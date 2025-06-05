@@ -1,0 +1,3 @@
+[submodule "deps/SCALib"]
+	path = deps/SCALib
+	url = https://github.com/simple-crypto/SCALib.git
