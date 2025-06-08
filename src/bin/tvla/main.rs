@@ -1,5 +1,6 @@
 use clap::Parser;
 use itertools::Itertools;
+use miette::{Diagnostic, SourceSpan};
 use ndarray::{Array1, Array2, s};
 use ndarray_npz::NpzWriter;
 use plotly::common::Mode;
@@ -9,9 +10,7 @@ use scasim::*;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use miette::{Diagnostic, SourceSpan};
 use thiserror::Error;
-
 
 #[derive(Parser, Debug)]
 #[command(name = "scasim-tvla")]
@@ -230,7 +229,8 @@ fn main() -> miette::Result<()> {
     let start_time: std::time::Instant = std::time::Instant::now();
     let npz_path = output_dir.join("traces.npz");
 
-    let mut npz = NpzWriter::new(File::create(&npz_path).expect("Failed to create npz file"));
+    let mut npz =
+        NpzWriter::new_compressed(File::create(&npz_path).expect("Failed to create npz file"));
     for (tidx, trace) in traces_array.outer_iter().enumerate() {
         npz.add_array(format!("trace_{tidx}"), &trace)
             .expect("Failed to add array 'a' to npz");
@@ -269,21 +269,20 @@ fn main() -> miette::Result<()> {
     )));
     plot.set_configuration(plots_config.clone());
     plot.write_html(output_dir.join(format!("trace{sample_trace_index}_plot.html")));
-    plot.write_image(
-        output_dir.join(format!("trace{sample_trace_index}_plot.png")),
-        plotly::ImageFormat::PNG,
-        1920,
-        1080 / 4,
-        1.0,
-    );
+    // plot.write_image(
+    //     output_dir.join(format!("trace{sample_trace_index}_plot.png")),
+    //     plotly::ImageFormat::PNG,
+    //     1920,
+    //     1080 / 4,
+    //     1.0,
+    // );
 
     plot.show();
 
     println!("Running t-test on traces...");
     let start_time = std::time::Instant::now();
-    let ttest_order = 1; // order of the t-test
 
-    let mut ttacc = ttest::Ttest::new(samples_per_trace, ttest_order);
+    let mut ttacc = ttest::Ttest::new(samples_per_trace, 2);
 
     ttacc.update(traces_array.view(), labels_array.view());
 
@@ -327,20 +326,13 @@ fn main() -> miette::Result<()> {
     ));
     t_plot.set_configuration(plots_config);
     t_plot.write_html(output_dir.join("t_test_plot.html"));
-    t_plot.write_image(
-        output_dir.join("t_test_plot.png"),
-        plotly::ImageFormat::PNG,
-        1920,
-        400,
-        1.0,
-    );
-    t_plot.write_image(
-        output_dir.join("t_test_plot.svg"),
-        plotly::ImageFormat::SVG,
-        1920,
-        400,
-        1.0,
-    );
+    // t_plot.write_image(
+    //     output_dir.join("t_test_plot.png"),
+    //     plotly::ImageFormat::PNG,
+    //     1920,
+    //     400,
+    //     1.0,
+    // );
     let t_plot_json_path = output_dir.join("t_plot.json");
     std::fs::write(t_plot_json_path, t_plot.to_json())
         .expect("Failed to write t_plot to JSON file");
