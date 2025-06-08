@@ -255,19 +255,6 @@ fn main() -> miette::Result<()> {
                 start_time.elapsed().as_secs_f32()
             );
 
-            // if false {
-            //     println!("Plotting {} time points", time_table.len());
-
-            //     let trace1 =
-            //         Scatter::new(time_table.clone(), power_table.clone()).mode(Mode::Lines);
-            //     let mut plot = Plot::new();
-            //     plot.add_trace(trace1);
-            //     plot.set_layout(plotly::Layout::new().title("Power Trace"));
-            //     plot.set_configuration(plots_config.clone());
-
-            //     plot.show();
-            // }
-
             let meta_markers = metadata_json
                 .get("markers")
                 .map(|v| {
@@ -344,9 +331,6 @@ fn main() -> miette::Result<()> {
                 // Update the ttest accumulator with the current traces and labels
                 ttacc.update(traces_array.view(), labels_array.view());
 
-                // let is_last_file = file_index == num_files - 1;
-
-                // if !is_last_file {
                 let t_values = ttacc.get_ttest();
                 max_t_values
                     .iter_mut()
@@ -366,7 +350,6 @@ fn main() -> miette::Result<()> {
                         );
                     });
                 Some(t_values)
-                // }
             } else {
                 panic!("Ttest accumulator is not initialized");
             }
@@ -378,7 +361,6 @@ fn main() -> miette::Result<()> {
         std::fs::create_dir_all(&output_dir).expect("Failed to create output directory for plots");
     }
 
-    
     // sage t_values to a npz file
     let npz_path = output_dir.join("t_values.npz");
     info!("Saving t-test results to {}", npz_path.display());
@@ -398,6 +380,7 @@ fn main() -> miette::Result<()> {
             .responsive(true)
             .typeset_math(true);
         let t_threshold = Some(4.5);
+
         plot_t_traces(
             t_values,
             t_threshold,
@@ -406,7 +389,6 @@ fn main() -> miette::Result<()> {
             &plots_config,
         )?;
 
-        // Plot the max t-values
         plot_max_t_values(
             max_t_values,
             num_traces_so_far,
