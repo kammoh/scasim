@@ -1,15 +1,18 @@
 use clap::Parser;
 use itertools::Itertools;
+use log::info;
 use miette::{Diagnostic, SourceSpan};
-use ndarray::{Array1, Array2, s};
+use ndarray::{Array1, Array2, ArrayBase, Dimension, OwnedRepr, s};
 use ndarray_npz::NpzWriter;
-use plotly::common::Mode;
+use num_ordinal::{Ordinal, Osize};
+use plotly::common::{Mode, Title};
 use plotly::{Plot, Scatter, Trace};
 use scalib::ttest;
+use scasim::plot::*;
 use scasim::*;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Parser, Debug)]
@@ -21,9 +24,11 @@ struct Args {
     // #[arg(value_name = "WAVE_FILE", index = 1)]
     // trace_filename: String,
     #[arg(value_name = "META_JSON", index = 1)]
-    metadata: String,
-    #[arg(value_name = "OUTPUT_DIR", help = "Directory to save the output files")]
-    output_dir: Option<String>,
+    maybe_metadata: Option<String>,
+    #[arg(long = "meta-list", value_name = "META_LIST_PATH")]
+    maybe_meta_list_path: Option<String>,
+    // #[arg(value_name = "OUTPUT_DIR", help = "Directory to save the output files")]
+    // output_dir: Option<String>,
     #[arg(
         long,
         help = "disable multi-threaded loading of the waveform and signals",
@@ -36,6 +41,28 @@ struct Args {
         default_value_t = true
     )]
     show_progress: bool,
+    /// The highest order of t-test to perform
+    #[arg(short = 'd', default_value_t = 2)]
+    order: usize,
+    #[arg(
+        long = "show",
+        help = "Show the plots in a web browser",
+        required = false,
+        action = clap::ArgAction::SetTrue,
+    )]
+    show_plots: bool,
+    #[arg(
+        help = "Plot the t-test results",
+        required = false,
+        default_value_t = true
+    )]
+    plot: bool,
+    #[arg(
+        value_name = "PLOTS_OUTPUT_DIR",
+        help = "Directory to save the ttest results and plot files",
+        default_value = ""
+    )]
+    ttest_output_dir: String,
 }
 
 fn get_metadata<P: AsRef<Path>>(
@@ -116,227 +143,279 @@ fn cut_trace(
 fn main() -> miette::Result<()> {
     let args = Args::parse();
 
-    let metadata_path = Path::new(&args.metadata);
+    // set default log level to info
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp(None)
+        .init();
 
-    let metadata_json = get_metadata(metadata_path, args.metadata.ends_with(".gz"))
-        .expect("Failed to load metadata!");
+    let filenames: Vec<PathBuf> = if let Some(meta_list_path) = args.maybe_meta_list_path {
+        let meta_root_path = PathBuf::from(&meta_list_path)
+            .parent()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Meta list path '{}' does not have a parent directory",
+                    meta_list_path
+                )
+            })
+            .to_owned();
+        // Read the meta list file and collect filenames
+        std::fs::read_to_string(meta_list_path)
+            .expect("Failed to read meta list file")
+            .lines()
+            .map(|line| {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    panic!("Empty line in meta list file");
+                }
+                let mut p = PathBuf::from(trimmed);
+                if !p.is_absolute() {
+                    p = meta_root_path.join(p);
+                }
+                p
+            })
+            .collect_vec()
+    } else if let Some(filename) = args.maybe_metadata {
+        vec![PathBuf::from(filename)]
+    } else {
+        panic!("No meta files provided. Please specify at least one NPZ file.");
+    };
+    let order = args.order;
 
-    let parent_folder_path = metadata_path
-        .parent()
-        .expect("Failed to get parent folder of metadata file")
-        .to_path_buf();
+    let mut samples_per_trace = 0;
+    let mut max_t_values = vec![Vec::<f64>::new(); order];
+    let mut num_traces_so_far = vec![];
 
-    let output_dir = args
-        .output_dir
-        .map(|s| Path::new(&s).to_path_buf())
-        .unwrap_or(parent_folder_path.clone());
+    let mut maybe_ttacc: Option<ttest::Ttest> = None;
 
-    let trace_filename = metadata_json
-        .get("trace_filename")
-        .and_then(|v| v.as_str())
-        .expect("trace_filename not found in metadata");
-
-    let trace_file_path = parent_folder_path.join(trace_filename);
-
-    let clock_period = metadata_json.get("clock_period").and_then(|v| v.as_u64());
-    let cp = clock_period.unwrap_or_default();
-    // .expect("clock_period not found in the metadata"); // FIXME optional
-
-    println!("Loading signals from the waveform...");
-    let start_time = std::time::Instant::now();
-
-    let (signals, time_table) =
-        load_waveform(&trace_file_path, !args.single_thread, args.show_progress)
-            .expect("Failed to load waveform!");
-    println!(
-        "It took {:.2}s to load {} signals with {} time points",
-        start_time.elapsed().as_secs_f32(),
-        signals.len(),
-        time_table.len()
-    );
-
-    println!("Generating power trace...");
-
-    let start_time = std::time::Instant::now();
-
-    let (time_table, power_table) = generate_power_trace(
-        &signals,
-        &time_table,
-        |(t, _)| *t % cp == 0,
-        clock_period.is_some(),
-    )
-    .expect("Failed to convert waveform to power trace!");
-
-    println!(
-        "It took {:.2}s to generate the power trace",
-        start_time.elapsed().as_secs_f32()
-    );
-
-    let plots_config = plotly::Configuration::new()
-        .display_mode_bar(plotly::configuration::DisplayModeBar::Hover)
-        .show_link(false)
-        .display_logo(false)
-        .editable(false)
-        .responsive(true);
-
-    if false {
-        println!("Plotting {} time points", time_table.len());
-
-        let trace1 = Scatter::new(time_table.clone(), power_table.clone()).mode(Mode::Lines);
-        let mut plot = Plot::new();
-        plot.add_trace(trace1);
-        plot.set_layout(plotly::Layout::new().title("Power Trace"));
-        plot.set_configuration(plots_config.clone());
-
-        plot.show();
+    if filenames.is_empty() {
+        panic!("No meta files provided. Please specify at least one NPZ file.");
     }
 
-    let meta_markers = metadata_json
-        .get("markers")
-        .map(|v| {
-            v.as_array()
-                .unwrap()
-                .into_iter()
-                .map(|e| {
-                    e.as_array()
+    let t_values = filenames
+        .iter()
+        .fold(None, |_, metadata_path| {
+            if !metadata_path.exists() {
+                panic!(
+                    "Metadata file '{}' does not exist!",
+                    metadata_path.display()
+                );
+            }
+
+            let metadata_json = get_metadata(
+                metadata_path,
+                metadata_path.extension().map_or(false, |ext| ext == "gz"),
+            )
+            .expect("Failed to load metadata!");
+
+            let parent_folder_path = metadata_path
+                .parent()
+                .expect("Failed to get parent folder of metadata file")
+                .to_path_buf();
+
+            let output_dir = &parent_folder_path;
+
+            let trace_filename = metadata_json
+                .get("trace_filename")
+                .and_then(|v| v.as_str())
+                .expect("trace_filename not found in metadata");
+
+            let trace_file_path = parent_folder_path.join(trace_filename);
+
+            let clock_period = metadata_json.get("clock_period").and_then(|v| v.as_u64());
+            let cp = clock_period.unwrap_or_default();
+            // .expect("clock_period not found in the metadata"); // FIXME optional
+
+            println!("Loading signals from the waveform...");
+            let start_time = std::time::Instant::now();
+
+            let (signals, time_table) =
+                load_waveform(&trace_file_path, !args.single_thread, args.show_progress)
+                    .expect("Failed to load waveform!");
+            println!(
+                "It took {:.2}s to load {} signals with {} time points",
+                start_time.elapsed().as_secs_f32(),
+                signals.len(),
+                time_table.len()
+            );
+
+            println!("Generating power trace...");
+
+            let start_time = std::time::Instant::now();
+
+            let (time_table, power_table) = generate_power_trace(
+                &signals,
+                &time_table,
+                |(t, _)| *t % cp == 0,
+                clock_period.is_some(),
+            )
+            .expect("Failed to convert waveform to power trace!");
+
+            println!(
+                "It took {:.2}s to generate the power trace",
+                start_time.elapsed().as_secs_f32()
+            );
+
+            // if false {
+            //     println!("Plotting {} time points", time_table.len());
+
+            //     let trace1 =
+            //         Scatter::new(time_table.clone(), power_table.clone()).mode(Mode::Lines);
+            //     let mut plot = Plot::new();
+            //     plot.add_trace(trace1);
+            //     plot.set_layout(plotly::Layout::new().title("Power Trace"));
+            //     plot.set_configuration(plots_config.clone());
+
+            //     plot.show();
+            // }
+
+            let meta_markers = metadata_json
+                .get("markers")
+                .map(|v| {
+                    v.as_array()
                         .unwrap()
                         .into_iter()
-                        .map(|i| i.as_u64().unwrap())
+                        .map(|e| {
+                            e.as_array()
+                                .unwrap()
+                                .into_iter()
+                                .map(|i| i.as_u64().unwrap())
+                                .collect_vec()
+                        })
                         .collect_vec()
                 })
-                .collect_vec()
+                .expect("markers not found in metadata");
+
+            println!("Cutting traces based on markers...");
+            let start_time = std::time::Instant::now();
+            let (traces_array, labels_array) = cut_trace(&power_table, &time_table, &meta_markers);
+            let (num_traces, cur_samples_per_trace) = traces_array.dim();
+            if samples_per_trace == 0 {
+                // Initialize samples_per_trace with the length of the first trace
+                samples_per_trace = cur_samples_per_trace;
+            } else if samples_per_trace != cur_samples_per_trace {
+                panic!(
+                    "Inconsistent number of samples per trace: expected {}, found {}",
+                    samples_per_trace, cur_samples_per_trace
+                );
+            }
+            num_traces_so_far.push(
+                num_traces_so_far
+                    .last()
+                    .map_or(num_traces, |&last| last + num_traces),
+            );
+            println!(
+                "Cut traces in {:.2}s, resulting in {} traces with a maximum of {} samples each",
+                start_time.elapsed().as_secs_f32(),
+                num_traces,
+                samples_per_trace
+            );
+
+            assert!(num_traces > 1, "Number of traces must be greater than 1");
+            assert!(
+                labels_array.len() == num_traces,
+                "Number of trace labels does not match number of traces"
+            );
+
+            println!("Saving traces and labels to NPZ file...");
+            let start_time: std::time::Instant = std::time::Instant::now();
+            let npz_path = output_dir.join("traces.npz");
+
+            let mut npz = NpzWriter::new_compressed(
+                File::create(&npz_path).expect("Failed to create npz file"),
+            );
+            for (tidx, trace) in traces_array.outer_iter().enumerate() {
+                npz.add_array(format!("trace_{tidx}"), &trace)
+                    .expect("Failed to add array 'a' to npz");
+            }
+            npz.add_array("labels", &labels_array)
+                .expect("Failed to add array 'labels' to npz");
+            npz.finish().expect("Failed to finish writing npz file");
+            println!(
+                "Saved traces and labels to {} in {:.2}s\n",
+                npz_path.display(),
+                start_time.elapsed().as_secs_f32()
+            );
+
+            if maybe_ttacc.is_none() {
+                maybe_ttacc = Some(ttest::Ttest::new(samples_per_trace, order));
+            }
+
+            if let Some(ref mut ttacc) = maybe_ttacc {
+                // Update the ttest accumulator with the current traces and labels
+                ttacc.update(traces_array.view(), labels_array.view());
+
+                // let is_last_file = file_index == num_files - 1;
+
+                // if !is_last_file {
+                let t_values = ttacc.get_ttest();
+                max_t_values
+                    .iter_mut()
+                    .zip(t_values.rows())
+                    .for_each(|(max_t, t_row)| {
+                        // for (i, &t_value) in t_row.iter().enumerate() {
+                        //     if t_value.is_finite() && t_value.abs() > max_t[i] {
+                        //         max_t[i] = t_value.abs();
+                        //     }
+                        // }
+                        max_t.push(
+                            t_row
+                                .iter()
+                                .filter_map(|&x| x.is_finite().then_some(x.abs()))
+                                .max_by(|a, b| a.partial_cmp(b).unwrap())
+                                .expect("Failed to find max t-value in current row"),
+                        );
+                    });
+                Some(t_values)
+                // }
+            } else {
+                panic!("Ttest accumulator is not initialized");
+            }
         })
-        .expect("markers not found in metadata");
+        .expect("Failed to compute t-test values");
 
-    println!("Cutting traces based on markers...");
-    let start_time = std::time::Instant::now();
-    let (traces_array, labels_array) = cut_trace(&power_table, &time_table, &meta_markers);
-    let (num_traces, samples_per_trace) = traces_array.dim();
-    println!(
-        "Cut traces in {:.2}s, resulting in {} traces with a maximum of {} samples each",
-        start_time.elapsed().as_secs_f32(),
-        num_traces,
-        samples_per_trace
-    );
+    let output_dir = PathBuf::from(&args.ttest_output_dir);
+    if !output_dir.exists() {
+        std::fs::create_dir_all(&output_dir).expect("Failed to create output directory for plots");
+    }
 
-    assert!(num_traces > 1, "Number of traces must be greater than 1");
-    assert!(
-        labels_array.len() == num_traces,
-        "Number of trace labels does not match number of traces"
-    );
-
-    println!("Saving traces and labels to NPZ file...");
-    let start_time: std::time::Instant = std::time::Instant::now();
-    let npz_path = output_dir.join("traces.npz");
-
+    
+    // sage t_values to a npz file
+    let npz_path = output_dir.join("t_values.npz");
+    info!("Saving t-test results to {}", npz_path.display());
     let mut npz =
         NpzWriter::new_compressed(File::create(&npz_path).expect("Failed to create npz file"));
-    for (tidx, trace) in traces_array.outer_iter().enumerate() {
-        npz.add_array(format!("trace_{tidx}"), &trace)
-            .expect("Failed to add array 'a' to npz");
-    }
-    npz.add_array("labels", &labels_array)
-        .expect("Failed to add array 'labels' to npz");
+    npz.add_array("t_values", &t_values)
+        .expect("Failed to add t_values array to npz");
     npz.finish().expect("Failed to finish writing npz file");
-    println!(
-        "Saved traces and labels to {} in {:.2}s\n",
-        npz_path.display(),
-        start_time.elapsed().as_secs_f32()
-    );
+    info!("Saved t_values to {}", npz_path.display());
 
-    println!(
-        "Plotting {} time points for a single trace",
-        time_table.len()
-    );
+    if args.plot {
+        let plots_config = plotly::Configuration::new()
+            .display_mode_bar(plotly::configuration::DisplayModeBar::Hover)
+            .show_link(false)
+            .display_logo(false)
+            .editable(false)
+            .responsive(true)
+            .typeset_math(true);
+        let t_threshold = Some(4.5);
+        plot_t_traces(
+            t_values,
+            t_threshold,
+            &output_dir,
+            args.show_plots,
+            &plots_config,
+        )?;
 
-    let sample_trace_index = 0;
-    let trace1 = Scatter::from_array(
-        Array1::linspace(0., samples_per_trace as f64, samples_per_trace),
-        traces_array.row(sample_trace_index).to_owned(),
-    )
-    .mode(Mode::Lines)
-    .line(plotly::common::Line::new().width(1.0).color("navy"));
-
-    // save trace1 as json
-    let trace_json_path = output_dir.join(format!("trace{sample_trace_index}.json"));
-    std::fs::write(trace_json_path, trace1.to_json()).expect("Failed to write trace1 to JSON file");
-
-    let mut plot = Plot::new();
-    plot.add_trace(trace1);
-    plot.set_layout(plotly::Layout::new().title(format!(
-        "Power trace #{sample_trace_index} class={}",
-        labels_array[sample_trace_index]
-    )));
-    plot.set_configuration(plots_config.clone());
-    plot.write_html(output_dir.join(format!("trace{sample_trace_index}_plot.html")));
-    // plot.write_image(
-    //     output_dir.join(format!("trace{sample_trace_index}_plot.png")),
-    //     plotly::ImageFormat::PNG,
-    //     1920,
-    //     1080 / 4,
-    //     1.0,
-    // );
-
-    plot.show();
-
-    println!("Running t-test on traces...");
-    let start_time = std::time::Instant::now();
-
-    let mut ttacc = ttest::Ttest::new(samples_per_trace, 2);
-
-    ttacc.update(traces_array.view(), labels_array.view());
-
-    let t_values = ttacc.get_ttest();
-
-    let t1_values = t_values
-        .row(0)
-        .iter()
-        .filter_map(|&x| x.is_finite().then_some(x.abs()))
-        .collect_vec();
-
-    println!(
-        "T-test completed in {:.2}s.\nt-values shape: {:?}\n",
-        start_time.elapsed().as_secs_f32(),
-        t_values.shape(),
-    );
-
-    // print!(
-    //     "First 100 t-values: {:?}\n",
-    //     t_values.row(0).slice(s![..100]).iter().join(", ")
-    // );
-
-    let t1_values_len = t1_values.len();
-    println!("Plotting t-values...");
-    //plot the t-values
-    let t_trace = Scatter::new((0..t1_values.len()).collect_vec(), t1_values).mode(Mode::Lines);
-    let mut t_plot = Plot::new();
-    t_plot.add_trace(t_trace);
-    t_plot.set_layout(plotly::Layout::new().title("T-test Values").shapes(
-        vec![plotly::layout::Shape::new()
-            .shape_type(plotly::layout::ShapeType::Line)
-            .x0(0)
-            .x1(t1_values_len as f64 - 1.0)
-            .y0(4.5)
-            .y1(4.5)
-            .line(plotly::layout::ShapeLine::new()
-                    .color(plotly::color::NamedColor::Orange)
-                    .width(2.5)
-                    .dash(plotly::common::DashType::Dot))
-            ],
-    ));
-    t_plot.set_configuration(plots_config);
-    t_plot.write_html(output_dir.join("t_test_plot.html"));
-    // t_plot.write_image(
-    //     output_dir.join("t_test_plot.png"),
-    //     plotly::ImageFormat::PNG,
-    //     1920,
-    //     400,
-    //     1.0,
-    // );
-    let t_plot_json_path = output_dir.join("t_plot.json");
-    std::fs::write(t_plot_json_path, t_plot.to_json())
-        .expect("Failed to write t_plot to JSON file");
-    t_plot.show();
+        // Plot the max t-values
+        plot_max_t_values(
+            max_t_values,
+            num_traces_so_far,
+            t_threshold,
+            &output_dir,
+            args.show_plots,
+            &plots_config,
+        )?;
+    }
 
     Ok(())
 }

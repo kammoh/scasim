@@ -4,10 +4,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use wellen::Hierarchy;
 use wellen::viewers::BodyResult;
+use num_format::{Locale, ToFormattedString};
+use log::{info, debug, warn};
 
 pub mod optional_filter;
+pub mod plot;
 
 pub use optional_filter::*;
 
@@ -71,7 +73,8 @@ pub fn load_waveform<P: AsRef<Path>>(
         .expect("Failed to load file!");
 
     let body_len = header.body_len;
-    let (body_progress, progress) = if show_progress || body_len == 0 {
+    let (body_progress, progress) = if !show_progress || body_len == 0 {
+        debug!("show_progress: {}, body_len: {}", show_progress, body_len);
         (None, None)
     } else {
         let p = Arc::new(AtomicU64::new(0));
@@ -94,13 +97,13 @@ pub fn load_waveform<P: AsRef<Path>>(
                 // see if we are done
                 let now_done = done.load(Ordering::SeqCst);
                 if now_done {
-                    // if bar.position() != body_len {
-                    //     println!(
-                    //         "WARN: Final progress value was: {}, expected {}",
-                    //         bar.position(),
-                    //         body_len
-                    //     );
-                    // }
+                    if bar.position() != body_len {
+                        debug!(
+                            "Final progress value was: {}, expected {}",
+                            bar.position(),
+                            body_len
+                        );
+                    }
                     bar.finish_and_clear();
                     break;
                 }
@@ -112,18 +115,31 @@ pub fn load_waveform<P: AsRef<Path>>(
     // load body
     let hierarchy = header.hierarchy;
 
+    let start_time = std::time::Instant::now();
     let body = wellen::viewers::read_body(header.body, &hierarchy, body_progress)
         .expect("Failed to load the waveform body!");
     if let Some((done, t)) = progress {
         done.store(true, Ordering::SeqCst);
         t.join().unwrap();
     }
+    info!("Read body in {:.2}s", start_time.elapsed().as_secs_f32());
+
+    info!("Total number of samples: {}", body.time_table.len().to_formatted_string(&Locale::en));
 
     let signal_refs = hierarchy.iter_vars().map(|v| v.signal_ref()).collect_vec();
 
     let mut wave_source = body.source;
+
+    wave_source.print_statistics();
+
+    info!("Loading {} signals..", signal_refs.len().to_formatted_string(&Locale::en));
+    let start_time = std::time::Instant::now();
     // wave_source.print_statistics();
     let signals = wave_source.load_signals(&signal_refs, &hierarchy, load_opts.multi_thread);
+    info!(
+        "Loaded signals in {:.2}s",
+        start_time.elapsed().as_secs_f32()
+    );
 
     Ok((signals, body.time_table))
 }
@@ -147,7 +163,7 @@ pub fn generate_power_trace<F: Fn(&(&u64, f32)) -> bool>(
             }
             prev_value = Some(new_value);
         }
-        // println!("{}: {}", s.full_name(&hierarchy), signal.size_in_memory());
+        // debug!("{}: {}", s.full_name(&hierarchy), signal.size_in_memory());
     }
     let mut leftover = 0.0;
 
