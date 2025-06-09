@@ -2,8 +2,7 @@ use clap::{Parser, Subcommand};
 use itertools::Itertools;
 use log::info;
 use ndarray::{Array1, Array2};
-use num_ordinal::{Ordinal, Osize, ordinal0};
-use plotly::common::{Mode, Title};
+use plotly::common::Mode;
 use plotly::{Plot, Scatter};
 use scalib::ttest;
 use scasim::plot::{plot_max_t_values, plot_t_traces};
@@ -194,7 +193,8 @@ fn main() -> miette::Result<()> {
                         .iter()
                         .filter_map(|name| {
                             name.starts_with("trace_").then(|| {
-                                npz_reader.by_name(name.as_str())
+                                npz_reader
+                                    .by_name(name.as_str())
                                     .expect(&format!("Failed to find '{}' in NPZ file", name))
                             })
                         })
@@ -229,22 +229,13 @@ fn main() -> miette::Result<()> {
                     }
 
                     if let Some(ref mut ttacc) = maybe_ttacc {
-                        // Update the ttest accumulator with the current traces and labels
                         ttacc.update(traces_array.view(), labels.view());
 
-                        // let is_last_file = file_index == num_files - 1;
-
-                        // if !is_last_file {
                         let t_values = ttacc.get_ttest();
                         max_t_values
                             .iter_mut()
                             .zip(t_values.rows())
                             .for_each(|(max_t, t_row)| {
-                                // for (i, &t_value) in t_row.iter().enumerate() {
-                                //     if t_value.is_finite() && t_value.abs() > max_t[i] {
-                                //         max_t[i] = t_value.abs();
-                                //     }
-                                // }
                                 max_t.push(
                                     t_row
                                         .iter()
@@ -254,7 +245,6 @@ fn main() -> miette::Result<()> {
                                 );
                             });
                         Some(t_values)
-                        // }
                     } else {
                         panic!("Ttest accumulator is not initialized");
                     }

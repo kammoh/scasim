@@ -17,14 +17,10 @@ use std::path::{Path, PathBuf};
 #[command(version)]
 #[command(about = "Test-Vector Leakage Analysis", long_about = None)]
 struct Args {
-    // #[arg(value_name = "WAVE_FILE", index = 1)]
-    // trace_filename: String,
     #[arg(value_name = "META_JSON", index = 1)]
     maybe_metadata: Option<String>,
     #[arg(long = "meta-list", value_name = "META_LIST_PATH")]
     maybe_meta_list_path: Option<String>,
-    // #[arg(value_name = "OUTPUT_DIR", help = "Directory to save the output files")]
-    // output_dir: Option<String>,
     #[arg(
         long,
         help = "disable multi-threaded loading of the waveform and signals",
@@ -293,9 +289,9 @@ fn main() -> miette::Result<()> {
             let cp = clock_period.unwrap_or_default();
             // .expect("clock_period not found in the metadata"); // FIXME optional
 
+            
             println!("Loading signals from the waveform...");
             let start_time = std::time::Instant::now();
-
             let (signals, time_table) =
                 load_waveform(&trace_file_path, !args.single_thread, args.show_progress)
                     .expect("Failed to load waveform!");
@@ -307,9 +303,7 @@ fn main() -> miette::Result<()> {
             );
 
             println!("Generating power trace...");
-
             let start_time = std::time::Instant::now();
-
             let (time_table, power_table) = generate_power_trace(
                 &signals,
                 &time_table,
@@ -317,7 +311,6 @@ fn main() -> miette::Result<()> {
                 clock_period.is_some(),
             )
             .expect("Failed to convert waveform to power trace!");
-
             println!(
                 "It took {:.2}s to generate the power trace",
                 start_time.elapsed().as_secs_f32()
@@ -374,6 +367,8 @@ fn main() -> miette::Result<()> {
         }
     }).collect_vec_list();
 
+
+    // must be done sequentially
     let t_values = collected_traces
         .into_iter()
         .flatten()
@@ -413,11 +408,6 @@ fn main() -> miette::Result<()> {
                     .iter_mut()
                     .zip(t_values.rows())
                     .for_each(|(max_t, t_row)| {
-                        // for (i, &t_value) in t_row.iter().enumerate() {
-                        //     if t_value.is_finite() && t_value.abs() > max_t[i] {
-                        //         max_t[i] = t_value.abs();
-                        //     }
-                        // }
                         max_t.push(
                             t_row
                                 .iter()
