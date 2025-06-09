@@ -1,19 +1,15 @@
 use clap::Parser;
 use itertools::Itertools;
-use log::info;
-use miette::{Diagnostic, SourceSpan};
-use ndarray::{Array1, Array2, ArrayBase, Dimension, OwnedRepr, s};
-use ndarray_npz::NpzWriter;
-use num_ordinal::{Ordinal, Osize};
-use plotly::common::{Mode, Title};
-use plotly::{Plot, Scatter, Trace};
+use log::*;
+use ndarray::{Array1, Array2, s};
+use ndarray_npz::{NpzReader, NpzWriter};
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use scalib::ttest;
 use scasim::plot::*;
 use scasim::*;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use thiserror::Error;
 
 #[derive(Parser, Debug)]
 #[command(name = "scasim-tvla")]
@@ -37,6 +33,12 @@ struct Args {
     single_thread: bool,
     #[arg(
         long,
+        help = "number of threads to use for parallel processing, defaults to the number of available CPU cores",
+        value_name = "NUM_THREADS"
+    )]
+    num_threads: Option<usize>,
+    #[arg(
+        long,
         help = "show progress bar while loading the file",
         default_value_t = true
     )]
@@ -57,6 +59,12 @@ struct Args {
         default_value_t = true
     )]
     plot: bool,
+    #[arg(
+        long = "use-existing",
+        help = "Skip generation of power trace data if the NPZ file already exists and is not older than the corresponding trace file. Use their stored data instead.",
+        default_value_t = true
+    )]
+    use_existing: bool,
     #[arg(
         value_name = "PLOTS_OUTPUT_DIR",
         help = "Directory to save the ttest results and plot files",
@@ -191,36 +199,96 @@ fn main() -> miette::Result<()> {
         panic!("No meta files provided. Please specify at least one NPZ file.");
     }
 
-    let t_values = filenames
-        .iter()
-        .fold(None, |_, metadata_path| {
-            if !metadata_path.exists() {
-                panic!(
-                    "Metadata file '{}' does not exist!",
-                    metadata_path.display()
-                );
+    let npz_filename = "traces.npz";
+
+    args.num_threads.iter().for_each(|&n| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .unwrap()
+    });
+
+    let default_num_threads = rayon::current_num_threads();
+
+    println!(
+        "Using {} threads for parallel processing",
+        default_num_threads
+    );
+
+    let collected_traces = filenames.into_par_iter().map(|metadata_path| {
+        if !metadata_path.exists() {
+            panic!(
+                "Metadata file '{}' does not exist!",
+                metadata_path.display()
+            );
+        }
+
+        let metadata_json = get_metadata(
+            &metadata_path,
+            metadata_path.extension().map_or(false, |ext| ext == "gz"),
+        )
+        .expect("Failed to load metadata!");
+
+        let parent_folder_path = metadata_path
+            .parent()
+            .expect("Failed to get parent folder of metadata file")
+            .to_path_buf();
+
+        let trace_filename = metadata_json
+            .get("trace_filename")
+            .and_then(|v| v.as_str())
+            .expect("trace_filename not found in metadata");
+
+        let trace_file_path = parent_folder_path.join(trace_filename);
+
+        let npz_path = parent_folder_path.join(npz_filename);
+
+        let use_existing = if args.use_existing && npz_path.exists() {
+            // Check if the npz file is older than the trace file
+            let npz_modified = std::fs::metadata(&npz_path).and_then(|m| m.modified());
+            let trace_modified = std::fs::metadata(&trace_file_path).and_then(|m| m.modified());
+            if let (Ok(npz_modified), Ok(trace_modified)) = (npz_modified, trace_modified) {
+                // Use existing if npz file is newer than trace file
+                npz_modified > trace_modified
+            } else {
+                false
             }
+        } else {
+            false
+        };
 
-            let metadata_json = get_metadata(
-                metadata_path,
-                metadata_path.extension().map_or(false, |ext| ext == "gz"),
+        if use_existing {
+            println!(
+                "Using existing traces and labels from {}",
+                npz_path.display()
+            );
+            let mut npz_reader =
+                NpzReader::new(File::open(&npz_path).expect("Failed to open npz file"))
+                    .expect("Failed to read npz file");
+            let labels_array: Array1<u16> = npz_reader
+                .by_name("labels")
+                .expect("Failed to find 'labels' in NPZ file");
+
+            let traces: Vec<Array1<f32>> = npz_reader
+                .names()
+                .expect("Failed to get names from NPZ file")
+                .iter()
+                .filter_map(|name| {
+                    name.starts_with("trace_").then(|| {
+                        npz_reader
+                            .by_name(name.as_str())
+                            .expect(&format!("Failed to find '{}' in NPZ file", name))
+                    })
+                })
+                .collect_vec();
+            let num_traces = traces.len();
+            let traces_array: Array2<f32> = Array2::from_shape_vec(
+                (num_traces, traces[0].len()),
+                traces.into_iter().flatten().collect(),
             )
-            .expect("Failed to load metadata!");
-
-            let parent_folder_path = metadata_path
-                .parent()
-                .expect("Failed to get parent folder of metadata file")
-                .to_path_buf();
-
-            let output_dir = &parent_folder_path;
-
-            let trace_filename = metadata_json
-                .get("trace_filename")
-                .and_then(|v| v.as_str())
-                .expect("trace_filename not found in metadata");
-
-            let trace_file_path = parent_folder_path.join(trace_filename);
-
+            .expect("Failed to create traces array");
+            (traces_array, labels_array)
+        } else {
             let clock_period = metadata_json.get("clock_period").and_then(|v| v.as_u64());
             let cp = clock_period.unwrap_or_default();
             // .expect("clock_period not found in the metadata"); // FIXME optional
@@ -275,37 +343,16 @@ fn main() -> miette::Result<()> {
             println!("Cutting traces based on markers...");
             let start_time = std::time::Instant::now();
             let (traces_array, labels_array) = cut_trace(&power_table, &time_table, &meta_markers);
+
             let (num_traces, cur_samples_per_trace) = traces_array.dim();
-            if samples_per_trace == 0 {
-                // Initialize samples_per_trace with the length of the first trace
-                samples_per_trace = cur_samples_per_trace;
-            } else if samples_per_trace != cur_samples_per_trace {
-                panic!(
-                    "Inconsistent number of samples per trace: expected {}, found {}",
-                    samples_per_trace, cur_samples_per_trace
-                );
-            }
-            num_traces_so_far.push(
-                num_traces_so_far
-                    .last()
-                    .map_or(num_traces, |&last| last + num_traces),
-            );
             println!(
                 "Cut traces in {:.2}s, resulting in {} traces with a maximum of {} samples each",
                 start_time.elapsed().as_secs_f32(),
                 num_traces,
-                samples_per_trace
+                cur_samples_per_trace
             );
-
-            assert!(num_traces > 1, "Number of traces must be greater than 1");
-            assert!(
-                labels_array.len() == num_traces,
-                "Number of trace labels does not match number of traces"
-            );
-
             println!("Saving traces and labels to NPZ file...");
             let start_time: std::time::Instant = std::time::Instant::now();
-            let npz_path = output_dir.join("traces.npz");
 
             let mut npz = NpzWriter::new_compressed(
                 File::create(&npz_path).expect("Failed to create npz file"),
@@ -321,6 +368,36 @@ fn main() -> miette::Result<()> {
                 "Saved traces and labels to {} in {:.2}s\n",
                 npz_path.display(),
                 start_time.elapsed().as_secs_f32()
+            );
+
+            (traces_array, labels_array)
+        }
+    }).collect_vec_list();
+
+    let t_values = collected_traces
+        .into_iter()
+        .flatten()
+        .fold(None, |_, (traces_array, labels_array)| {
+            let (num_traces, cur_samples_per_trace) = traces_array.dim();
+            if samples_per_trace == 0 {
+                // Initialize samples_per_trace with the length of the first trace
+                samples_per_trace = cur_samples_per_trace;
+            } else if samples_per_trace != cur_samples_per_trace {
+                panic!(
+                    "Inconsistent number of samples per trace: expected {}, found {}",
+                    samples_per_trace, cur_samples_per_trace
+                );
+            }
+            num_traces_so_far.push(
+                num_traces_so_far
+                    .last()
+                    .map_or(num_traces, |&last| last + num_traces),
+            );
+
+            assert!(num_traces > 1, "Number of traces must be greater than 1");
+            assert!(
+                labels_array.len() == num_traces,
+                "Number of trace labels does not match number of traces"
             );
 
             if maybe_ttacc.is_none() {
@@ -379,6 +456,7 @@ fn main() -> miette::Result<()> {
             .editable(false)
             .responsive(true)
             .typeset_math(true);
+
         let t_threshold = Some(4.5);
 
         plot_t_traces(

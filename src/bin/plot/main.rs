@@ -182,19 +182,19 @@ fn main() -> miette::Result<()> {
 
                     // Parse the NPZ file
                     info!("Processing file: {}", filename.display());
-                    let mut npz =
+                    let mut npz_reader =
                         ndarray_npz::NpzReader::new(reader).expect("Failed to parse NPZ file");
-                    let labels: Array1<u16> = npz
+                    let labels: Array1<u16> = npz_reader
                         .by_name("labels")
                         .expect("Failed to find 'labels' in NPZ file");
 
-                    let traces: Vec<Array1<f32>> = npz
+                    let traces: Vec<Array1<f32>> = npz_reader
                         .names()
                         .expect("Failed to get names from NPZ file")
                         .iter()
                         .filter_map(|name| {
                             name.starts_with("trace_").then(|| {
-                                npz.by_name(name.as_str())
+                                npz_reader.by_name(name.as_str())
                                     .expect(&format!("Failed to find '{}' in NPZ file", name))
                             })
                         })
