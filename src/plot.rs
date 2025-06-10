@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use itertools::Itertools;
+use capitalize::Capitalize;
 use log::info;
 use ndarray::{Array1, ArrayBase, Dimension, OwnedRepr};
 use num_ordinal::{Ordinal, Osize};
@@ -52,7 +52,10 @@ pub fn plot_t_traces<D: Dimension, P: AsRef<Path>>(
             t_plot.add_trace(t_trace.clone());
             t_plot.set_layout(
                 plotly::Layout::new()
-                    .title(format!("{}-order t-test: |t| vs time", Osize::from0(d)))
+                    .title(format!(
+                        "{}-order t-test: |t| vs time",
+                        Osize::from1(d).to_string().capitalize()
+                    ))
                     .shapes(threshold_line.as_slice().to_owned())
                     .x_axis(plotly::layout::Axis::new().title("Time (cycles)"))
                     .y_axis(plotly::layout::Axis::new().title(Title::with_text("|t|"))),
@@ -134,7 +137,6 @@ pub fn plot_max_t_values(
     );
     for (i, max_tvals) in max_t_values.into_iter().enumerate() {
         let d = i + 1;
-        info!("Max t-values for d={d}: {:?}", max_tvals);
         println!(
             "Max t-value for d={d}: {:.03}",
             max_tvals

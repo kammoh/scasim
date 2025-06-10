@@ -4,9 +4,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use wellen::viewers::BodyResult;
 use num_format::{Locale, ToFormattedString};
-use log::{info, debug, warn};
+use log::{info, debug};
 
 pub mod optional_filter;
 pub mod plot;
