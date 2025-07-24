@@ -1,3 +1,6 @@
 [submodule "deps/SCALib"]
 	path = deps/SCALib
-	url = https://github.com/simple-crypto/SCALib.git
+	url = https://github.com/kammoh/SCALib.git
+[submodule "fst-reader"]
+	path = fst-reader
+	url = https://github.com/ekiwi/fst-reader.git
