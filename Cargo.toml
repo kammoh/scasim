@@ -5,10 +5,11 @@ edition = "2024"
 
 [dependencies]
 bytesize = "2.0.1"
-clap = { version = "4.5.39", features = ["derive", "env"] }
-indicatif = "0.17.11"
+clap = { version = "4.5.41", features = ["derive", "env"] }
+indicatif = "0.18.0"
 itertools = "0.14.0"
-wellen = "0.15.0"
+wellen = "0.17.1"
+fst-reader = {path = "fst-reader"}
 # vcd = { git = "https://github.com/kevinmehall/rust-vcd.git" }
 ndarray = { version = "0.16.1", features = ["approx", "rayon", "serde"] }
 ndarray-npz = "0.4.2"
@@ -17,17 +18,18 @@ compact_str = "0.9.0"
 bitvec = "1.0.1"
 linereader = "0.4.0"
 atoi_radix10 = "0.0.1"
-plotly = { version = "0.12.1", features = [
-    "kaleido",
+plotly = { version = "0.13.4", features = [
+    "plotly_static",
+    "static_export_default",
     "plotly_embed_js",
     "plotly_image",
     "plotly_ndarray",
     "kaleido_download",
 ] }
 scalib = { path = "deps/SCALib/src/scalib_ext/scalib" }
-zarrs = "0.20.1"
-flate2 = "1.1.1"
-serde_json = "1.0.140"
+zarrs = "0.21.2"
+flate2 = "1.1.2"
+serde_json = "1.0.141"
 miette = { version = "7.6.0", features = ["fancy"] }
 thiserror = "2.0.12"
 num-format = "0.4.4"
