@@ -34,10 +34,10 @@ enum Commands {
     #[clap(name = "plot-traces", about = "Plot traces from a NPZ file")]
     PlotTraces {
         /// Indices of the traces to plot
-        #[arg(index = 1)]
+        #[arg(value_name = "INDICES", index = 1)]
         trace_indices: Vec<usize>,
 
-        #[arg(value_name = "NPZ_FILE", index = 1)]
+        #[arg(value_name = "NPZ_FILE", index = 2)]
         filename: String,
     },
     #[clap(
@@ -256,6 +256,7 @@ fn main() -> miette::Result<()> {
             plot_t_traces(
                 t_values,
                 t_threshold,
+                false, // abs_values
                 output_dir,
                 args.show_plots,
                 &plots_config,

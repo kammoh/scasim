@@ -1,61 +1,46 @@
 use indicatif::ProgressStyle;
 use itertools::Itertools;
+use log::{debug, info};
+use num_format::{Locale, ToFormattedString};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use num_format::{Locale, ToFormattedString};
-use log::{info, debug};
 
+pub mod fst;
 pub mod optional_filter;
 pub mod plot;
+pub mod power_model;
 
+pub use fst::*;
 pub use optional_filter::*;
+pub use power_model::*;
 
-pub trait Hamming {
-    /// Get the Hamming weight of the value, i.e. number of bits set to `1`.
-    fn hamming_weight(&self) -> u32;
-    /// Get the Hamming distance between two values, i.e. number of bits that differ.
-    fn hamming_distance(&self, other: &Self) -> u32;
-}
+pub fn markers_to_time_indices(
+    meta_markers: &[(u64, u64, u16)],
+    time_table: &[u64],
+) -> Vec<(usize, usize, u16)> {
+    // convert the markers to time index intervals
+    // each marker has 3 u64 elements: start_time, end_time, and label
+    // returns a vector of tuples of (low_index, high_index, label) where low_index..high_index is the range of time indices for the marker
+    // use the fact that both meta_markers and time_table are sorted by time
 
-#[inline(always)]
-pub fn power_model<V: Hamming>(prev_value: &V, new_value: &V) -> f32 {
-    // new_value.hamming_weight() as f32 * 0.1 + // static power
-    new_value.hamming_distance(&prev_value) as f32
-}
+    meta_markers
+        .into_iter()
+        .map(|marker| {
+            // let start_time = marker[0];
+            // let end_time = marker[1];
+            // let label = marker[2] as u16;
+            let (start_time, end_time, label) = marker.to_owned();
 
-impl<'a> Hamming for wellen::SignalValue<'a> {
-    fn hamming_weight(&self) -> u32 {
-        match self {
-            wellen::SignalValue::Binary(data, bits) => {
-                if *bits == 0 {
-                    panic!("Cannot compute hamming weight of empty signal!");
-                }
-                data.iter().map(|&x| x.count_ones()).sum()
-            }
-            _ => 0,
-        }
-    }
+            // find the start index
+            let low_index = time_table.binary_search(&start_time).unwrap_or_else(|x| x);
+            // find the end index
+            let high_index = time_table.binary_search(&end_time).unwrap_or_else(|x| x);
 
-    fn hamming_distance(&self, other: &Self) -> u32 {
-        match (self, other) {
-            (
-                wellen::SignalValue::Binary(self_data, self_bits),
-                wellen::SignalValue::Binary(other_data, other_bits),
-            ) => {
-                if self_bits != other_bits {
-                    panic!("Cannot compare different bit widths!");
-                }
-                self_data
-                    .iter()
-                    .zip(other_data.iter())
-                    .map(|(a, b)| (a ^ b).count_ones())
-                    .sum()
-            }
-            _ => 0,
-        }
-    }
+            (low_index, high_index, label)
+        })
+        .collect()
 }
 
 pub fn load_waveform<P: AsRef<Path>>(
@@ -123,7 +108,10 @@ pub fn load_waveform<P: AsRef<Path>>(
     }
     info!("Read body in {:.2}s", start_time.elapsed().as_secs_f32());
 
-    info!("Total number of samples: {}", body.time_table.len().to_formatted_string(&Locale::en));
+    info!(
+        "Total number of samples: {}",
+        body.time_table.len().to_formatted_string(&Locale::en)
+    );
 
     let signal_refs = hierarchy.iter_vars().map(|v| v.signal_ref()).collect_vec();
 
@@ -131,7 +119,10 @@ pub fn load_waveform<P: AsRef<Path>>(
 
     wave_source.print_statistics();
 
-    info!("Loading {} signals..", signal_refs.len().to_formatted_string(&Locale::en));
+    info!(
+        "Loading {} signals..",
+        signal_refs.len().to_formatted_string(&Locale::en)
+    );
     let start_time = std::time::Instant::now();
     // wave_source.print_statistics();
     let signals = wave_source.load_signals(&signal_refs, &hierarchy, load_opts.multi_thread);

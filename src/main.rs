@@ -1,9 +1,4 @@
 use clap::Parser;
-use indicatif::ProgressStyle;
-use itertools::Itertools;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread;
 
 use plotly::common::Mode;
 use plotly::{Plot, Scatter};

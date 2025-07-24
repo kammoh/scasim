@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 #[command(version)]
 #[command(about = "Test-Vector Leakage Analysis", long_about = None)]
 struct Args {
-    #[arg(value_name = "META_JSON", index = 1)]
+    #[arg(long = "meta-json", value_name = "META_JSON")]
     maybe_metadata: Option<String>,
     #[arg(long = "meta-list", value_name = "META_LIST_PATH")]
     maybe_meta_list_path: Option<String>,
@@ -50,8 +50,8 @@ struct Args {
     )]
     show_plots: bool,
     #[arg(
+        long,
         help = "Plot the t-test results",
-        required = false,
         default_value_t = true
     )]
     plot: bool,
@@ -62,6 +62,7 @@ struct Args {
     )]
     use_existing: bool,
     #[arg(
+        long,
         value_name = "PLOTS_OUTPUT_DIR",
         help = "Directory to save the ttest results and plot files",
         default_value = ""
@@ -84,36 +85,10 @@ fn get_metadata<P: AsRef<Path>>(
     }
 }
 
-fn markers_to_time_indices(
-    meta_markers: &[Vec<u64>],
-    time_table: &[u64],
-) -> Vec<(usize, usize, u16)> {
-    // convert the markers to time index intervals
-    // each marker has 3 u64 elements: start_time, end_time, and label
-    // returns a vector of tuples of (low_index, high_index, label) where low_index..high_index is the range of time indices for the marker
-    // use the fact that both meta_markers and time_table are sorted by time
-
-    meta_markers
-        .iter()
-        .map(|marker| {
-            let start_time = marker[0];
-            let end_time = marker[1];
-            let label = marker[2] as u16;
-
-            // find the start index
-            let low_index = time_table.binary_search(&start_time).unwrap_or_else(|x| x);
-            // find the end index
-            let high_index = time_table.binary_search(&end_time).unwrap_or_else(|x| x);
-
-            (low_index, high_index, label)
-        })
-        .collect()
-}
-
 fn cut_trace(
     power_table: &[f32],
     time_table: &[u64],
-    meta_markers: &[Vec<u64>],
+    meta_markers: &[(u64, u64, u16)],
 ) -> (Array2<f32>, Array1<u16>) {
     println!("Converting markers to time indices...");
     let start_time = std::time::Instant::now();
@@ -166,16 +141,16 @@ fn main() -> miette::Result<()> {
         std::fs::read_to_string(meta_list_path)
             .expect("Failed to read meta list file")
             .lines()
-            .map(|line| {
+            .filter_map(|line| {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
-                    panic!("Empty line in meta list file");
+                    return None; // Skip empty lines
                 }
                 let mut p = PathBuf::from(trimmed);
                 if !p.is_absolute() {
                     p = meta_root_path.join(p);
                 }
-                p
+                Some(p)
             })
             .collect_vec()
     } else if let Some(filename) = args.maybe_metadata {
@@ -188,6 +163,11 @@ fn main() -> miette::Result<()> {
     let mut samples_per_trace = 0;
     let mut max_t_values = vec![Vec::<f64>::new(); order];
     let mut num_traces_so_far = vec![];
+    // Initial max |t| is 0.0 for each order corresponding to 0 traces
+    max_t_values.iter_mut().for_each(|v| {
+        v.push(0.0);
+    });
+    num_traces_so_far.push(0);
 
     let mut maybe_ttacc: Option<ttest::Ttest> = None;
 
@@ -240,14 +220,18 @@ fn main() -> miette::Result<()> {
         let npz_path = parent_folder_path.join(npz_filename);
 
         let use_existing = if args.use_existing && npz_path.exists() {
-            // Check if the npz file is older than the trace file
-            let npz_modified = std::fs::metadata(&npz_path).and_then(|m| m.modified());
-            let trace_modified = std::fs::metadata(&trace_file_path).and_then(|m| m.modified());
-            if let (Ok(npz_modified), Ok(trace_modified)) = (npz_modified, trace_modified) {
-                // Use existing if npz file is newer than trace file
-                npz_modified > trace_modified
+            if !trace_file_path.exists() {
+                true
             } else {
-                false
+                // Check if the npz file is older than the trace file
+                let npz_modified = std::fs::metadata(&npz_path).and_then(|m| m.modified());
+                let trace_modified = std::fs::metadata(&trace_file_path).and_then(|m| m.modified());
+                if let (Ok(npz_modified), Ok(trace_modified)) = (npz_modified, trace_modified) {
+                    // Use existing if npz file is newer than trace file
+                    npz_modified > trace_modified
+                } else {
+                    false
+                }
             }
         } else {
             false
@@ -288,8 +272,32 @@ fn main() -> miette::Result<()> {
             let clock_period = metadata_json.get("clock_period").and_then(|v| v.as_u64());
             let cp = clock_period.unwrap_or_default();
             // .expect("clock_period not found in the metadata"); // FIXME optional
+            let meta_markers = metadata_json
+                .get("markers")
+                .map(|v| {
+                    v.as_array()
+                        .unwrap()
+                        .into_iter()
+                        .map(|e| {
+                            let (start_time, end_time, label) =  e.as_array()
+                                .unwrap()
+                                .into_iter()
+                                .map(|i| i.as_u64().unwrap())
+                                .collect_tuple().unwrap();
+                            (start_time, end_time, label as u16)
+                        })
+                        .collect_vec()
+                })
+                .expect("markers not found in metadata");
 
-            
+            if false {
+                let (traces_array, labels_array, _) = traces_from_fst(
+                    &trace_file_path,
+                    &meta_markers,
+                    |t| clock_period.map(|cp| t % cp == 0).unwrap_or(true),
+                ).expect("Failed to load traces from FST file");
+                (traces_array, labels_array)
+            } else {
             println!("Loading signals from the waveform...");
             let start_time = std::time::Instant::now();
             let (signals, time_table) =
@@ -316,22 +324,7 @@ fn main() -> miette::Result<()> {
                 start_time.elapsed().as_secs_f32()
             );
 
-            let meta_markers = metadata_json
-                .get("markers")
-                .map(|v| {
-                    v.as_array()
-                        .unwrap()
-                        .into_iter()
-                        .map(|e| {
-                            e.as_array()
-                                .unwrap()
-                                .into_iter()
-                                .map(|i| i.as_u64().unwrap())
-                                .collect_vec()
-                        })
-                        .collect_vec()
-                })
-                .expect("markers not found in metadata");
+            
 
             println!("Cutting traces based on markers...");
             let start_time = std::time::Instant::now();
@@ -365,6 +358,7 @@ fn main() -> miette::Result<()> {
 
             (traces_array, labels_array)
         }
+        }
     }).collect_vec_list();
 
 
@@ -372,17 +366,41 @@ fn main() -> miette::Result<()> {
     let t_values = collected_traces
         .into_iter()
         .flatten()
-        .fold(None, |_, (traces_array, labels_array)| {
+        .fold(None, |_prev_tvalues, (traces_array, labels_array)| {
             let (num_traces, cur_samples_per_trace) = traces_array.dim();
-            if samples_per_trace == 0 {
+            let traces_array = if samples_per_trace == 0 {
                 // Initialize samples_per_trace with the length of the first trace
                 samples_per_trace = cur_samples_per_trace;
-            } else if samples_per_trace != cur_samples_per_trace {
-                panic!(
+                traces_array
+            } else {
+                if samples_per_trace == cur_samples_per_trace {
+                    traces_array
+                } else {
+                error!(
                     "Inconsistent number of samples per trace: expected {}, found {}",
                     samples_per_trace, cur_samples_per_trace
                 );
-            }
+                if cur_samples_per_trace > samples_per_trace {
+                    warn!(
+                        "Using the first {} samples of the longer trace",
+                        samples_per_trace
+                    );
+                    // Array2::<f32>::from(traces_array.slice(s![.., ..samples_per_trace]))
+                    traces_array.slice(s![.., ..samples_per_trace]).to_owned()
+                } else {
+                    error!(
+                        "skipping trace with {} samples as expected {}",
+                        cur_samples_per_trace, samples_per_trace
+                    );
+                    // create a larger array with zeros
+                    let mut t = Array2::<f32>::zeros((num_traces, samples_per_trace));
+                    // fill in each row with the available samples
+                    for (i, row) in traces_array.outer_iter().enumerate() {
+                        t.slice_mut(s![i, ..row.len()]).assign(&row);
+                    }
+                    t
+                }
+            }};
             num_traces_so_far.push(
                 num_traces_so_far
                     .last()
@@ -452,6 +470,7 @@ fn main() -> miette::Result<()> {
         plot_t_traces(
             t_values,
             t_threshold,
+            false, // abs_values
             &output_dir,
             args.show_plots,
             &plots_config,
