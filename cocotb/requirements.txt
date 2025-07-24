@@ -1,0 +1,6 @@
+cocotb      @ git+https://github.com/cocotb/cocotb.git@stable/1.9
+cocotb-bus  @ git+https://github.com/cocotb/cocotb-bus.git
+pytest
+# numpy
+coverage
+joblib
