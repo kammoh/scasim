@@ -107,6 +107,7 @@ def build_simulation(
     build: bool = True,
     waves: bool | None = None,
     trace_ext="fst",
+    trace_threads: int = 2,
     verbose: bool = False,
 ):
     build_args: list[str | VHDL | Verilog] = []
@@ -152,9 +153,9 @@ def build_simulation(
                 "16384",
                 "--trace-max-width",
                 "16384",
-                "--trace-threads",
-                "4",
             ]
+            if trace_threads > 0:
+                verilate_flags += ["--trace-threads", str(trace_threads)]
             if trace_ext == "fst":
                 verilate_flags += ["--trace-fst"]
             elif trace_ext == "vcd":
@@ -226,9 +227,25 @@ def run_test(
     print(f"Results file: {results_xml_file}")
 
     if results_xml_file and results_xml_file.exists():
-        print(parse_results(results_xml_file))
+        results = parse_results(results_xml_file)
+        print(results)
+        if not results:
+            print(f"Warning: no test results found in {results_xml_file}")
+            exit(1)
+        failed = results.count(lambda ts: ts.failures > 0 or ts.errors > 0)
+        if failed > 0:
+            print(f"Test run failed with {failed} failures/errors")
+            for ts in results:
+                print(f"Random seed: {ts.random_seed}")
+                for tc in ts.test_cases:
+                    print(
+                        f"{tc.name} ({tc.classname}) - {tc.status} - time: {tc.time:.3f}s, sim_time: {tc.sim_time_ns:.3f}ns, ratio: {tc.ratio_time:.3f}"
+                    )
+            exit(1)
+
     else:
         print("No results file found")
+        exit(1)
 
 
 if __name__ == "__main__":
@@ -303,10 +320,21 @@ if __name__ == "__main__":
         help="name of the trace file to generate (default: tvla.fst)",
     )
     argparser.add_argument(
+        "--trace-threads",
+        type=int,
+        default=1,
+        help="number of threads to use for tracing (default: 1)",
+    )
+    argparser.add_argument(
         "--multi",
         "--multiple-runs",
         type=int,
         help="run the test multiple times with different seeds",
+    )
+    argparser.add_argument(
+        "--no-random",
+        action="store_true",
+        help="sets the TVLA_DISABLE_RANDOM environment variable to 1",
     )
     argparser.add_argument(
         "--multi-dir-suffix",
@@ -360,7 +388,14 @@ if __name__ == "__main__":
             print(f"Error: source file {src} does not exist")
             exit(1)
 
-    test_root = args.test_root or Path.cwd() / "tvla_run" / args.top
+    from hashlib import sha256
+
+    # from pathlib import Path
+    source_hashes = [sha256(src.read_bytes()).hexdigest() for src in sources]
+    source_hashes.sort()  # sort the hashes to ensure consistent ordering
+    design_hash = sha256("".join(source_hashes).encode("utf-8")).hexdigest()[:8]
+    design_dir_name = f"{args.top}_{design_hash}"
+    test_root = args.test_root or Path.cwd() / "tvla_run" / design_dir_name
     build_dir: Path = test_root / "sim_build"
 
     if not build_dir.exists():
@@ -397,6 +432,7 @@ if __name__ == "__main__":
             sim="verilator",
             waves=True,
             trace_ext=trace_ext,
+            trace_threads=args.trace_threads,
             verbose=args.verbose,
         )
     else:
@@ -457,7 +493,7 @@ if __name__ == "__main__":
             extra_env=run_extra_env,
         )
 
-    def run_multi(id, multi_test_dir: Path):
+    def run_multi(id, multi_test_dir: Path, extra_env):
         assert (
             args.seed is None
         ), "Multi tests should not use a fixed seed, it will be generated randomly for each run"
@@ -506,6 +542,8 @@ if __name__ == "__main__":
             exit(1)
         dir_suffix = args.multi_dir_suffix
         assert dir_suffix, "Directory suffix for multi tests cannot be empty"
+        if args.no_random:
+            dir_suffix += "_no_random"
         multi_test_top_dir = test_root / test_case / dir_suffix
         if not multi_test_top_dir.exists():
             multi_test_top_dir.mkdir(parents=True, exist_ok=True)
@@ -513,9 +551,15 @@ if __name__ == "__main__":
             print(
                 f"Warning: multi test directory {multi_test_top_dir} already exists. Results will be appended to the existing ones."
             )
+        if args.no_random:
+            print("Disabling randomization for multi tests")
+            extra_env["TVLA_DISABLE_RANDOM"] = "1"
+        print(
+            f"Running {num_runs} multi tests in {multi_test_top_dir} with parallel jobs: {args.parallel_jobs}"
+        )
         n_jobs = min(num_runs, args.parallel_jobs)
         meta_files = Parallel(n_jobs=n_jobs)(
-            delayed(run_multi)(i, multi_test_top_dir) for i in range(num_runs)
+            delayed(run_multi)(i, multi_test_top_dir, extra_env) for i in range(num_runs)
         )
         if any(f is None for f in meta_files):
             print("Warning: Some meta files were not created during the multi test runs")
@@ -537,7 +581,7 @@ if __name__ == "__main__":
             seed = int(args.seed) & 0x7FFF_FFFF  # ensure seed is a 31-bit integer
 
         constant_rand_confs = [False, True]
-        if args.single_test:
+        if args.single_test or args.no_random:
             constant_rand_confs = [False]
 
         n_jobs = min(len(constant_rand_confs), args.parallel_jobs)

@@ -19,7 +19,6 @@ bitvec = "1.0.1"
 linereader = "0.4.0"
 atoi_radix10 = "0.0.1"
 plotly = { version = "0.13.4", features = [
-    "plotly_static",
     "static_export_default",
     "plotly_embed_js",
     "plotly_image",

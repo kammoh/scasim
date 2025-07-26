@@ -18,6 +18,7 @@ pub fn plot_t_traces<D: Dimension, P: AsRef<Path>>(
     output_dir: P,
     show_plots: bool,
     plots_config: &plotly::Configuration,
+    image_exporter: &mut plotly_static::StaticExporter,
 ) -> miette::Result<()> {
     let threshold_lines = if let Some(t) = t_threshold {
         let pos = plotly::layout::Shape::new()
@@ -52,10 +53,6 @@ pub fn plot_t_traces<D: Dimension, P: AsRef<Path>>(
     } else {
         vec![]
     };
-
-    let mut image_exporter = plotly_static::StaticExporterBuilder::default()
-        .build()
-        .expect("Failed to create static exporter");
 
     let lines = threshold_lines.clone();
     let y_label = if abs_values { "|t|" } else { "t-value" };
@@ -95,12 +92,10 @@ pub fn plot_t_traces<D: Dimension, P: AsRef<Path>>(
             // y_max is: if t_threshold is Some(t) => Some(v) where v is the maximum if t and the absolute value of the t-values, otherwise its None
             let max_y = if let Some(t) = t_threshold {
                 Some(
-                    if abs_values {
-                        ord_t_values.iter().fold(t, |acc, &x| acc.max(x.abs()))
-                    } else {
-                        ord_t_values.iter().fold(t, |acc, &x| acc.max(x))
-                    }
-                    .max(1.5 * t)
+                    ord_t_values
+                        .iter()
+                        .fold(t, |acc, &x| acc.max(x.abs()))
+                        .max(1.5 * t)
                         + 0.5,
                 )
             } else {
@@ -119,11 +114,6 @@ pub fn plot_t_traces<D: Dimension, P: AsRef<Path>>(
             };
             t_plot.set_layout(
                 plotly::Layout::new()
-                    .title(format!(
-                        "{}-order t-test: {} vs time",
-                        Osize::from1(d).to_string().capitalize(),
-                        y_label
-                    ))
                     .shapes(lines.clone())
                     .x_axis(plotly::layout::Axis::new().title("Time (cycles)"))
                     .y_axis(y_axis),
@@ -134,12 +124,12 @@ pub fn plot_t_traces<D: Dimension, P: AsRef<Path>>(
             let html_output_path = output_dir.as_ref().join(file_stem.with_extension("html"));
             info!("Writing t_plot to {}", html_output_path.display());
             t_plot.write_html(html_output_path);
-            let pdf_output_path = output_dir.as_ref().join(file_stem.with_extension("pdf"));
-            info!("Writing t_plot to {}", pdf_output_path.display());
+            let image_output_path = output_dir.as_ref().join(file_stem.with_extension("svg"));
+            info!("Writing t_plot to {}", image_output_path.display());
             if let Err(e) = t_plot.write_image_with_exporter(
-                &mut image_exporter,
-                pdf_output_path,
-                plotly_static::ImageFormat::PDF,
+                image_exporter,
+                image_output_path,
+                plotly_static::ImageFormat::SVG,
                 800,
                 600,
                 1.0,
@@ -159,7 +149,6 @@ pub fn plot_t_traces<D: Dimension, P: AsRef<Path>>(
     all_t_plot.set_configuration(plots_config.clone());
     all_t_plot.set_layout(
         plotly::Layout::new()
-            .title(format!("{} vs time", y_label))
             .x_axis(plotly::layout::Axis::new().title("time (cycles)"))
             .y_axis(plotly::layout::Axis::new().title(Title::with_text(y_label)))
             .shapes(threshold_lines),
@@ -186,6 +175,7 @@ pub fn plot_max_t_values(
     output_dir: &Path,
     show_plots: bool,
     plots_config: &plotly::Configuration,
+    image_exporter: &mut plotly_static::StaticExporter,
 ) -> miette::Result<()> {
     assert!(num_traces_so_far.len() == max_t_values[0].len());
 
@@ -210,7 +200,7 @@ pub fn plot_max_t_values(
 
     max_t_plot.set_layout(
         plotly::Layout::new()
-            .title("Max t-values (max(|t|)) vs Number of Traces")
+            // .title("Max t-values (max(|t|)) vs Number of Traces")
             .x_axis(plotly::layout::Axis::new().title("Number of Traces"))
             .y_axis(plotly::layout::Axis::new().title("max(|t|)"))
             .shapes(threshold_line.into_iter().collect()),
@@ -235,7 +225,8 @@ pub fn plot_max_t_values(
         max_t_plot.add_trace(max_t_trace);
     }
     let max_t_plot_file_stem = PathBuf::from("max_t_values");
-    let html_output_path = output_dir.join(max_t_plot_file_stem.with_extension("html"));
+    let max_t_plot_file_stem = output_dir.join(max_t_plot_file_stem);
+    let html_output_path = max_t_plot_file_stem.with_extension("html");
     info!("Writing max_t_plot to {}", html_output_path.display());
     max_t_plot.write_html(html_output_path);
     // max_t_plot.write_image(
@@ -245,10 +236,24 @@ pub fn plot_max_t_values(
     //     400,
     //     1.0,
     // );
-    let max_t_plot_json_path = output_dir.join(max_t_plot_file_stem.with_extension("json"));
+    let max_t_plot_json_path = max_t_plot_file_stem.with_extension("json");
     info!("Writing max_t_plot to {}", max_t_plot_json_path.display());
     std::fs::write(max_t_plot_json_path, max_t_plot.to_json())
         .expect("Failed to write max_t_plot to JSON file");
+    info!(
+        "Writing max_t_plot to {}",
+        max_t_plot_file_stem.with_extension("svg").display()
+    );
+    if let Err(e) = max_t_plot.write_image_with_exporter(
+        image_exporter,
+        max_t_plot_file_stem.with_extension("svg"),
+        plotly_static::ImageFormat::SVG,
+        800,
+        600,
+        1.0,
+    ) {
+        log::error!("Failed to write max_t_plot to SVG: {}", e);
+    }
     if show_plots {
         max_t_plot.show();
     }

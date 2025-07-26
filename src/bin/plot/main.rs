@@ -3,7 +3,7 @@ use itertools::Itertools;
 use log::info;
 use ndarray::{Array1, Array2};
 use plotly::common::Mode;
-use plotly::{Plot, Scatter};
+use plotly::{Plot, Scatter, plotly_static};
 use scalib::ttest;
 use scasim::plot::{plot_max_t_values, plot_t_traces};
 use std::fs::File;
@@ -172,6 +172,8 @@ fn main() -> miette::Result<()> {
                 panic!("No NPZ files provided. Please specify at least one NPZ file.");
             }
 
+            let mut total_num_traces = 0;
+
             let t_values = filenames
                 .iter()
                 .fold(None, |_, filename| {
@@ -200,6 +202,8 @@ fn main() -> miette::Result<()> {
                         })
                         .collect();
                     let num_traces = traces.len();
+
+                    total_num_traces += num_traces;
 
                     let traces_array: Array2<f32> = Array2::from_shape_vec(
                         (num_traces, traces[0].len()),
@@ -251,7 +255,15 @@ fn main() -> miette::Result<()> {
                 })
                 .expect("Failed to compute t-test values");
 
+            log::info!("Total number of traces: {}", total_num_traces);
+
             let t_threshold = Some(4.5);
+
+            let mut image_exporter = plotly_static::StaticExporterBuilder::default()
+                .pdf_export_timeout(1000)
+                // .offline_mode(true)
+                .build()
+                .expect("Failed to create static exporter");
 
             plot_t_traces(
                 t_values,
@@ -260,6 +272,7 @@ fn main() -> miette::Result<()> {
                 output_dir,
                 args.show_plots,
                 &plots_config,
+                &mut image_exporter,
             )?;
 
             assert!(max_t_values.len() == order);
@@ -272,6 +285,7 @@ fn main() -> miette::Result<()> {
                 output_dir,
                 args.show_plots,
                 &plots_config,
+                &mut image_exporter,
             )?;
         }
     }

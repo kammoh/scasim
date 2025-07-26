@@ -3,6 +3,7 @@ use itertools::Itertools;
 use log::*;
 use ndarray::{Array1, Array2, s};
 use ndarray_npz::{NpzReader, NpzWriter};
+use plotly::plotly_static;
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use scalib::ttest;
 use scasim::plot::*;
@@ -191,12 +192,14 @@ fn main() -> miette::Result<()> {
         default_num_threads
     );
 
-    let collected_traces = filenames.into_par_iter().map(|metadata_path| {
+
+    let collected_traces = filenames.into_par_iter().filter_map(|metadata_path| {
         if !metadata_path.exists() {
-            panic!(
+            log::error!(
                 "Metadata file '{}' does not exist!",
                 metadata_path.display()
             );
+            return None;
         }
 
         let metadata_json = get_metadata(
@@ -267,7 +270,7 @@ fn main() -> miette::Result<()> {
                 traces.into_iter().flatten().collect(),
             )
             .expect("Failed to create traces array");
-            (traces_array, labels_array)
+            Some((traces_array, labels_array))
         } else {
             let clock_period = metadata_json.get("clock_period").and_then(|v| v.as_u64());
             let cp = clock_period.unwrap_or_default();
@@ -296,7 +299,7 @@ fn main() -> miette::Result<()> {
                     &meta_markers,
                     |t| clock_period.map(|cp| t % cp == 0).unwrap_or(true),
                 ).expect("Failed to load traces from FST file");
-                (traces_array, labels_array)
+                Some((traces_array, labels_array))
             } else {
             println!("Loading signals from the waveform...");
             let start_time = std::time::Instant::now();
@@ -356,18 +359,20 @@ fn main() -> miette::Result<()> {
                 start_time.elapsed().as_secs_f32()
             );
 
-            (traces_array, labels_array)
+            Some((traces_array, labels_array))
         }
         }
     }).collect_vec_list();
 
 
+    let mut total_collected_traces: usize = 0;
     // must be done sequentially
     let t_values = collected_traces
         .into_iter()
         .flatten()
         .fold(None, |_prev_tvalues, (traces_array, labels_array)| {
             let (num_traces, cur_samples_per_trace) = traces_array.dim();
+            total_collected_traces += num_traces;
             let traces_array = if samples_per_trace == 0 {
                 // Initialize samples_per_trace with the length of the first trace
                 samples_per_trace = cur_samples_per_trace;
@@ -441,6 +446,11 @@ fn main() -> miette::Result<()> {
         })
         .expect("Failed to compute t-test values");
 
+    log::info!(
+        "Total number of traces: {}",
+        total_collected_traces
+    );
+
     let output_dir = PathBuf::from(&args.ttest_output_dir);
     if !output_dir.exists() {
         std::fs::create_dir_all(&output_dir).expect("Failed to create output directory for plots");
@@ -457,6 +467,12 @@ fn main() -> miette::Result<()> {
     info!("Saved t_values to {}", npz_path.display());
 
     if args.plot {
+        let mut image_exporter = plotly_static::StaticExporterBuilder::default()
+            .pdf_export_timeout(1000)
+            // .offline_mode(true)
+            .build()
+            .expect("Failed to create static exporter");
+
         let plots_config = plotly::Configuration::new()
             .display_mode_bar(plotly::configuration::DisplayModeBar::Hover)
             .show_link(false)
@@ -474,6 +490,7 @@ fn main() -> miette::Result<()> {
             &output_dir,
             args.show_plots,
             &plots_config,
+            &mut image_exporter,
         )?;
 
         plot_max_t_values(
@@ -483,6 +500,7 @@ fn main() -> miette::Result<()> {
             &output_dir,
             args.show_plots,
             &plots_config,
+            &mut image_exporter,
         )?;
     }
 
