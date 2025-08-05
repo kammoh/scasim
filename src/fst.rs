@@ -1,10 +1,10 @@
 use fst_reader::{FstFilter, FstReader, FstSignalValue};
 
-use gxhash::{HashMap, HashMapExt};
 use itertools::Itertools;
 use log::info;
 use miette::{Context, IntoDiagnostic};
 use ndarray::{Array1, Array2};
+use rustc_hash::FxHashMap as HashMap;
 
 use std::io::BufReader;
 use std::path::Path;
@@ -85,8 +85,10 @@ pub fn traces_from_fst<P: AsRef<Path>, F: Fn(u64) -> bool>(
             let high_index = time_table.binary_search(&end).unwrap_or_else(|x| x);
 
             let time_table_slice = &time_table[low_index..high_index];
-            let mut last_values: HashMap<u32, Vec<u8>> =
-                HashMap::with_capacity(header.var_count as usize);
+            let mut last_values: HashMap<u32, Vec<u8>> = HashMap::with_capacity_and_hasher(
+                header.var_count as usize,
+                rustc_hash::FxBuildHasher,
+            );
             let filter = FstFilter::filter_time(*start, *end - 1);
             fst_reader
                 .read_signals(
