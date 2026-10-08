@@ -5,6 +5,7 @@ use crate::hierarchy::{HierarchyIndex, Selection, SelectionError};
 use std::collections::BTreeSet;
 use std::path::Path;
 
+pub mod fst;
 pub mod reference;
 mod slots;
 pub mod stats;
@@ -360,9 +361,13 @@ impl PowerTrace {
 }
 
 /// Computes the activity of a waveform file with one bin per distinct time of its time table.
-/// All formats use the `wellen` reference path.
+/// FST files use the fast path; other formats (VCD, GHW) use the `wellen` reference path.
 pub fn activity(path: &Path, plan: &PowerPlan) -> Result<ActivityTrace, PowerError> {
-    reference::activity_reference(path, plan)
+    if is_fst(path)? {
+        fst::activity_fst(path, plan)
+    } else {
+        reference::activity_reference(path, plan)
+    }
 }
 
 /// Computes the activity of a waveform file in the given bins.
@@ -371,7 +376,11 @@ pub fn activity_binned(
     plan: &PowerPlan,
     bins: &Bins,
 ) -> Result<ActivityTrace, PowerError> {
-    reference::activity_reference_binned(path, plan, bins)
+    if is_fst(path)? {
+        fst::activity_fst_binned(path, plan, bins)
+    } else {
+        reference::activity_reference_binned(path, plan, bins)
+    }
 }
 
 /// Toggle counts of the selected signals, as one trace.
@@ -394,8 +403,18 @@ pub fn power_trace(
 
 /// Reads the signal paths of a waveform file, without any values.
 pub fn hierarchy_index(path: &Path) -> Result<HierarchyIndex, PowerError> {
-    let header = wellen::viewers::read_header_from_file(path, &reference::load_options())?;
-    Ok(HierarchyIndex::from_wellen(&header.hierarchy))
+    if is_fst(path)? {
+        let mut reader = fst::open_reader(path)?;
+        Ok(HierarchyIndex::from_fst(&mut reader)?)
+    } else {
+        let header = wellen::viewers::read_header_from_file(path, &reference::load_options())?;
+        Ok(HierarchyIndex::from_wellen(&header.hierarchy))
+    }
+}
+
+fn is_fst(path: &Path) -> Result<bool, PowerError> {
+    let mut file = std::fs::File::open(path)?;
+    Ok(fst_reader::is_fst_file(&mut file))
 }
 
 #[cfg(test)]

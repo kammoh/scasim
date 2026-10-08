@@ -17,7 +17,6 @@ pub(crate) struct Placement {
     /// The global slot that local slot 0 stands for.
     pub first_slot: usize,
     /// The number of local slots. It is 0 if every time point is ignored.
-    #[allow(dead_code)] // Only the fast FST path reads it.
     pub slot_count: usize,
     /// The local slot of each time point, or `IGNORED`.
     local: Vec<u32>,
@@ -101,7 +100,6 @@ impl SlotStats {
     }
 
     /// Adds slot `i` of `other` to slot `offset + i` of `self`, for every slot of `other`.
-    #[allow(dead_code)] // Only the fast FST path calls it.
     pub fn add_window(&mut self, offset: usize, other: &SlotStats) {
         fn add_all<T: Copy + std::ops::AddAssign>(dst: &mut [T], src: &[T]) {
             for (d, s) in dst.iter_mut().zip(src) {
@@ -164,7 +162,6 @@ impl SlotStats {
 
 /// Adds the per-channel statistics `b` to `a`. Both cover the same slots, or one of them is
 /// empty (no data yet).
-#[allow(dead_code)] // Only the fast FST path calls it.
 pub(crate) fn merge_channel_stats(mut a: Vec<SlotStats>, b: Vec<SlotStats>) -> Vec<SlotStats> {
     if a.is_empty() {
         return b;
