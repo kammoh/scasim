@@ -56,7 +56,7 @@ impl Fixture {
     }
 
     /// The paths of signal `index`: its own path, then the path of each alias.
-    fn paths(&self, index: usize) -> Vec<String> {
+    pub fn paths(&self, index: usize) -> Vec<String> {
         let join = |scope: &str, name: &str| {
             if scope.is_empty() {
                 name.to_string()

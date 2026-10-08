@@ -10,6 +10,7 @@ use std::thread;
 pub mod hierarchy;
 pub mod optional_filter;
 pub mod plot;
+pub mod power;
 pub mod power_model;
 
 pub use optional_filter::*;
