@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
+pub mod hierarchy;
 pub mod optional_filter;
 pub mod plot;
 pub mod power_model;
