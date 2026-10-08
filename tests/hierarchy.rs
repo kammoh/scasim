@@ -262,3 +262,126 @@ fn vcd_variables_without_bit_vector_values_get_no_path() {
     assert_eq!(names.len(), 2, "{names:?}");
     assert!(names.contains(&"tb.bits") && names.contains(&"tb.last"));
 }
+
+/// A vector that the dumper writes bit by bit as `d [0]`, `d [1]`, and `d [2]`, and the same
+/// bits again in a second scope. `wellen` merges adjacent bits with the same name into one
+/// variable that is derived from the bit signals. Handles 0 to 2 are the bits, and handle 3 is
+/// an ordinary signal.
+fn bit_by_bit_fixture() -> Fixture {
+    let sig = |name: &str, width| FixtureSignal {
+        scope: "tb".into(),
+        name: name.into(),
+        width,
+    };
+    let mut fx = Fixture::flat(&[]);
+    fx.signals = vec![
+        sig("d [0]", 1),
+        sig("d [1]", 1),
+        sig("d [2]", 1),
+        sig("e", 4),
+    ];
+    fx.aliases = (0..3)
+        .map(|bit| ("tb.u".to_string(), format!("d [{bit}]"), bit))
+        .collect();
+    fx.initial = vec!["0".into(), "0".into(), "0".into(), "0000".into()];
+    fx
+}
+
+/// The input handle indices of every derived signal that `wellen` reports for the file.
+fn derived_inputs(path: &Path) -> Vec<Vec<usize>> {
+    let header =
+        wellen::viewers::read_header_from_file(path, &wellen::LoadOptions::default()).unwrap();
+    header
+        .hierarchy
+        .all_derived_signals()
+        .map(|(_, derived)| {
+            let mut inputs: Vec<usize> = derived.inputs().iter().map(|i| i.index()).collect();
+            inputs.sort();
+            inputs
+        })
+        .collect()
+}
+
+/// Checks the index that `from_wellen` builds for the file of `bit_by_bit_fixture`.
+fn check_merged_vector_paths(path: &Path) {
+    // The test is only useful if `wellen` merges the bits into one derived signal.
+    assert_eq!(derived_inputs(path), vec![vec![0, 1, 2]]);
+    let index = wellen_index(path);
+    // The derived signal has a handle after the four real handles. No path may use it.
+    assert_eq!(index.paths.len(), 4);
+    // Every bit gets the paths of the merged variable in both scopes.
+    for bit in 0..3 {
+        assert_eq!(
+            sorted_paths(&index, bit),
+            vec!["tb.d", "tb.u.d"],
+            "bit {bit}"
+        );
+        assert!(index.paths[bit].iter().all(|p| !p.is_alias));
+    }
+    assert_eq!(sorted_paths(&index, 3), vec!["tb.e"]);
+    // A rule that names the merged vector selects all of its bits.
+    assert_eq!(
+        select(&index, &["+signal:tb.u.d"]),
+        vec![true, true, true, false]
+    );
+    assert_eq!(
+        select(&index, &["-signal:tb.d"]),
+        vec![false, false, false, true]
+    );
+}
+
+#[test]
+fn wellen_gives_every_bit_of_a_merged_vector_the_paths_of_the_vector() {
+    let (_dir, path) = temp_fst(&bit_by_bit_fixture());
+    check_merged_vector_paths(&path);
+    // The FST index lists the same paths for every bit handle.
+    let fst = fst_index(&path);
+    let wellen = wellen_index(&path);
+    assert_eq!(wellen.paths.len(), fst.paths.len());
+    for h in 0..fst.paths.len() {
+        let key = |p: &SignalPath| (p.path.clone(), p.scope.clone(), p.modules.clone());
+        let mut from_fst: Vec<_> = fst.paths[h].iter().map(key).collect();
+        let mut from_wellen: Vec<_> = wellen.paths[h].iter().map(key).collect();
+        from_fst.sort();
+        from_wellen.sort();
+        assert_eq!(from_wellen, from_fst, "handle {h}");
+    }
+}
+
+#[test]
+fn wellen_maps_a_merged_vector_in_a_vcd_file_to_its_bit_handles() {
+    let (_dir, path) = temp_vcd(&bit_by_bit_fixture());
+    check_merged_vector_paths(&path);
+}
+
+#[test]
+fn derived_signals_of_simulator_files_map_to_the_same_input_handles_as_fst() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fst-reader/fsts");
+    for name in [
+        "questa-sim/dump.vcd.fst",
+        "riviera-pro/dump.vcd.fst",
+        "vcs/processor.vcd.fst",
+    ] {
+        let path = root.join(name);
+        let header =
+            wellen::viewers::read_header_from_file(&path, &wellen::LoadOptions::default()).unwrap();
+        let derived: Vec<_> = header.hierarchy.all_derived_signals().collect();
+        assert!(!derived.is_empty(), "{name} has no derived signal");
+        let fst = fst_index(&path);
+        let wellen = HierarchyIndex::from_wellen(&header.hierarchy);
+        // The handles of derived signals come after the real handles. No path may use them.
+        assert!(wellen.paths.len() <= fst.paths.len(), "{name}");
+        for (_, d) in derived {
+            for input in d.inputs() {
+                let h = input.index();
+                let key = |p: &SignalPath| (p.path.clone(), p.scope.clone(), p.modules.clone());
+                let mut from_fst: Vec<_> = fst.paths[h].iter().map(key).collect();
+                let mut from_wellen: Vec<_> = wellen.paths[h].iter().map(key).collect();
+                from_fst.sort();
+                from_wellen.sort();
+                assert!(!from_fst.is_empty(), "{name}: handle {h} has no path");
+                assert_eq!(from_wellen, from_fst, "{name}: handle {h}");
+            }
+        }
+    }
+}

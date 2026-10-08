@@ -33,8 +33,9 @@ pub struct HierarchyIndex {
 /// A range without a space before it must contain a colon: `mem[3]` is an array element and stays.
 ///
 /// A name that consists only of a bit range, such as `[3:0]`, stays whole, so the result is never
-/// empty. For example, `wellen` can turn `tdata[1714295607408:1714295607407]` into the scope
-/// `tdata` and the variable name `[1714295607408:1714295607407]`.
+/// empty. The same holds if only white space comes before the range. For example, `wellen` can
+/// turn `tdata[1714295607408:1714295607407]` into the scope `tdata` and the variable name
+/// `[1714295607408:1714295607407]`.
 pub fn strip_bit_range(name: &str) -> &str {
     let Some(open) = name.rfind('[') else {
         return name;
@@ -56,8 +57,9 @@ pub fn strip_bit_range(name: &str) -> &str {
         None if inner.contains(':') => &name[..open],
         None => name,
     };
-    // A name that consists only of a bit range stays whole. The name must not become empty.
-    if base.is_empty() { name } else { base }
+    // A name that consists only of a bit range stays whole. The name must not become empty or
+    // consist only of white space.
+    if base.trim().is_empty() { name } else { base }
 }
 
 /// The scopes that are open while a hierarchy is walked.
@@ -454,6 +456,9 @@ mod tests {
             "[1714295607408:1714295607407]"
         );
         assert_eq!(strip_bit_range(" [3:0]"), " [3:0]");
+        // Only white space before the range counts as nothing.
+        assert_eq!(strip_bit_range("  [3:0]"), "  [3:0]");
+        assert_eq!(strip_bit_range("\t[3:0]"), "\t[3:0]");
     }
 
     #[test]
