@@ -13,6 +13,7 @@ pub struct BatchMeta {
     /// Waveform file, resolved relative to the metadata file.
     pub trace_path: PathBuf,
     /// If present, only time points at multiples of the clock period are kept (legacy sampling).
+    /// It is greater than zero. `read_batch_meta` rejects a zero.
     pub clock_period: Option<u64>,
     /// One marker per trace: start time, end time (exclusive), and class label.
     pub markers: Vec<(u64, u64, u16)>,
@@ -40,9 +41,9 @@ pub fn read_batch_meta(meta_path: &Path) -> miette::Result<BatchMeta> {
         .ok_or_else(|| miette!("{}: missing trace_filename", meta_path.display()))?;
     let clock_period = match json.get("clock_period") {
         None | Some(serde_json::Value::Null) => None,
-        Some(v) => Some(v.as_u64().ok_or_else(|| {
+        Some(v) => Some(v.as_u64().filter(|&period| period > 0).ok_or_else(|| {
             miette!(
-                "{}: clock_period must be a non-negative integer, got {v}",
+                "{}: clock_period must be a positive integer, got {v}",
                 meta_path.display()
             )
         })?),
@@ -52,16 +53,27 @@ pub fn read_batch_meta(meta_path: &Path) -> miette::Result<BatchMeta> {
         .and_then(|v| v.as_array())
         .ok_or_else(|| miette!("{}: missing markers", meta_path.display()))?
         .iter()
-        .map(|m| {
-            let m = m
+        .map(|marker| {
+            let values = marker
                 .as_array()
-                .filter(|m| m.len() == 3)
-                .ok_or_else(|| miette!("bad marker {m}"))?;
+                .filter(|values| values.len() == 3)
+                .ok_or_else(|| miette!("{}: bad marker {marker}", meta_path.display()))?;
             let n = |i: usize| {
-                m[i].as_u64()
-                    .ok_or_else(|| miette!("bad marker value {}", m[i]))
+                values[i].as_u64().ok_or_else(|| {
+                    miette!(
+                        "{}: bad marker value {} in {marker}",
+                        meta_path.display(),
+                        values[i]
+                    )
+                })
             };
-            Ok((n(0)?, n(1)?, u16::try_from(n(2)?).into_diagnostic()?))
+            let label = u16::try_from(n(2)?).map_err(|_| {
+                miette!(
+                    "{}: the label of the marker {marker} does not fit in 16 bits",
+                    meta_path.display()
+                )
+            })?;
+            Ok((n(0)?, n(1)?, label))
         })
         .collect::<miette::Result<Vec<_>>>()?;
     let dir = meta_path.parent().unwrap_or(Path::new("."));
@@ -128,6 +140,20 @@ pub struct BatchDiagnostics {
     pub info: RunInfo,
 }
 
+impl BatchDiagnostics {
+    /// True if the legacy sampling drops more than half of the toggles. Then the traces probably
+    /// miss most of the activity of the selected signals.
+    pub fn sampling_drops_most(&self) -> bool {
+        self.kept_toggles.saturating_mul(2) < self.total_toggles
+    }
+
+    /// True if the selected signals lie below more than one top-level scope. Then the selection
+    /// probably includes more than the design under test, for example a testbench.
+    pub fn spans_several_top_scopes(&self) -> bool {
+        self.info.top_scopes.len() > 1
+    }
+}
+
 /// Applies the legacy sampling and the markers to a power trace.
 fn traces_from_power(
     trace: PowerTrace,
@@ -136,8 +162,8 @@ fn traces_from_power(
 ) -> (Array2<f32>, Array1<u16>, BatchDiagnostics) {
     let total_toggles = trace.total();
     let kept = match meta.clock_period {
-        Some(period) if period > 0 => trace.keep_multiples_of(period),
-        _ => trace,
+        Some(period) => trace.keep_multiples_of(period),
+        None => trace,
     };
     let diagnostics = BatchDiagnostics {
         total_toggles,
@@ -268,6 +294,83 @@ mod tests {
             (d.total_toggles, d.kept_toggles, d.segment_toggles),
             (7, 7, 7)
         );
+    }
+
+    fn diagnostics(total: u64, kept: u64, top_scopes: &[&str]) -> BatchDiagnostics {
+        BatchDiagnostics {
+            total_toggles: total,
+            kept_toggles: kept,
+            segment_toggles: 0,
+            info: RunInfo {
+                top_scopes: top_scopes.iter().map(|s| s.to_string()).collect(),
+                ..RunInfo::default()
+            },
+        }
+    }
+
+    #[test]
+    fn sampling_drops_most_when_it_keeps_less_than_half_of_the_toggles() {
+        assert!(!diagnostics(10, 5, &[]).sampling_drops_most(), "half");
+        assert!(diagnostics(10, 4, &[]).sampling_drops_most(), "one less");
+        assert!(!diagnostics(11, 6, &[]).sampling_drops_most(), "odd total");
+        assert!(diagnostics(11, 5, &[]).sampling_drops_most(), "odd total");
+        assert!(diagnostics(10, 0, &[]).sampling_drops_most(), "none kept");
+        assert!(!diagnostics(10, 10, &[]).sampling_drops_most(), "all kept");
+        assert!(!diagnostics(0, 0, &[]).sampling_drops_most(), "no toggles");
+    }
+
+    #[test]
+    fn selection_spans_several_top_scopes_from_two_scopes_on() {
+        assert!(!diagnostics(0, 0, &[]).spans_several_top_scopes());
+        assert!(!diagnostics(0, 0, &["tb"]).spans_several_top_scopes());
+        assert!(diagnostics(0, 0, &["a", "b"]).spans_several_top_scopes());
+        assert!(diagnostics(0, 0, &["a", "b", "c"]).spans_several_top_scopes());
+    }
+
+    #[test]
+    fn cut_traces_gives_an_empty_trace_to_a_marker_that_ends_before_it_starts() {
+        // [30, 10) has low index 3 and high index 1. The range must be empty, not negative.
+        let (traces, labels) = cut_traces(&trace(), &[(30, 10, 1), (10, 30, 0)]);
+        assert_eq!(traces, array![[0.0, 0.0], [2.0, 3.0]]);
+        assert_eq!(labels, array![1u16, 0]);
+        let (_, _, d) =
+            traces_from_power(trace(), &meta(None, vec![(30, 10, 1)]), RunInfo::default());
+        assert_eq!(d.segment_toggles, 0);
+    }
+
+    #[test]
+    fn read_batch_meta_rejects_a_zero_clock_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.json");
+        std::fs::write(
+            &path,
+            r#"{"trace_filename": "a.fst", "clock_period": 0, "markers": []}"#,
+        )
+        .unwrap();
+        let message = read_batch_meta(&path).unwrap_err().to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("clock_period"), "{message}");
+    }
+
+    #[test]
+    fn read_batch_meta_names_the_file_in_marker_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.json");
+        for (markers, what) in [
+            ("[[1, 2]]", "bad marker"),
+            ("[[1, 2, \"x\"]]", "bad marker value"),
+            ("[[1, 2, 70000]]", "label"),
+            ("[[1, -2, 0]]", "bad marker value"),
+        ] {
+            std::fs::write(
+                &path,
+                format!(r#"{{"trace_filename": "a.fst", "markers": {markers}}}"#),
+            )
+            .unwrap();
+            let message = read_batch_meta(&path).unwrap_err().to_string();
+            assert!(message.contains(&path.display().to_string()), "{message}");
+            assert!(message.contains(what), "{markers}: {message}");
+        }
     }
 
     #[test]

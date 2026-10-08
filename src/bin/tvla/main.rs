@@ -126,9 +126,10 @@ fn list_signals(index: &HierarchyIndex, selection: &Selection) -> miette::Result
         println!("{handle}\t{selected}\t{names}");
     }
     let count = resolution.selected.iter().filter(|&&s| s).count();
-    println!("{count} of {selectable} selectable signals are selected");
+    // The summary and the warnings go to stderr. Stdout has only the lines of the signals.
+    eprintln!("{count} of {selectable} selectable signals are selected");
     for rule in &resolution.unmatched_rules {
-        println!("warning: the rule {rule} matches no signal");
+        eprintln!("warning: the rule {rule} matches no signal");
     }
     Ok(())
 }
@@ -139,7 +140,7 @@ fn report_selection(batch: &str, d: &BatchDiagnostics) {
     for rule in &d.info.unmatched_rules {
         warn!("{batch}: the rule {rule} matches no signal");
     }
-    if d.info.top_scopes.len() > 1 {
+    if d.spans_several_top_scopes() {
         info!(
             "{batch}: the selection spans {} top-level scopes: {}. To measure only the design \
              under test, select it, for example with --include scope:TOP.dut",
@@ -147,7 +148,7 @@ fn report_selection(batch: &str, d: &BatchDiagnostics) {
             d.info.top_scopes.join(", ")
         );
     }
-    if d.total_toggles > 0 && 2 * d.kept_toggles < d.total_toggles {
+    if d.sampling_drops_most() {
         warn!(
             "{batch}: the sampling at multiples of the clock period keeps only {} of {} toggles",
             d.kept_toggles, d.total_toggles
