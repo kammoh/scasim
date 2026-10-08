@@ -52,9 +52,13 @@ overflow-checks = false     # Disable integer overflow checks.
 fst-reader = { path = "fst-reader" }
 
 # The tests decompress and parse waveform files. Optimized code makes them much faster.
+# The first setting affects every dev build, not only the tests: all dependencies, including
+# `fst-reader`, compile with `opt-level = 3` also in a normal `cargo build`. Only this package
+# keeps `opt-level = 1` there.
 [profile.dev.package."*"]
 opt-level = 3
 
+# The tests of this package compile with more optimization than a dev build.
 [profile.test]
 opt-level = 2
 overflow-checks = true

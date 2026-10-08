@@ -299,6 +299,58 @@ fn changes_after_the_header_end_time_are_ignored() {
     );
 }
 
+/// The same with several sections. `read_signals` skips the sections that start after the end
+/// time. It drops the changes after the end time inside the other sections.
+#[test]
+fn changes_after_the_header_end_time_are_ignored_in_later_sections() {
+    let mut fx = small_fixture();
+    // The signal s0 falls at the time 30, so that the second section has a kept change (30) and
+    // a dropped change (40, on s1).
+    fx.steps[2].1 = vec![(0, "0".into())];
+    // Three sections with the time points {0, 10, 20}, {30, 40}, and {50}. The writer sets the
+    // start time of a section to the last time before it: 0, 20, and 40.
+    fx.flush_before = vec![2, 4];
+    let (_d, path) = temp_fst(&fx);
+    let reader =
+        fst_reader::FstReader::open(std::io::BufReader::new(std::fs::File::open(&path).unwrap()))
+            .unwrap();
+    let starts: Vec<u64> = reader.sections().iter().map(|s| s.start_time).collect();
+    assert_eq!(starts, vec![0, 20, 40]);
+    let full = plan_all(true, UnknownPolicy::Half);
+    let bins = Bins::new(vec![0, 30], Some(60)).unwrap();
+    // 15: the second and third sections start after the end. 25: only the third section does,
+    // and the end is before every time point of the second. 35: the end is inside the second
+    // section. 40: the end is the time of a change, which counts, and the third section starts at
+    // the end. 45: the end is after the start of the third section, but before its time point.
+    for end_time in [15, 25, 35, 40, 45] {
+        patch_header_end_time(&path, end_time);
+        let mut cut = fx.clone();
+        for (time, changes) in &mut cut.steps {
+            if *time > end_time {
+                changes.clear();
+            }
+        }
+        let expected =
+            expected_activity(&cut, &[("all", vec![0, 1, 2])], true, UnknownPolicy::Half);
+        assert_eq!(expected.times, SMALL_TIMES.to_vec());
+        assert_both_paths(&path, &full, &expected);
+        assert_both_paths_binned(&path, &full, &bins, &rebin(&expected, &bins));
+    }
+    // By value: the toggles per time point 0, 10, 20, 30, 40, and 50.
+    for (end_time, toggles) in [
+        (15, vec![0, 3, 0, 0, 0, 0]),
+        (25, vec![0, 3, 1, 0, 0, 0]),
+        // The fall of s0 at 30 counts. The change of s1 at 40 does not.
+        (35, vec![0, 3, 1, 1, 0, 0]),
+        (40, vec![0, 3, 1, 1, 2, 0]),
+        (45, vec![0, 3, 1, 1, 2, 0]),
+    ] {
+        patch_header_end_time(&path, end_time);
+        let got = activity_fst(&path, &full).unwrap();
+        assert_eq!(got.channels[0].toggles, toggles, "end time {end_time}");
+    }
+}
+
 /// One signal changes several times at the same time. All changes count.
 #[test]
 fn glitches_inside_one_time_step_count() {
@@ -981,6 +1033,17 @@ fn check_corpus_file(path: &Path, name: &str) -> Checked {
     }
 }
 
+/// The corpus files that no comparison can use, with the reason in `check_corpus_file`.
+const EXPECTED_CORPUS_SKIPS: [&str; 4] = [
+    "fst-writer/multi_vc_block.fst",
+    "fst-writer/packed_real.fst",
+    "ghdl/oscar/ghdl.fst",
+    "partial/truncated_3sections.fst",
+];
+
+/// The number of corpus files that the fast path and the reference path both read.
+const EXPECTED_CORPUS_COMPARED: usize = 56;
+
 /// On every corpus file, the fast path must read what `read_signals` reads. Where the reference
 /// path can read the file too, both must give the same result for all three unknown policies and
 /// for a selection that excludes the first selectable signal.
@@ -988,7 +1051,7 @@ fn check_corpus_file(path: &Path, name: &str) -> Checked {
 fn fast_path_matches_reference_on_corpus() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fst-reader/fsts");
     let (mut compared, mut frame_first) = (0, 0);
-    let mut skipped = Vec::new();
+    let (mut skipped, mut skipped_names) = (Vec::new(), Vec::new());
     for path in corpus_files() {
         let name = path.strip_prefix(&root).unwrap().display().to_string();
         match check_corpus_file(&path, &name) {
@@ -996,7 +1059,10 @@ fn fast_path_matches_reference_on_corpus() {
                 compared += 1;
                 frame_first += usize::from(f);
             }
-            Checked::Skipped(reason) => skipped.push(format!("{name}: {reason}")),
+            Checked::Skipped(reason) => {
+                skipped.push(format!("{name}: {reason}"));
+                skipped_names.push(name);
+            }
         }
     }
     eprintln!(
@@ -1005,5 +1071,144 @@ fn fast_path_matches_reference_on_corpus() {
     for line in &skipped {
         eprintln!("skipped {line}");
     }
-    assert!(compared >= 20, "only {compared} corpus files compared");
+    assert_eq!(skipped_names, EXPECTED_CORPUS_SKIPS, "{skipped:#?}");
+    assert_eq!(compared, EXPECTED_CORPUS_COMPARED);
+}
+
+// ---- Corpus test against an oracle built from `read_signals` ----
+
+/// One bin per distinct time.
+fn identity_bins(layout: &Layout) -> Bins {
+    Bins::new(layout.times.clone(), None).unwrap()
+}
+
+/// Every third time, beginning with the second. The end is the last time. So the first time point
+/// is before the first bin, and the last time point is after the end.
+fn subset_bins(layout: &Layout) -> Bins {
+    let end = *layout.times.last().unwrap();
+    let starts = layout
+        .times
+        .iter()
+        .copied()
+        .skip(1)
+        .step_by(3)
+        .filter(|&start| start < end)
+        .collect();
+    Bins::new(starts, Some(end)).unwrap()
+}
+
+/// The first bin starts at time 0, so that the frame values at the start time of the first
+/// section are inside the first bin. Further bins start at every third time.
+fn from_zero_bins(layout: &Layout) -> Bins {
+    let mut starts = vec![0];
+    starts.extend(layout.times.iter().copied().step_by(3).filter(|&t| t > 0));
+    Bins::new(starts, None).unwrap()
+}
+
+/// No bin, and the end is the start time of the first section: the frame values at that time are
+/// after the end, and so is everything else.
+fn end_at_frame_bins(layout: &Layout) -> Bins {
+    Bins::new(vec![], Some(layout.first_start)).unwrap()
+}
+
+/// Whether a corpus file was compared with the oracle, with how many frame events.
+enum OracleChecked {
+    Compared { frame_events: usize },
+    Skipped(String),
+}
+
+/// Makes bins from the layout of a file.
+type BinsMaker = dyn Fn(&Layout) -> Bins;
+
+fn check_against_read_signals(path: &Path, name: &str) -> OracleChecked {
+    let bin_kinds: [(&str, &BinsMaker); 4] = [
+        ("identity", &identity_bins),
+        ("subset", &subset_bins),
+        ("from zero", &from_zero_bins),
+        ("end at frame", &end_at_frame_bins),
+    ];
+    let makers: Vec<&BinsMaker> = bin_kinds.iter().map(|(_, make)| *make).collect();
+    let expected = match expected_from_read_signals(path, &POLICIES, &makers) {
+        Ok(expected) => expected,
+        Err(reason) => {
+            // The fast path must not read a file that the oracle cannot read, with one exception:
+            // a file without time points has an empty result.
+            let half = plan_all(true, UnknownPolicy::Half);
+            if reason == "no time points" {
+                assert!(
+                    activity_fst(path, &half).unwrap().times.is_empty(),
+                    "{name}"
+                );
+            } else {
+                assert!(activity_fst(path, &half).is_err(), "{name}: {reason}");
+            }
+            return OracleChecked::Skipped(reason);
+        }
+    };
+    if expected.selected_handles == 0 {
+        let half = plan_all(true, UnknownPolicy::Half);
+        assert!(
+            matches!(activity_fst(path, &half), Err(PowerError::EmptyChannel(_))),
+            "{name}"
+        );
+        return OracleChecked::Skipped("no selectable signal".into());
+    }
+    for (p, &unknown) in POLICIES.iter().enumerate() {
+        let plan = plan_all(true, unknown);
+        for (k, (kind, _)) in bin_kinds.iter().enumerate() {
+            let want = &expected.traces[p][k];
+            let got = match *kind {
+                "identity" => activity_fst(path, &plan),
+                _ => activity_fst_binned(path, &plan, &expected.bins[k]),
+            }
+            .unwrap_or_else(|e| panic!("{name}: the fast path failed: {e:?}"));
+            let context = format!("{name}, {kind}, {unknown:?}");
+            assert_eq!(got.times, want.times, "{context}");
+            assert_eq!(got.timescale_exponent, want.timescale_exponent, "{context}");
+            assert_eq!(
+                got.info.selected_handles, want.info.selected_handles,
+                "{context}"
+            );
+            assert_eq!(got.channels.len(), 1, "{context}");
+            assert_same_channel(&got.channels[0], &want.channels[0], &context);
+        }
+    }
+    OracleChecked::Compared {
+        frame_events: expected.frame_events,
+    }
+}
+
+/// The oracle takes the changes from the event stream of `FstReader::read_signals` and does
+/// not use the fast path or `wellen`. This covers the frame values of the first section, which
+/// `read_signals` reports at the section start time when the first time point is later. The fast
+/// path must give the oracle's result on every corpus file that it reads, for all unknown
+/// policies, for one bin per time, and for bins that put the frame values before the first bin,
+/// in the first bin, and after the end.
+#[test]
+fn fast_path_matches_the_read_signals_oracle_on_corpus() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fst-reader/fsts");
+    let (mut compared, mut frame_first) = (0, 0);
+    let (mut skipped, mut skipped_names) = (Vec::new(), Vec::new());
+    for path in corpus_files() {
+        let name = path.strip_prefix(&root).unwrap().display().to_string();
+        match check_against_read_signals(&path, &name) {
+            OracleChecked::Compared { frame_events } => {
+                compared += 1;
+                frame_first += usize::from(frame_events > 0);
+            }
+            OracleChecked::Skipped(reason) => {
+                skipped.push(format!("{name}: {reason}"));
+                skipped_names.push(name);
+            }
+        }
+    }
+    eprintln!(
+        "oracle: compared {compared} corpus files; {frame_first} have frame values at the start of the first section"
+    );
+    for line in &skipped {
+        eprintln!("oracle skipped {line}");
+    }
+    assert_eq!(skipped_names, EXPECTED_CORPUS_SKIPS, "{skipped:#?}");
+    assert_eq!(compared, EXPECTED_CORPUS_COMPARED);
+    assert!(frame_first > 0, "no compared file starts with a frame");
 }

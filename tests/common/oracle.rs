@@ -55,7 +55,7 @@ fn oracle_weight(c: u8, unknown: UnknownPolicy) -> i64 {
 }
 
 /// The statistics of a change from `old` to `new`. `old == None` is a first value.
-fn oracle_change(old: Option<&str>, new: &str, unknown: UnknownPolicy) -> Totals {
+pub fn oracle_change(old: Option<&str>, new: &str, unknown: UnknownPolicy) -> Totals {
     let mut t = Totals::default();
     for (k, b) in new.bytes().enumerate() {
         t.hw_delta += oracle_weight(b, unknown);
