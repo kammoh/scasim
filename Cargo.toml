@@ -8,7 +8,7 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 indicatif = "0.18.6"
 itertools = "0.15.0"
 wellen = "0.25.6"
-fst-reader = {path = "fst-reader"}
+fst-reader = "0.17"
 # must match the ndarray version of scalib (pinned to 0.16 by its nshare dependency)
 ndarray = { version = "0.16.1", features = ["approx", "rayon", "serde"] }
 ndarray-npz = "0.4.2"
@@ -26,7 +26,6 @@ num-format = "0.4.4"
 log = "0.4.27"
 env_logger = "0.11.11"
 rayon = "1.10.0"
-rustc-hash = "2.1.3"
 
 [dev-dependencies]
 approx = "0.5.1"
@@ -42,3 +41,8 @@ name = "tvla"
 [profile.dev]
 opt-level = 1               # Use slightly better optimizations.
 overflow-checks = false     # Disable integer overflow checks.
+
+# Fork under development; see docs/superpowers/specs/2026-10-08-fast-power-design.md.
+# The patch applies to the whole dependency graph, so wellen uses the same fst-reader.
+[patch.crates-io]
+fst-reader = { path = "fst-reader" }

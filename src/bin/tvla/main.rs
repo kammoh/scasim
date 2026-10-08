@@ -297,14 +297,6 @@ fn main() -> miette::Result<()> {
                 })
                 .expect("markers not found in metadata");
 
-            if false {
-                let (traces_array, labels_array, _) = traces_from_fst(
-                    &trace_file_path,
-                    &meta_markers,
-                    |t| clock_period.map(|cp| t % cp == 0).unwrap_or(true),
-                ).expect("Failed to load traces from FST file");
-                Some((traces_array, labels_array))
-            } else {
             println!("Loading signals from the waveform...");
             let start_time = std::time::Instant::now();
             let (signals, time_table) =
@@ -364,7 +356,6 @@ fn main() -> miette::Result<()> {
             );
 
             Some((traces_array, labels_array))
-        }
         }
     }).collect_vec_list();
 

@@ -7,12 +7,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
-pub mod fst;
 pub mod optional_filter;
 pub mod plot;
 pub mod power_model;
 
-pub use fst::*;
 pub use optional_filter::*;
 pub use power_model::*;
 

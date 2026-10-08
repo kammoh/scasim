@@ -3,4 +3,4 @@
 	url = https://github.com/kammoh/SCALib.git
 [submodule "fst-reader"]
 	path = fst-reader
-	url = https://github.com/ekiwi/fst-reader.git
+	url = https://github.com/kammoh/fst-reader.git
