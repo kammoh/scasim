@@ -1,16 +1,18 @@
-use clap::Parser;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use itertools::Itertools;
 use log::*;
+use miette::{IntoDiagnostic, WrapErr};
 use ndarray::{Array1, Array2, s};
 use ndarray_npz::{NpzReader, NpzWriter};
 use plotly::plotly_static;
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use scalib::ttest;
+use scasim::batch::{BatchDiagnostics, batch_traces, read_batch_meta};
+use scasim::hierarchy::{HierarchyIndex, Selection};
 use scasim::plot::*;
-use scasim::*;
+use scasim::power::hierarchy_index;
 use std::fs::File;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "scasim-tvla")]
@@ -24,25 +26,10 @@ struct Args {
     maybe_meta_list_path: Option<String>,
     #[arg(
         long,
-        help = "disable multi-threaded loading of the waveform and signals",
-        default_value_t = false
-    )]
-    single_thread: bool,
-    #[arg(
-        long,
         help = "number of threads to use for parallel processing, defaults to the number of available CPU cores",
         value_name = "NUM_THREADS"
     )]
     num_threads: Option<usize>,
-    #[arg(
-        long,
-        help = "show progress bar while loading the file",
-        action = clap::ArgAction::Set,
-        num_args = 0..=1,
-        default_missing_value = "true",
-        default_value_t = true
-    )]
-    show_progress: bool,
     /// The highest order of t-test to perform
     #[arg(short = 'd', default_value_t = 2)]
     order: usize,
@@ -71,6 +58,22 @@ struct Args {
         default_value_t = true
     )]
     use_existing: bool,
+    /// Select signals by rule (repeatable): scope:PATH, signal:PATH, regex:PATTERN, or
+    /// module:NAME. The rules of --include and --exclude apply in the order on the command line.
+    /// The last rule that matches a signal decides. A signal with several names (aliases)
+    /// matches a rule if one of its names matches. Without any rule, all signals are selected.
+    /// If the first rule is an --include, no signal is selected before it. If the first rule is
+    /// an --exclude, all signals are. With rules, `traces.npz` files are neither read nor
+    /// written.
+    #[arg(long = "include", value_name = "KIND:VALUE")]
+    include: Vec<String>,
+    /// Remove signals from the selection by rule (repeatable). See --include.
+    #[arg(long = "exclude", value_name = "KIND:VALUE")]
+    exclude: Vec<String>,
+    /// Print every selectable signal of the first waveform, with its names and whether the rules
+    /// select it, then exit.
+    #[arg(long = "list-signals")]
+    list_signals: bool,
     #[arg(
         long,
         value_name = "PLOTS_OUTPUT_DIR",
@@ -80,62 +83,90 @@ struct Args {
     ttest_output_dir: String,
 }
 
-fn get_metadata<P: AsRef<Path>>(
-    filename: P,
-    is_compressed: bool,
-) -> Result<serde_json::Value, std::io::Error> {
-    let file = File::open(&filename)?;
-    if is_compressed {
-        let mut decoder = flate2::read::GzDecoder::new(file);
-        let mut buffer = Vec::new();
-        decoder.read_to_end(&mut buffer)?;
-        Ok(serde_json::from_slice(&buffer)?)
-    } else {
-        Ok(serde_json::from_reader(file)?)
+/// The values of `--include` and `--exclude` as rules (`+kind:value` and `-kind:value`), in the
+/// order on the command line. `clap` keeps the values of each flag in separate lists, so the
+/// order across the two flags comes from the indices of the values.
+fn ordered_rules(matches: &ArgMatches) -> Vec<String> {
+    let mut rules: Vec<(usize, String)> = Vec::new();
+    for (flag, sign) in [("include", '+'), ("exclude", '-')] {
+        if let (Some(indices), Some(values)) =
+            (matches.indices_of(flag), matches.get_many::<String>(flag))
+        {
+            rules.extend(indices.zip(values).map(|(i, v)| (i, format!("{sign}{v}"))));
+        }
     }
+    rules.sort_by_key(|(index, _)| *index);
+    rules.into_iter().map(|(_, rule)| rule).collect()
 }
 
-fn cut_trace(
-    power_table: &[f32],
-    time_table: &[u64],
-    meta_markers: &[(u64, u64, u16)],
-) -> (Array2<f32>, Array1<u16>) {
-    println!("Converting markers to time indices...");
-    let start_time = std::time::Instant::now();
-    let time_indices_and_labels = markers_to_time_indices(meta_markers, time_table);
-    println!(
-        "Converted markers to time indices in {:.2}s",
-        start_time.elapsed().as_secs_f32()
-    );
-
-    let max_len = time_indices_and_labels
-        .iter()
-        .map(|(lo, hi, _)| hi - lo)
-        .max()
-        .unwrap_or(0);
-
-    println!("Cutting the monolithic trace...");
-
-    let mut all_traces = Array2::<f32>::zeros((time_indices_and_labels.len(), max_len));
-    let mut trace_labels = Array1::<u16>::zeros(time_indices_and_labels.len());
-
-    for (i, (start_idx, end_idx, label)) in time_indices_and_labels.into_iter().enumerate() {
-        trace_labels[i] = label;
-        all_traces
-            .slice_mut(s![i, ..end_idx - start_idx])
-            .assign(&Array1::from_vec(power_table[start_idx..end_idx].to_vec()));
+/// Prints every selectable signal of a waveform with its names and the selection result.
+fn list_signals(index: &HierarchyIndex, selection: &Selection) -> miette::Result<()> {
+    let resolution = selection.resolve(index).into_diagnostic()?;
+    let mut selectable = 0;
+    for (handle, paths) in index.paths.iter().enumerate() {
+        if paths.is_empty() {
+            continue;
+        }
+        selectable += 1;
+        let names = paths
+            .iter()
+            .map(|p| {
+                if p.is_alias {
+                    format!("{} (alias)", p.path)
+                } else {
+                    p.path.clone()
+                }
+            })
+            .join(", ");
+        let selected = if resolution.selected[handle] {
+            "yes"
+        } else {
+            "no"
+        };
+        println!("{handle}\t{selected}\t{names}");
     }
+    let count = resolution.selected.iter().filter(|&&s| s).count();
+    println!("{count} of {selectable} selectable signals are selected");
+    for rule in &resolution.unmatched_rules {
+        println!("warning: the rule {rule} matches no signal");
+    }
+    Ok(())
+}
 
-    (all_traces, trace_labels)
+/// Tells the user what the selection covers, and warns about selections that probably do not
+/// measure what the user wants.
+fn report_selection(batch: &str, d: &BatchDiagnostics) {
+    for rule in &d.info.unmatched_rules {
+        warn!("{batch}: the rule {rule} matches no signal");
+    }
+    if d.info.top_scopes.len() > 1 {
+        info!(
+            "{batch}: the selection spans {} top-level scopes: {}. To measure only the design \
+             under test, select it, for example with --include scope:TOP.dut",
+            d.info.top_scopes.len(),
+            d.info.top_scopes.join(", ")
+        );
+    }
+    if d.total_toggles > 0 && 2 * d.kept_toggles < d.total_toggles {
+        warn!(
+            "{batch}: the sampling at multiples of the clock period keeps only {} of {} toggles",
+            d.kept_toggles, d.total_toggles
+        );
+    }
 }
 
 fn main() -> miette::Result<()> {
-    let args = Args::parse();
-
     // set default log level to info
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp(None)
         .init();
+
+    let matches = Args::command().get_matches();
+    let args = Args::from_arg_matches(&matches).into_diagnostic()?;
+    let rules = ordered_rules(&matches);
+    let selection = Selection::parse(&rules)
+        .into_diagnostic()
+        .wrap_err("invalid value for --include or --exclude")?;
 
     let filenames: Vec<PathBuf> = if let Some(meta_list_path) = args.maybe_meta_list_path {
         let meta_root_path = PathBuf::from(&meta_list_path)
@@ -168,6 +199,14 @@ fn main() -> miette::Result<()> {
     } else {
         panic!("No meta files provided. Please specify at least one NPZ file.");
     };
+    if filenames.is_empty() {
+        panic!("No meta files provided. Please specify at least one NPZ file.");
+    }
+    if args.list_signals {
+        let meta = read_batch_meta(&filenames[0])?;
+        let index = hierarchy_index(&meta.trace_path).into_diagnostic()?;
+        return list_signals(&index, &selection);
+    }
     let order = args.order;
 
     let mut samples_per_trace = 0;
@@ -181,11 +220,11 @@ fn main() -> miette::Result<()> {
 
     let mut maybe_ttacc: Option<ttest::Ttest> = None;
 
-    if filenames.is_empty() {
-        panic!("No meta files provided. Please specify at least one NPZ file.");
-    }
-
     let npz_filename = "traces.npz";
+    // `traces.npz` holds the traces of the default selection (all signals). A run with rules
+    // computes other traces. It must not reuse the file, and it must not overwrite it, because
+    // a later run without rules would then read the traces of this selection.
+    let cache_allowed = rules.is_empty();
 
     args.num_threads.iter().for_each(|&n| {
         rayon::ThreadPoolBuilder::new()
@@ -210,27 +249,17 @@ fn main() -> miette::Result<()> {
             return None;
         }
 
-        let metadata_json = get_metadata(
-            &metadata_path,
-            metadata_path.extension().is_some_and(|ext| ext == "gz"),
-        )
-        .expect("Failed to load metadata!");
+        let meta = read_batch_meta(&metadata_path).expect("Failed to read batch metadata");
+        let trace_file_path = meta.trace_path.clone();
 
         let parent_folder_path = metadata_path
             .parent()
             .expect("Failed to get parent folder of metadata file")
             .to_path_buf();
 
-        let trace_filename = metadata_json
-            .get("trace_filename")
-            .and_then(|v| v.as_str())
-            .expect("trace_filename not found in metadata");
-
-        let trace_file_path = parent_folder_path.join(trace_filename);
-
         let npz_path = parent_folder_path.join(npz_filename);
 
-        let use_existing = if args.use_existing && npz_path.exists() {
+        let use_existing = if args.use_existing && cache_allowed && npz_path.exists() {
             if !trace_file_path.exists() {
                 true
             } else {
@@ -276,84 +305,45 @@ fn main() -> miette::Result<()> {
             .expect("Failed to create traces array");
             Some((traces_array, labels_array))
         } else {
-            let clock_period = metadata_json.get("clock_period").and_then(|v| v.as_u64());
-            let cp = clock_period.unwrap_or_default();
-            // .expect("clock_period not found in the metadata"); // FIXME optional
-            let meta_markers = metadata_json
-                .get("markers")
-                .map(|v| {
-                    v.as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|e| {
-                            let (start_time, end_time, label) =  e.as_array()
-                                .unwrap()
-                                .iter()
-                                .map(|i| i.as_u64().unwrap())
-                                .collect_tuple().unwrap();
-                            (start_time, end_time, label as u16)
-                        })
-                        .collect_vec()
-                })
-                .expect("markers not found in metadata");
-
-            println!("Loading signals from the waveform...");
+            println!("Computing power traces from {}...", trace_file_path.display());
             let start_time = std::time::Instant::now();
-            let (signals, time_table) =
-                load_waveform(&trace_file_path, !args.single_thread, args.show_progress)
-                    .expect("Failed to load waveform!");
-            println!(
-                "It took {:.2}s to load {} signals with {} time points",
-                start_time.elapsed().as_secs_f32(),
-                signals.len(),
-                time_table.len()
-            );
-
-            println!("Generating power trace...");
-            let start_time = std::time::Instant::now();
-            let (time_table, power_table) = generate_power_trace(
-                &signals,
-                &time_table,
-                |(t, _)| *t % cp == 0,
-                clock_period.is_some(),
-            )
-            .expect("Failed to convert waveform to power trace!");
-            println!(
-                "It took {:.2}s to generate the power trace",
-                start_time.elapsed().as_secs_f32()
-            );
-
-
-
-            println!("Cutting traces based on markers...");
-            let start_time = std::time::Instant::now();
-            let (traces_array, labels_array) = cut_trace(&power_table, &time_table, &meta_markers);
-
+            let (traces_array, labels_array, diagnostics) =
+                batch_traces(&meta, &selection).expect("Failed to compute traces");
             let (num_traces, cur_samples_per_trace) = traces_array.dim();
             println!(
-                "Cut traces in {:.2}s, resulting in {} traces with a maximum of {} samples each",
-                start_time.elapsed().as_secs_f32(),
-                num_traces,
-                cur_samples_per_trace
-            );
-            println!("Saving traces and labels to NPZ file...");
-            let start_time: std::time::Instant = std::time::Instant::now();
-
-            let mut npz = NpzWriter::new_compressed(
-                File::create(&npz_path).expect("Failed to create npz file"),
-            );
-            for (tidx, trace) in traces_array.outer_iter().enumerate() {
-                npz.add_array(format!("trace_{tidx}"), &trace)
-                    .expect("Failed to add array 'a' to npz");
-            }
-            npz.add_array("labels", &labels_array)
-                .expect("Failed to add array 'labels' to npz");
-            npz.finish().expect("Failed to finish writing npz file");
-            println!(
-                "Saved traces and labels to {} in {:.2}s\n",
-                npz_path.display(),
+                "Computed {num_traces} traces with up to {cur_samples_per_trace} samples in {:.2}s",
                 start_time.elapsed().as_secs_f32()
             );
+            info!(
+                "{}: {} signals selected; toggles: {} in total, {} at the sampled time points, \
+                 {} inside the segments",
+                trace_file_path.display(),
+                diagnostics.info.selected_handles,
+                diagnostics.total_toggles,
+                diagnostics.kept_toggles,
+                diagnostics.segment_toggles
+            );
+            report_selection(&trace_file_path.display().to_string(), &diagnostics);
+
+            if cache_allowed {
+                println!("Saving traces and labels to NPZ file...");
+                let start_time: std::time::Instant = std::time::Instant::now();
+                let mut npz = NpzWriter::new_compressed(
+                    File::create(&npz_path).expect("Failed to create npz file"),
+                );
+                for (tidx, trace) in traces_array.outer_iter().enumerate() {
+                    npz.add_array(format!("trace_{tidx}"), &trace)
+                        .expect("Failed to add array 'a' to npz");
+                }
+                npz.add_array("labels", &labels_array)
+                    .expect("Failed to add array 'labels' to npz");
+                npz.finish().expect("Failed to finish writing npz file");
+                println!(
+                    "Saved traces and labels to {} in {:.2}s\n",
+                    npz_path.display(),
+                    start_time.elapsed().as_secs_f32()
+                );
+            }
 
             Some((traces_array, labels_array))
         }
@@ -500,4 +490,47 @@ fn main() -> miette::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    fn rules(args: &[&str]) -> Vec<String> {
+        let mut argv = vec!["tvla", "--meta-json", "meta.json"];
+        argv.extend_from_slice(args);
+        ordered_rules(&Args::command().try_get_matches_from(argv).unwrap())
+    }
+
+    #[test]
+    fn rules_keep_the_command_line_order_across_both_flags() {
+        assert_eq!(
+            rules(&[
+                "--exclude",
+                "scope:tb.dut.u_rng",
+                "--include",
+                "signal:tb.dut.u_rng.state",
+                "--exclude=regex:.*clk"
+            ]),
+            [
+                "-scope:tb.dut.u_rng",
+                "+signal:tb.dut.u_rng.state",
+                "-regex:.*clk"
+            ]
+        );
+        assert_eq!(
+            rules(&[
+                "--include",
+                "scope:a",
+                "--exclude",
+                "signal:a.b",
+                "--include",
+                "scope:c"
+            ]),
+            ["+scope:a", "-signal:a.b", "+scope:c"]
+        );
+    }
+
+    #[test]
+    fn no_flags_give_no_rules() {
+        assert!(rules(&[]).is_empty());
+        assert!(rules(&["--list-signals"]).is_empty());
+    }
+}
