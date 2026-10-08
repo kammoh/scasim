@@ -31,6 +31,10 @@ pub struct HierarchyIndex {
 /// Removes a trailing bit range such as ` [3:0]`, `[31:0]`, or ` [7]` from a variable name.
 ///
 /// A range without a space before it must contain a colon: `mem[3]` is an array element and stays.
+///
+/// A name that consists only of a bit range, such as `[3:0]`, stays whole, so the result is never
+/// empty. For example, `wellen` can turn `tdata[1714295607408:1714295607407]` into the scope
+/// `tdata` and the variable name `[1714295607408:1714295607407]`.
 pub fn strip_bit_range(name: &str) -> &str {
     let Some(open) = name.rfind('[') else {
         return name;
@@ -45,13 +49,15 @@ pub fn strip_bit_range(name: &str) -> &str {
     if !is_range {
         return name;
     }
-    match name[..open].strip_suffix(' ') {
+    let base = match name[..open].strip_suffix(' ') {
         // Verilog dumpers: "data [3:0]" and "bit [7]"
         Some(base) => base,
         // VHDL dumpers: "data[3:0]". Without a colon, "mem[3]" is an array element.
         None if inner.contains(':') => &name[..open],
         None => name,
-    }
+    };
+    // A name that consists only of a bit range stays whole. The name must not become empty.
+    if base.is_empty() { name } else { base }
 }
 
 /// The scopes that are open while a hierarchy is walked.
@@ -436,6 +442,31 @@ mod tests {
         assert_eq!(strip_bit_range("weird [a:b]"), "weird [a:b]");
         assert_eq!(strip_bit_range("plain"), "plain");
         assert_eq!(strip_bit_range("open[3"), "open[3");
+    }
+
+    #[test]
+    fn strip_bit_range_keeps_a_name_that_is_only_a_range() {
+        // `wellen` splits `tdata[1714295607408:1714295607407]` into the scope `tdata` and
+        // the variable name `[1714295607408:1714295607407]`.
+        assert_eq!(strip_bit_range("[3:0]"), "[3:0]");
+        assert_eq!(
+            strip_bit_range("[1714295607408:1714295607407]"),
+            "[1714295607408:1714295607407]"
+        );
+        assert_eq!(strip_bit_range(" [3:0]"), " [3:0]");
+    }
+
+    #[test]
+    fn a_name_that_is_only_a_range_does_not_leave_a_trailing_dot_in_the_path() {
+        let mut scopes = ScopeStack::default();
+        scopes.push("tdata", "");
+        let mut index = HierarchyIndex::default();
+        index.add(0, &scopes, "[1714295607408:1714295607407]", false);
+        assert_eq!(
+            index.paths[0][0].path,
+            "tdata.[1714295607408:1714295607407]"
+        );
+        assert_eq!(index.paths[0][0].scope, "tdata");
     }
 
     #[test]
