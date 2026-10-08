@@ -274,6 +274,20 @@ pub fn patch_header_end_time(path: &Path, end_time: u64) {
     std::fs::write(path, bytes).unwrap();
 }
 
+/// Replaces the one place in the file where `pattern` occurs by `replacement` (the same length).
+/// Panics if `pattern` occurs not exactly once, so that a change of the writer cannot silently
+/// make a test patch another place.
+pub fn replace_unique_bytes(path: &Path, pattern: &[u8], replacement: &[u8]) {
+    assert_eq!(pattern.len(), replacement.len());
+    let mut bytes = std::fs::read(path).unwrap();
+    let places: Vec<usize> = (0..=bytes.len() - pattern.len())
+        .filter(|&at| bytes[at..at + pattern.len()] == *pattern)
+        .collect();
+    assert_eq!(places.len(), 1, "{pattern:02x?} must occur exactly once");
+    bytes[places[0]..places[0] + pattern.len()].copy_from_slice(replacement);
+    std::fs::write(path, bytes).unwrap();
+}
+
 /// `fst-writer` 0.3.1 stores a zlib-compressed time table as if it were uncompressed when both
 /// have the same length, so the reader decodes garbage. Returns false for such files.
 pub fn time_table_is_readable(path: &Path, fx: &Fixture) -> bool {

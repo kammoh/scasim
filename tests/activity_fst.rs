@@ -299,6 +299,47 @@ fn changes_after_the_header_end_time_are_ignored() {
     );
 }
 
+/// `read_signals` stops at the first time point after the header end time. It does not parse
+/// the values after that point, so a damaged value there is not an error. The fast path must
+/// also stop before it parses such a value.
+#[test]
+fn a_damaged_value_after_the_header_end_time_is_not_an_error() {
+    let mut fx = Fixture::flat(&[2]);
+    fx.initial = vec!["00".into()];
+    fx.steps = vec![(10, vec![(0, "01".into())]), (20, vec![(0, "10".into())])];
+    let (_d, path) = temp_fst(&fx);
+    // The change data of the signal is stored as it is: the marker 0 for "not compressed", then
+    // for each change a byte with the time delta and the kind, and the packed value. The kind
+    // is 2-state ("01" is 0x40, "10" is 0x80). The delta of the second change is 1, so its
+    // first byte is 0x02. Setting bit 0 makes the value 4-state, which needs two characters,
+    // but the data ends after one byte.
+    replace_unique_bytes(
+        &path,
+        &[0x00, 0x00, 0x40, 0x02, 0x80],
+        &[0x00, 0x00, 0x40, 0x03, 0x80],
+    );
+    // The damage is real: with the end time 20, the second change counts and the fast path
+    // reports the error. (The reference path would panic inside `wellen`.)
+    patch_header_end_time(&path, 20);
+    assert!(activity_fst(&path, &plan_all(true, UnknownPolicy::Half)).is_err());
+
+    // With the end time 10, the second change is dropped. Its value is never parsed.
+    patch_header_end_time(&path, 10);
+    let mut cut = fx.clone();
+    cut.steps[1].1.clear();
+    let expected = expected_activity(&cut, &[("all", vec![0])], true, UnknownPolicy::Half);
+    assert_eq!(expected.times, vec![0, 10, 20]);
+    assert_eq!(expected.channels[0].toggles, vec![0, 1, 0]);
+    assert_both_paths(&path, &plan_all(true, UnknownPolicy::Half), &expected);
+    let bins = Bins::new(vec![0, 10], Some(30)).unwrap();
+    assert_both_paths_binned(
+        &path,
+        &plan_all(true, UnknownPolicy::Half),
+        &bins,
+        &rebin(&expected, &bins),
+    );
+}
+
 /// The same with several sections. `read_signals` skips the sections that start after the end
 /// time. It drops the changes after the end time inside the other sections.
 #[test]

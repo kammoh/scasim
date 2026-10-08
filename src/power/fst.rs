@@ -166,9 +166,11 @@ fn add_frame_values<const FULL: bool>(
 
 /// Decodes the changes of all selected signals of one section, in parallel, and returns the
 /// statistics of every channel for the slots of `placement`. `last` holds the last value of every
-/// signal before the section, and holds it after the section.
+/// signal before the section, and holds it after the section. The decoder stops at the first
+/// change after the time index `last_time_index`, without parsing its value.
 fn decode_section<const FULL: bool>(
     section: &FstSection,
+    last_time_index: usize,
     placement: &Placement,
     plan: &PowerPlan,
     handle_channels: &[Vec<usize>],
@@ -195,15 +197,19 @@ fn decode_section<const FULL: bool>(
                         .map(|_| SlotStats::new(placement.slot_count, FULL))
                         .collect();
                 }
-                section.for_each_change(FstSignalHandle::from_index(h), |time_index, value| {
-                    let Some(slot) = placement.local_slot(time_index) else {
-                        return;
-                    };
-                    let d = step::<FULL>(last, value, plan.unknown, &mut scratch);
-                    for &c in channels {
-                        local[c].add::<FULL>(slot, &d);
-                    }
-                })?;
+                section.for_each_change_until(
+                    FstSignalHandle::from_index(h),
+                    last_time_index,
+                    |time_index, value| {
+                        let Some(slot) = placement.local_slot(time_index) else {
+                            return;
+                        };
+                        let d = step::<FULL>(last, value, plan.unknown, &mut scratch);
+                        for &c in channels {
+                            local[c].add::<FULL>(slot, &d);
+                        }
+                    },
+                )?;
             }
             Ok(local)
         })
@@ -274,9 +280,24 @@ fn run<const FULL: bool>(
             if placement.slot_count == 0 {
                 continue;
             }
+            // `read_signals` stops at the first time point after the header end time, before it
+            // parses the values there. The decoder must stop at the same place.
+            let kept = times
+                .iter()
+                .position(|&t| t > end_time)
+                .unwrap_or(times.len());
+            let Some(last_time_index) = kept.checked_sub(1) else {
+                continue;
+            };
             plan.check_section_memory(placement.slot_count, rayon::current_num_threads())?;
-            let decoded =
-                decode_section::<FULL>(&section, &placement, plan, handle_channels, &mut last)?;
+            let decoded = decode_section::<FULL>(
+                &section,
+                last_time_index,
+                &placement,
+                plan,
+                handle_channels,
+                &mut last,
+            )?;
             for (total, section_stats) in stats.iter_mut().zip(&decoded) {
                 total.add_window(placement.first_slot, section_stats);
             }
