@@ -26,7 +26,7 @@ pub fn markers_to_time_indices(
     // use the fact that both meta_markers and time_table are sorted by time
 
     meta_markers
-        .into_iter()
+        .iter()
         .map(|marker| {
             // let start_time = marker[0];
             // let end_time = marker[1];
@@ -47,7 +47,7 @@ pub fn load_waveform<P: AsRef<Path>>(
     filename: P,
     multi_thread: bool,
     show_progress: bool,
-) -> Result<(Vec<(wellen::SignalRef, wellen::Signal)>, Vec<u64>), wellen::WellenError> {
+) -> Result<(Vec<wellen::Signal>, Vec<u64>), wellen::WellenError> {
     let load_opts = wellen::LoadOptions {
         multi_thread,
         remove_scopes_with_empty_name: false,
@@ -113,7 +113,11 @@ pub fn load_waveform<P: AsRef<Path>>(
         body.time_table.len().to_formatted_string(&Locale::en)
     );
 
-    let signal_refs = hierarchy.iter_vars().map(|v| v.signal_ref()).collect_vec();
+    // several vars may alias one signal; `load_signals` deduplicates the refs
+    let signal_refs = hierarchy
+        .all_vars()
+        .map(|v| hierarchy[v].signal_ref())
+        .collect_vec();
 
     let mut wave_source = body.source;
 
@@ -135,7 +139,7 @@ pub fn load_waveform<P: AsRef<Path>>(
 }
 
 pub fn generate_power_trace<F: Fn(&(&u64, f32)) -> bool>(
-    signals: &[(wellen::SignalRef, wellen::Signal)],
+    signals: &[wellen::Signal],
     time_table: &[u64],
     filter_predicate: F,
     //    filter_predicate: Option<fn((u64, f32)) -> bool>,
@@ -144,8 +148,8 @@ pub fn generate_power_trace<F: Fn(&(&u64, f32)) -> bool>(
 ) -> Result<(Vec<u64>, Vec<f32>), wellen::WellenError> {
     let mut power_table = vec![0f32; time_table.len()];
 
-    for (_, signal) in signals.iter() {
-        let mut prev_value: Option<wellen::SignalValue> = None;
+    for signal in signals.iter() {
+        let mut prev_value: Option<wellen::SignalValueRef> = None;
         for (time_index, new_value) in signal.iter_changes() {
             if let Some(prev_value) = prev_value {
                 // we have a previous value, compute the power
@@ -183,7 +187,9 @@ pub fn generate_power_trace<F: Fn(&(&u64, f32)) -> bool>(
 ///  * `multi_thread` enables multi-threaded loading of the waveform and signals.
 ///  * `show_progress` enables a progress bar while loading the file.
 ///  * `filter_predicate` is an optional function that filters the time points and power values.
-/// returns a tuple of two vectors: time points and power values.
+///  * `do_filter` enables `filter_predicate`.
+///
+/// Returns a tuple of two vectors: time points and power values.
 pub fn wave_to_powertrace<F: Fn(&(&u64, f32)) -> bool, P: AsRef<Path>>(
     filename: P,
     multi_thread: bool,

@@ -21,6 +21,9 @@ struct Args {
     #[arg(
         long,
         help = "show progress bar while loading the file",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
         default_value_t = true
     )]
     show_progress: bool,

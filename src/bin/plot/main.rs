@@ -98,21 +98,23 @@ fn main() -> miette::Result<()> {
                 let trace_name = format!("trace_{}", index);
                 let trace_data: Array1<f32> = npz
                     .by_name(&trace_name)
-                    .expect(&format!("Failed to find '{}' in NPZ file", trace_name));
+                    .unwrap_or_else(|_| panic!("Failed to find '{}' in NPZ file", trace_name));
 
                 let label = labels
                     .get(*index)
-                    .expect(&format!("Failed to get label for index {}", index));
+                    .unwrap_or_else(|| panic!("Failed to get label for index {}", index));
 
-                let scatter_trace =
-                    Scatter::from_array(Array1::range(0., trace_data.len() as f32, 1.), trace_data)
-                        .mode(Mode::Lines)
-                        .name(format!("Trace {} (Label: {})", index, label))
-                        .line(
-                            plotly::common::Line::new()
-                                .width(1.0)
-                                .auto_color_scale(true),
-                        );
+                let scatter_trace = Scatter::new(
+                    (0..trace_data.len()).collect::<Vec<_>>(),
+                    trace_data.to_vec(),
+                )
+                .mode(Mode::Lines)
+                .name(format!("Trace {} (Label: {})", index, label))
+                .line(
+                    plotly::common::Line::new()
+                        .width(1.0)
+                        .auto_color_scale(true),
+                );
 
                 plot.add_trace(scatter_trace);
             }
@@ -193,12 +195,11 @@ fn main() -> miette::Result<()> {
                         .names()
                         .expect("Failed to get names from NPZ file")
                         .iter()
-                        .filter_map(|name| {
-                            name.starts_with("trace_").then(|| {
-                                npz_reader
-                                    .by_name(name.as_str())
-                                    .expect(&format!("Failed to find '{}' in NPZ file", name))
-                            })
+                        .filter(|&name| name.starts_with("trace_"))
+                        .map(|name| {
+                            npz_reader
+                                .by_name(name.as_str())
+                                .unwrap_or_else(|_| panic!("Failed to find '{}' in NPZ file", name))
                         })
                         .collect();
                     let num_traces = traces.len();

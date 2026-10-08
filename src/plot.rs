@@ -1,13 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use capitalize::Capitalize;
-use itertools::Itertools;
 use log::info;
-use ndarray::{Array1, ArrayBase, Dimension, OwnedRepr};
-use num_ordinal::{Ordinal, Osize};
+use ndarray::{ArrayBase, Dimension, OwnedRepr};
 use plotly::{
     Plot, Scatter,
     common::{Mode, Title},
+    export::sync::ExporterSyncExt,
     plotly_static,
 };
 
@@ -75,9 +73,9 @@ pub fn plot_t_traces<D: Dimension, P: AsRef<Path>>(
             //plot the t-values
             let mut t_plot = Plot::new();
 
-            let t_trace = Scatter::from_array(
-                Array1::range(0., ord_t_values.len() as f32, 1.0),
-                ord_t_values.clone(),
+            let t_trace = Scatter::new(
+                (0..ord_t_values.len()).collect::<Vec<_>>(),
+                ord_t_values.to_vec(),
             )
             .mode(Mode::Lines)
             .line(
@@ -90,17 +88,13 @@ pub fn plot_t_traces<D: Dimension, P: AsRef<Path>>(
             t_plot.add_trace(t_trace.clone());
             let y_axis = plotly::layout::Axis::new().title(Title::with_text(y_label));
             // y_max is: if t_threshold is Some(t) => Some(v) where v is the maximum if t and the absolute value of the t-values, otherwise its None
-            let max_y = if let Some(t) = t_threshold {
-                Some(
-                    ord_t_values
-                        .iter()
-                        .fold(t, |acc, &x| acc.max(x.abs()))
-                        .max(1.5 * t)
-                        + 0.5,
-                )
-            } else {
-                None
-            };
+            let max_y = t_threshold.map(|t| {
+                ord_t_values
+                    .iter()
+                    .fold(t, |acc, &x| acc.max(x.abs()))
+                    .max(1.5 * t)
+                    + 0.5
+            });
             log::info!(
                 "Max y for d={d}: {}",
                 max_y.map_or("None".to_string(), |v| v.to_string())
@@ -126,15 +120,15 @@ pub fn plot_t_traces<D: Dimension, P: AsRef<Path>>(
             t_plot.write_html(html_output_path);
             let image_output_path = output_dir.as_ref().join(file_stem.with_extension("svg"));
             info!("Writing t_plot to {}", image_output_path.display());
-            if let Err(e) = t_plot.write_image_with_exporter(
-                image_exporter,
+            if let Err(e) = image_exporter.write_image(
+                &t_plot,
                 image_output_path,
                 plotly_static::ImageFormat::SVG,
                 800,
                 600,
                 1.0,
             ) {
-                log::error!("Failed to write t_plot to PDF: {}", e);
+                log::error!("Failed to write t_plot to SVG: {}", e);
             }
             let t_plot_json_path = output_dir.as_ref().join(file_stem.with_extension("json"));
             std::fs::write(t_plot_json_path, t_plot.to_json())
@@ -244,8 +238,8 @@ pub fn plot_max_t_values(
         "Writing max_t_plot to {}",
         max_t_plot_file_stem.with_extension("svg").display()
     );
-    if let Err(e) = max_t_plot.write_image_with_exporter(
-        image_exporter,
+    if let Err(e) = image_exporter.write_image(
+        &max_t_plot,
         max_t_plot_file_stem.with_extension("svg"),
         plotly_static::ImageFormat::SVG,
         800,

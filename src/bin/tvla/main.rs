@@ -37,6 +37,9 @@ struct Args {
     #[arg(
         long,
         help = "show progress bar while loading the file",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
         default_value_t = true
     )]
     show_progress: bool,
@@ -53,12 +56,18 @@ struct Args {
     #[arg(
         long,
         help = "Plot the t-test results",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
         default_value_t = true
     )]
     plot: bool,
     #[arg(
         long = "use-existing",
         help = "Skip generation of power trace data if the NPZ file already exists and is not older than the corresponding trace file. Use their stored data instead.",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
         default_value_t = true
     )]
     use_existing: bool,
@@ -192,7 +201,6 @@ fn main() -> miette::Result<()> {
         default_num_threads
     );
 
-
     let collected_traces = filenames.into_par_iter().filter_map(|metadata_path| {
         if !metadata_path.exists() {
             log::error!(
@@ -204,7 +212,7 @@ fn main() -> miette::Result<()> {
 
         let metadata_json = get_metadata(
             &metadata_path,
-            metadata_path.extension().map_or(false, |ext| ext == "gz"),
+            metadata_path.extension().is_some_and(|ext| ext == "gz"),
         )
         .expect("Failed to load metadata!");
 
@@ -256,13 +264,9 @@ fn main() -> miette::Result<()> {
                 .names()
                 .expect("Failed to get names from NPZ file")
                 .iter()
-                .filter_map(|name| {
-                    name.starts_with("trace_").then(|| {
-                        npz_reader
+                .filter(|&name| name.starts_with("trace_")).map(|name| npz_reader
                             .by_name(name.as_str())
-                            .expect(&format!("Failed to find '{}' in NPZ file", name))
-                    })
-                })
+                            .unwrap_or_else(|_| panic!("Failed to find '{}' in NPZ file", name)))
                 .collect_vec();
             let num_traces = traces.len();
             let traces_array: Array2<f32> = Array2::from_shape_vec(
@@ -280,11 +284,11 @@ fn main() -> miette::Result<()> {
                 .map(|v| {
                     v.as_array()
                         .unwrap()
-                        .into_iter()
+                        .iter()
                         .map(|e| {
                             let (start_time, end_time, label) =  e.as_array()
                                 .unwrap()
-                                .into_iter()
+                                .iter()
                                 .map(|i| i.as_u64().unwrap())
                                 .collect_tuple().unwrap();
                             (start_time, end_time, label as u16)
@@ -327,7 +331,7 @@ fn main() -> miette::Result<()> {
                 start_time.elapsed().as_secs_f32()
             );
 
-            
+
 
             println!("Cutting traces based on markers...");
             let start_time = std::time::Instant::now();
@@ -364,7 +368,6 @@ fn main() -> miette::Result<()> {
         }
     }).collect_vec_list();
 
-
     let mut total_collected_traces: usize = 0;
     // must be done sequentially
     let t_values = collected_traces
@@ -381,31 +384,32 @@ fn main() -> miette::Result<()> {
                 if samples_per_trace == cur_samples_per_trace {
                     traces_array
                 } else {
-                error!(
-                    "Inconsistent number of samples per trace: expected {}, found {}",
-                    samples_per_trace, cur_samples_per_trace
-                );
-                if cur_samples_per_trace > samples_per_trace {
-                    warn!(
-                        "Using the first {} samples of the longer trace",
-                        samples_per_trace
-                    );
-                    // Array2::<f32>::from(traces_array.slice(s![.., ..samples_per_trace]))
-                    traces_array.slice(s![.., ..samples_per_trace]).to_owned()
-                } else {
                     error!(
-                        "skipping trace with {} samples as expected {}",
-                        cur_samples_per_trace, samples_per_trace
+                        "Inconsistent number of samples per trace: expected {}, found {}",
+                        samples_per_trace, cur_samples_per_trace
                     );
-                    // create a larger array with zeros
-                    let mut t = Array2::<f32>::zeros((num_traces, samples_per_trace));
-                    // fill in each row with the available samples
-                    for (i, row) in traces_array.outer_iter().enumerate() {
-                        t.slice_mut(s![i, ..row.len()]).assign(&row);
+                    if cur_samples_per_trace > samples_per_trace {
+                        warn!(
+                            "Using the first {} samples of the longer trace",
+                            samples_per_trace
+                        );
+                        // Array2::<f32>::from(traces_array.slice(s![.., ..samples_per_trace]))
+                        traces_array.slice(s![.., ..samples_per_trace]).to_owned()
+                    } else {
+                        error!(
+                            "skipping trace with {} samples as expected {}",
+                            cur_samples_per_trace, samples_per_trace
+                        );
+                        // create a larger array with zeros
+                        let mut t = Array2::<f32>::zeros((num_traces, samples_per_trace));
+                        // fill in each row with the available samples
+                        for (i, row) in traces_array.outer_iter().enumerate() {
+                            t.slice_mut(s![i, ..row.len()]).assign(&row);
+                        }
+                        t
                     }
-                    t
                 }
-            }};
+            };
             num_traces_so_far.push(
                 num_traces_so_far
                     .last()
@@ -446,10 +450,7 @@ fn main() -> miette::Result<()> {
         })
         .expect("Failed to compute t-test values");
 
-    log::info!(
-        "Total number of traces: {}",
-        total_collected_traces
-    );
+    log::info!("Total number of traces: {}", total_collected_traces);
 
     let output_dir = PathBuf::from(&args.ttest_output_dir);
     if !output_dir.exists() {

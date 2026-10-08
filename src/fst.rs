@@ -11,16 +11,16 @@ use std::path::Path;
 
 use crate::{Hamming, markers_to_time_indices, power_model};
 
-impl<'a> Hamming for &'a [u8] {
+impl Hamming for &[u8] {
     #[inline(always)]
     fn hamming_weight(&self) -> u32 {
-        self.into_iter().fold(0, |w, byte| w + byte.count_ones()) as u32
+        self.iter().fold(0, |w, byte| w + byte.count_ones())
     }
 
     #[inline(always)]
     fn hamming_distance(&self, other: &Self) -> u32 {
-        self.into_iter()
-            .zip(other.into_iter())
+        self.iter()
+            .zip(*other)
             .map(|(a, b)| (a ^ b).count_ones())
             .sum()
     }
@@ -75,14 +75,14 @@ pub fn traces_from_fst<P: AsRef<Path>, F: Fn(u64) -> bool>(
     let mut labels = Array1::<u16>::zeros(num_traces);
 
     meta_markers
-        .into_iter()
+        .iter()
         .enumerate()
         .for_each(|(trace_index, (start, end, label))| {
             labels[trace_index] = *label;
 
-            let low_index = time_table.binary_search(&start).unwrap_or_else(|x| x);
+            let low_index = time_table.binary_search(start).unwrap_or_else(|x| x);
             // find the end index
-            let high_index = time_table.binary_search(&end).unwrap_or_else(|x| x);
+            let high_index = time_table.binary_search(end).unwrap_or_else(|x| x);
 
             let time_table_slice = &time_table[low_index..high_index];
             let mut last_values: HashMap<u32, Vec<u8>> = HashMap::with_capacity_and_hasher(
@@ -91,33 +91,29 @@ pub fn traces_from_fst<P: AsRef<Path>, F: Fn(u64) -> bool>(
             );
             let filter = FstFilter::filter_time(*start, *end - 1);
             fst_reader
-                .read_signals(
-                    &filter,
-                    |time, signal_handle, signal_value| match signal_value {
-                        FstSignalValue::String(signal_value) => {
-                            let time_index =
-                                time_table_slice.binary_search(&time).unwrap_or_else(|x| x);
+                .read_signals(&filter, |time, signal_handle, signal_value| {
+                    if let FstSignalValue::String(signal_value) = signal_value {
+                        let time_index =
+                            time_table_slice.binary_search(&time).unwrap_or_else(|x| x);
 
-                            // if time_filter.as_ref().map(|f| f(time)).unwrap_or(true) {
-                            if time_filter(time) {
-                                let sig = signal_handle.get_index() as u32;
+                        // if time_filter.as_ref().map(|f| f(time)).unwrap_or(true) {
+                        if time_filter(time) {
+                            let sig = signal_handle.get_index() as u32;
 
-                                // println!(
-                                //     "Processing signal: {}, time: {}, time_index: {}",
-                                //     sig, time, time_index
-                                // );
+                            // println!(
+                            //     "Processing signal: {}, time: {}, time_index: {}",
+                            //     sig, time, time_index
+                            // );
 
-                                if let Some(last_value) = last_values.get(&sig) {
-                                    all_traces[[trace_index, time_index]] +=
-                                        power_model(&last_value.as_slice(), &signal_value);
-                                }
-
-                                last_values.insert(sig, signal_value.to_vec());
+                            if let Some(last_value) = last_values.get(&sig) {
+                                all_traces[[trace_index, time_index]] +=
+                                    power_model(&last_value.as_slice(), &signal_value);
                             }
+
+                            last_values.insert(sig, signal_value.to_vec());
                         }
-                        _ => {}
-                    },
-                )
+                    }
+                })
                 .expect("Failed to read signals from FST file");
         });
 

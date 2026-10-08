@@ -232,7 +232,7 @@ def run_test(
         if not results:
             print(f"Warning: no test results found in {results_xml_file}")
             exit(1)
-        failed = results.count(lambda ts: ts.failures > 0 or ts.errors > 0)
+        failed = sum(1 for ts in results if ts.failures > 0 or ts.errors > 0)
         if failed > 0:
             print(f"Test run failed with {failed} failures/errors")
             for ts in results:
@@ -288,7 +288,7 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--build",
         action="store_true",
-        help="whether to build the design before running tests (default: True)",
+        help="force a rebuild of the design (default: rebuild only if the build is missing or older than the sources)",
     )
     argparser.add_argument(
         "--test-root",

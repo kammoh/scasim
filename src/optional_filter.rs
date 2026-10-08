@@ -1,14 +1,11 @@
+/// Iterator that yields either all items of `I`, or only those that pass a filter.
+type MaybeFiltered<I, P> = std::iter::Chain<
+    std::iter::Flatten<std::option::IntoIter<I>>,
+    std::iter::Flatten<std::option::IntoIter<std::iter::Filter<I, P>>>,
+>;
+
 pub trait FilterAdaptorWithCondition: Iterator {
-    fn opt_filter<P>(
-        self,
-        predicate: P,
-        condition: bool,
-    ) -> OptionalFilter<
-        std::iter::Chain<
-            std::iter::Flatten<std::option::IntoIter<Self>>,
-            std::iter::Flatten<std::option::IntoIter<std::iter::Filter<Self, P>>>,
-        >,
-    >
+    fn opt_filter<P>(self, predicate: P, condition: bool) -> OptionalFilter<MaybeFiltered<Self, P>>
     where
         Self: Sized,
         P: FnMut(&Self::Item) -> bool,
@@ -31,15 +28,7 @@ pub trait FilterAdaptorWithCondition: Iterator {
 impl<T: Iterator> FilterAdaptorWithCondition for T {}
 
 pub trait OptFilterAdaptor: Iterator {
-    fn opt_filter_option<P>(
-        self,
-        predicate: Option<P>,
-    ) -> OptionalFilter<
-        std::iter::Chain<
-            std::iter::Flatten<std::option::IntoIter<Self>>,
-            std::iter::Flatten<std::option::IntoIter<std::iter::Filter<Self, P>>>,
-        >,
-    >
+    fn opt_filter_option<P>(self, predicate: Option<P>) -> OptionalFilter<MaybeFiltered<Self, P>>
     where
         Self: Sized,
         P: FnMut(&Self::Item) -> bool,
