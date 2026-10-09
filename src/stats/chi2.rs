@@ -91,7 +91,9 @@ pub struct TestResult {
     /// Degrees of freedom after dropping and merging. Zero if the test is not valid.
     pub dof: u32,
     /// Evidence against the null hypothesis as `-log10(p)`. Computed in the log domain, so it is
-    /// finite even when `p` is below the smallest positive `f64`.
+    /// finite even when `p` is below the smallest positive `f64`. It is NaN only if the p-value
+    /// computation did not converge, which cannot happen for any `u32` degrees of freedom (see
+    /// [`ln_gamma_q`](super::special::ln_gamma_q)).
     pub neg_log10_p: f64,
     /// Total count `N` of the rows that took part in the test.
     pub n: u64,

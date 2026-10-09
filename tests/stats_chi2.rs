@@ -10,7 +10,7 @@
 //! The fixtures are in `tests/fixtures/stats/`. Their generators are in `scripts/fixtures/`.
 
 use ndarray::{Array1, Array2};
-use scasim::stats::special::{chi2_ln_sf, ln_gamma, neg_log10_chi2_sf, normal_isf};
+use scasim::stats::special::{chi2_ln_sf, ln_gamma, ln_gamma_q, neg_log10_chi2_sf, normal_isf};
 use scasim::stats::threshold::t_bonferroni;
 use scasim::stats::{
     Binning, HistAccumulator, Statistic, TestOptions, TestResult, Workspace, test_table,
@@ -298,6 +298,37 @@ fn matches_mpmath() {
         worst.3
     );
     assert!(worst.0 < 1.0e-12, "worst error {:?}", worst);
+}
+
+/// `ln Q(a, x)` for tiny shapes (where `1 - P` cancels) and for huge shapes, against mpmath.
+#[test]
+fn ln_gamma_q_matches_mpmath_for_small_and_huge_shapes() {
+    let v = fixture("gamma_q_mpmath.json");
+    let points = v["points"].as_array().unwrap();
+    assert!(points.len() >= 30);
+    let mut worst = (0.0_f64, 0.0_f64, 0.0_f64);
+    for p in points {
+        let (a, x) = (p["a"].as_f64().unwrap(), p["x"].as_f64().unwrap());
+        let want: f64 = p["ln_q"].as_str().unwrap().parse().unwrap();
+        let got = ln_gamma_q(a, x);
+        assert!(got.is_finite(), "a = {a:e}, x = {x}: {got}");
+        let e = (got - want).abs() / want.abs().max(1.0);
+        if a < 1.0 {
+            // Small shapes are cheap and exact to rounding.
+            assert!(e < 1.0e-13, "a = {a:e}, x = {x}: {got} versus {want}");
+        }
+        if e > worst.0 {
+            worst = (e, a, x);
+        }
+    }
+    eprintln!(
+        "ln_gamma_q vs mpmath: {} points, worst error {:.3e} at a = {:e}, x = {}",
+        points.len(),
+        worst.0,
+        worst.1,
+        worst.2
+    );
+    assert!(worst.0 < 1.0e-9, "worst {worst:?}");
 }
 
 #[test]
