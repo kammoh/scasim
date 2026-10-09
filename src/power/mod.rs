@@ -66,6 +66,17 @@ pub enum UnknownPolicy {
     Half,
 }
 
+impl UnknownPolicy {
+    /// Stable name used in statistics cache keys.
+    pub const fn cache_key_name(self) -> &'static str {
+        match self {
+            Self::AsZero => "as-zero",
+            Self::AsOne => "as-one",
+            Self::Half => "half",
+        }
+    }
+}
+
 /// Statistics of a set of value changes. `toggles` counts bit positions whose state changed;
 /// `rise` (0 to 1) and `fall` (1 to 0) are subsets of them; `hw_delta` is the change of the
 /// Hamming weight in half-bit units. See [`stats`] for the exact rules.
@@ -633,6 +644,13 @@ pub(crate) fn is_fst(path: &Path) -> Result<bool, PowerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_policy_cache_names_follow_the_policy() {
+        assert_eq!(UnknownPolicy::AsZero.cache_key_name(), "as-zero");
+        assert_eq!(UnknownPolicy::AsOne.cache_key_name(), "as-one");
+        assert_eq!(UnknownPolicy::Half.cache_key_name(), "half");
+    }
 
     #[test]
     fn bins_must_increase_strictly() {

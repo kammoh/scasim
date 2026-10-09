@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 const ALGORITHM: u32 = 1;
 const MAGIC: &[u8; 8] = b"SCASTATS";
 
@@ -128,6 +128,7 @@ pub struct CacheKey {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ChannelIdentity {
     pub name: String,
+    pub is_total: bool,
     pub handles_hash: [u8; 32],
     pub handles: usize,
 }
@@ -168,13 +169,7 @@ impl Cache {
             return Err(miette!("invalid batch id, sample axis, or channel list"));
         }
         let mut names = BTreeSet::new();
-        if self
-            .channels
-            .iter()
-            .filter(|c| c.identity.name == "total")
-            .count()
-            != 1
-        {
+        if self.channels.iter().filter(|c| c.identity.is_total).count() != 1 {
             return Err(miette!("the cache needs one total channel"));
         }
         for (g, counts) in &self.counts {
@@ -188,7 +183,7 @@ impl Cache {
             }
         }
         for channel in &self.channels {
-            if !names.insert(&channel.identity.name)
+            if !names.insert((channel.identity.is_total, &channel.identity.name))
                 || channel.identity.handles == 0
                 || channel.groups.keys().ne(self.counts.keys())
             {
@@ -416,6 +411,7 @@ mod tests {
         let channel = Channel {
             identity: ChannelIdentity {
                 name: "total".into(),
+                is_total: true,
                 handles_hash: [7; 32],
                 handles: 2,
             },
@@ -465,12 +461,35 @@ mod tests {
         }
     }
     #[test]
+    fn a_scope_channel_named_total_is_not_the_total_channel() {
+        let mut c = cache("a", 2, false);
+        let mut scope = c.channels[0].clone();
+        scope.identity.name = "total".into();
+        scope.identity.is_total = false;
+        c.channels.push(scope);
+        c.validate().unwrap();
+        assert_eq!(
+            c.channels
+                .iter()
+                .position(|channel| channel.identity.is_total),
+            Some(0)
+        );
+        assert_eq!(
+            c.channels
+                .iter()
+                .filter(|channel| channel.identity.is_total)
+                .count(),
+            1
+        );
+    }
+    #[test]
     fn merge_matches_channels_by_identity_and_checks_names_and_settings() {
         let mut a = cache("a", 2, false);
         let mut b = cache("b", 2, true);
         for c in [&mut a, &mut b] {
             let mut second = c.channels[0].clone();
             second.identity.name = "scope".into();
+            second.identity.is_total = false;
             c.channels.push(second);
         }
         b.channels.reverse();

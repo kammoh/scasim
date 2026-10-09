@@ -176,3 +176,52 @@ pub fn waveform_time_unit(path: &Path) -> miette::Result<TimeUnit> {
         exponent: i32::from(exponent),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TimeUnit;
+
+    #[test]
+    fn ticks_exercises_initial_u128_multiplication_and_u64_conversion() {
+        let unit = TimeUnit {
+            mantissa: u64::MAX,
+            exponent: 0,
+        };
+        assert_eq!(unit.ticks(u64::MAX, &unit), Some(u64::MAX));
+        let fine = TimeUnit {
+            mantissa: 1,
+            exponent: -1,
+        };
+        assert_eq!(
+            TimeUnit {
+                mantissa: 1,
+                exponent: 0
+            }
+            .ticks(u64::MAX, &fine),
+            None
+        );
+    }
+
+    #[test]
+    fn ticks_checks_positive_and_negative_power_of_ten_multiplication() {
+        let positive = TimeUnit {
+            mantissa: u64::MAX,
+            exponent: 0,
+        };
+        let fine = TimeUnit {
+            mantissa: 1,
+            exponent: -1,
+        };
+        assert_eq!(positive.ticks(u64::MAX, &fine), None);
+
+        let negative = TimeUnit {
+            mantissa: 1,
+            exponent: -40,
+        };
+        let coarse = TimeUnit {
+            mantissa: 1,
+            exponent: 0,
+        };
+        assert_eq!(negative.ticks(1, &coarse), None);
+    }
+}

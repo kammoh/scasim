@@ -329,6 +329,7 @@ fn report_selection(batch: &str, d: &BatchDiagnostics) {
 /// How `tvla` turns a batch into traces.
 struct BatchSettings<'a> {
     selection: &'a Selection,
+    pair: [u16; 2],
     sampling: Sampling,
     policy: LengthPolicy,
     use_existing: bool,
@@ -430,6 +431,13 @@ fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Res
         ));
     }
     let meta = read_batch_meta(metadata_path)?;
+    if meta.v1.is_some() && meta.markers.len() < 2 {
+        return Err(miette!(
+            "the batch {} has {} traces; a t-test needs at least two traces",
+            metadata_path.display(),
+            meta.markers.len()
+        ));
+    }
     let key = settings
         .stats_common
         .as_ref()
@@ -461,6 +469,11 @@ fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Res
             npz_path.display()
         );
         let data = read_trace_cache(&npz_path)?;
+        require_pair_labels(
+            data.1.as_slice().expect("labels are contiguous"),
+            settings.pair,
+            &metadata_path.display().to_string(),
+        )?;
         return Ok(BatchResult {
             meta,
             identities: Vec::new(),
@@ -480,6 +493,7 @@ fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Res
             meta.markers.len()
         ));
     }
+
     println!(
         "Computing power traces from {}...",
         trace_file_path.display()
@@ -553,6 +567,7 @@ fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Res
                     } else {
                         channel.name.clone()
                     },
+                    is_total: channel_index == 0,
                     handles: handles.len(),
                     handles_hash: cache::digest(&serde_json::to_vec(&handles).into_diagnostic()?),
                 })
@@ -562,6 +577,11 @@ fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Res
         Vec::new()
     };
     let output = compute_batch(&meta, &plan, &settings.sampling, settings.policy)?;
+    require_pair_labels(
+        output.labels.as_slice().expect("labels are contiguous"),
+        settings.pair,
+        &metadata_path.display().to_string(),
+    )?;
     if let Some(key) = &key {
         let stat = std::fs::metadata(&trace_file_path).into_diagnostic()?;
         let mtime = stat
@@ -713,6 +733,14 @@ fn batch_cache(result: &BatchResult) -> miette::Result<cache::Cache> {
                     result.total.labels.select(Axis(0), &rows).view(),
                 )
                 .into_diagnostic()?;
+                if hist.rejected() > 0 {
+                    return Err(miette!(
+                        "the traces from {} (batch {}) have {} values that are not integers or are 2^53 or larger. The statistics need integer-valued traces",
+                        result.total.source.display(),
+                        result.total.metadata.display(),
+                        hist.rejected()
+                    ));
+                }
                 groups.insert(*group, hist);
             }
             Ok(cache::Channel {
@@ -742,6 +770,32 @@ fn batch_cache(result: &BatchResult) -> miette::Result<cache::Cache> {
         aliased: result.aliased,
         outside: result.outside,
     })
+}
+
+fn require_pair_counts(hist: &HistAccumulator, pair: [u16; 2], batch: &str) -> miette::Result<()> {
+    for label in pair {
+        if hist.class_count(label) == 0 {
+            return Err(miette!(
+                "{batch}: --pair label {label} is absent from the batch"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_pair_labels(labels: &[u16], pair: [u16; 2], batch: &str) -> miette::Result<()> {
+    for label in pair {
+        if !labels.contains(&label) {
+            return Err(miette!(
+                "{batch}: --pair label {label} is absent from the batch"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn unknown_policy_cache_name(policy: scasim::power::UnknownPolicy) -> String {
+    policy.cache_key_name().into()
 }
 
 /// The fold of one per-scope channel.
@@ -891,12 +945,13 @@ fn main() -> miette::Result<()> {
             depth: args.depth as usize,
             policy,
             shuffle_seed: args.shuffle_labels,
-            unknown: "half".into(),
+            unknown: unknown_policy_cache_name(scasim::power::UnknownPolicy::default()),
         },
         ..cache::CommonKey::default()
     };
     let settings = BatchSettings {
         selection: &selection,
+        pair,
         sampling,
         policy,
         use_existing: args.use_existing,
@@ -975,11 +1030,13 @@ fn main() -> miette::Result<()> {
             let total = cache
                 .channels
                 .iter()
-                .position(|c| c.identity.name == "total")
+                .position(|c| c.identity.is_total)
                 .expect("cache validation requires total");
-            fold.add_histogram(cache.selected(total, args.group, args.pool_groups)?)?;
+            let hist = cache.selected(total, args.group, args.pool_groups)?;
+            require_pair_counts(&hist, pair, &path.display().to_string())?;
+            fold.add_histogram(hist)?;
             if scope_folds.is_empty() {
-                for channel in cache.channels.iter().filter(|c| c.identity.name != "total") {
+                for channel in cache.channels.iter().filter(|c| !c.identity.is_total) {
                     let mut fold = Fold::without_curves(order, args.chi2);
                     fold.policy = policy;
                     fold.pair = pair;
@@ -994,7 +1051,7 @@ fn main() -> miette::Result<()> {
                 let index = cache
                     .channels
                     .iter()
-                    .position(|c| c.identity.name == f.name)
+                    .position(|c| !c.identity.is_total && c.identity.name == f.name)
                     .expect("channel identities were checked");
                 f.fold
                     .add_histogram(cache.selected(index, args.group, args.pool_groups)?)?;
@@ -1038,6 +1095,15 @@ fn main() -> miette::Result<()> {
                         }
                     }
                 }
+                require_pair_labels(
+                    result
+                        .total
+                        .labels
+                        .as_slice()
+                        .expect("labels are contiguous"),
+                    pair,
+                    &result.total.metadata.display().to_string(),
+                )?;
                 if let Some(edges) = &result.edges {
                     edge_totals.add(edges);
                 }
@@ -1355,6 +1421,7 @@ fn plot_chi2(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::array;
 
     fn rules(args: &[&str]) -> Vec<String> {
         let mut argv = vec!["tvla", "--meta-json", "meta.json"];
@@ -1395,5 +1462,52 @@ mod tests {
     fn no_flags_give_no_rules() {
         assert!(rules(&[]).is_empty());
         assert!(rules(&["--list-signals"]).is_empty());
+    }
+
+    #[test]
+    fn batch_cache_reports_rejected_non_integer_trace_values() {
+        let metadata = PathBuf::from("meta.json");
+        let result = BatchResult {
+            meta: scasim::batch::BatchMeta {
+                metadata_path: metadata.clone(),
+                v1: None,
+                trace_path: PathBuf::from("wave.vcd"),
+                clock_period: None,
+                markers: vec![(0, 1, 0), (1, 2, 1)],
+            },
+            identities: vec![cache::ChannelIdentity {
+                name: "total".into(),
+                is_total: true,
+                handles_hash: [0; 32],
+                handles: 1,
+            }],
+            key: Some(cache::CacheKey {
+                common: cache::CommonKey::default(),
+                batch: cache::BatchKey::default(),
+            }),
+            total: Loaded {
+                metadata: metadata.clone(),
+                source: PathBuf::from("traces"),
+                traces: array![[0.5_f32], [1.0]],
+                labels: array![0_u16, 1],
+            },
+            scopes: Vec::new(),
+            edges: None,
+            aliased: 0,
+            outside: 0,
+        };
+        let err = batch_cache(&result).unwrap_err().to_string();
+        assert!(
+            err.contains("not integers") && err.contains("meta.json"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn cache_key_uses_the_selected_unknown_policy() {
+        assert_eq!(
+            unknown_policy_cache_name(scasim::power::UnknownPolicy::AsOne),
+            "as-one"
+        );
     }
 }

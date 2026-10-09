@@ -188,6 +188,7 @@ fn the_channel_traces_add_up_to_the_trace_of_the_whole_selection_bit_for_bit() {
     assert!(plan.channels.iter().any(|c| c.name == "(outside tb.dut)"));
     assert_eq!(plan.channels[0].name, "total");
     let meta = BatchMeta {
+        metadata_path: path.with_file_name("meta.json"),
         v1: None,
         trace_path: path.clone(),
         clock_period: None,

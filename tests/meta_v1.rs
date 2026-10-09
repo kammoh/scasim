@@ -38,10 +38,13 @@ fn v1_exact_ps_to_ns_and_ps_ticks() {
 }
 #[test]
 fn v1_rejects_inexact_and_overflow_with_file_and_segment() {
-    for (exp, start, unit) in [(-9, 1001, -12), (-12, u64::MAX, 0)] {
+    for (exp, start, unit) in [(-9, 1001, -12), (-12, 1, 0)] {
         let (dir, mut json) = fixture(exp);
         json["time"]["exponent"] = unit.into();
         json["segments"][0]["start"] = start.into();
+        if unit == 0 {
+            json["segments"][0]["end"] = u64::MAX.into();
+        }
         let err = read(&dir, &json).unwrap_err().to_string();
         assert!(
             err.contains("meta.json") && err.contains("segment 7"),
@@ -122,5 +125,19 @@ fn time_units_handle_factors_and_large_exact_values() {
         }
         .ticks(1, &ps),
         None
+    );
+}
+
+#[test]
+fn v1_legacy_mode_error_names_metadata_file() {
+    let (dir, json) = fixture(-9);
+    let meta = read(&dir, &json).unwrap();
+    let plan = PowerPlan::toggles(Selection::all());
+    let err = compute_batch(&meta, &plan, &Sampling::Legacy, LengthPolicy::Pad)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("meta.json") && err.contains("--clock"),
+        "{err}"
     );
 }

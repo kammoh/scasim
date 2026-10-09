@@ -110,6 +110,25 @@ fn select_three_labels_and_two_groups() {
             .success()
     );
 }
+
+#[test]
+fn v1_batches_require_two_traces_and_pair_labels_present_in_the_batch() {
+    let one = Batch::new("one", true);
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(one.meta()).unwrap()).unwrap();
+    meta["segments"].as_array_mut().unwrap().truncate(1);
+    std::fs::write(one.meta(), serde_json::to_vec(&meta).unwrap()).unwrap();
+    let output = one.run(&["--clock", "tb.clk", "--pool-groups"]);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("at least two traces"), "{err}");
+
+    let many = Batch::new("many", true);
+    let output = many.run(&["--clock", "tb.clk", "--pair", "1", "9", "--pool-groups"]);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("9") && err.contains("label"), "{err}");
+}
 #[test]
 fn caches_match_normal_run_and_reject_duplicate_and_corruption() {
     for (v1, edges, scopes) in [
@@ -277,6 +296,32 @@ fn changed_seed_segment_and_preprocessing_change_the_cache_key() {
     choice.extend(["--pair", "1", "2"]);
     ok(b.run(&choice));
     assert_eq!(original, std::fs::read(&out).unwrap());
+}
+
+#[test]
+fn changed_waveform_content_changes_the_cache_key() {
+    let b = Batch::new("b", true);
+    let cache = b.dir.path().join("batch.stats");
+    let flags = [
+        "--clock",
+        "tb.clk",
+        "--pool-groups",
+        "--stats-out",
+        cache.to_str().unwrap(),
+    ];
+    ok(b.run(&flags));
+    let original = std::fs::read(&cache).unwrap();
+    let waveform_path = b.dir.path().join("w.vcd");
+    let waveform = std::fs::read_to_string(&waveform_path).unwrap();
+    let changed = waveform.replacen(
+        "$enddefinitions $end\n#0",
+        "$enddefinitions $end\n$comment cache-key check $end\n#0",
+        1,
+    );
+    assert_ne!(waveform, changed);
+    std::fs::write(&waveform_path, changed).unwrap();
+    ok(b.run(&flags));
+    assert_ne!(original, std::fs::read(&cache).unwrap());
 }
 
 #[test]

@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 /// Metadata of one batch. Segment times use waveform ticks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchMeta {
+    /// The metadata file that describes this batch.
+    pub metadata_path: PathBuf,
     /// Version 1 fields, including names, groups, seeds, and extensions.
     pub v1: Option<crate::metadata::MetadataV1>,
     /// Waveform file, resolved relative to the metadata file.
@@ -61,6 +63,7 @@ pub fn read_batch_meta(meta_path: &Path) -> miette::Result<BatchMeta> {
             (PathBuf::new(), Vec::new())
         };
         return Ok(BatchMeta {
+            metadata_path: meta_path.to_path_buf(),
             v1: Some(v1),
             trace_path,
             clock_period: None,
@@ -110,6 +113,7 @@ pub fn read_batch_meta(meta_path: &Path) -> miette::Result<BatchMeta> {
         .collect::<miette::Result<Vec<_>>>()?;
     let dir = meta_path.parent().unwrap_or(Path::new("."));
     Ok(BatchMeta {
+        metadata_path: meta_path.to_path_buf(),
         v1: None,
         trace_path: dir.join(trace_filename),
         clock_period,
@@ -538,7 +542,8 @@ pub fn compute_batch(
         Sampling::Legacy => {
             if meta.v1.is_some() {
                 return Err(miette!(
-                    "version 1 metadata has no clock_period; use --clock PATH"
+                    "{}: version 1 metadata has no clock_period; use --clock PATH",
+                    meta.metadata_path.display()
                 ));
             }
             let mut activity = activity(&meta.trace_path, plan).map_err(wrap)?;
@@ -848,6 +853,7 @@ mod tests {
 
     fn meta(clock_period: Option<u64>, markers: Vec<(u64, u64, u16)>) -> BatchMeta {
         BatchMeta {
+            metadata_path: PathBuf::from("meta.json"),
             v1: None,
             trace_path: PathBuf::from("unused"),
             clock_period,
@@ -981,6 +987,7 @@ mod tests {
         let path = dir.path().join("w.vcd");
         std::fs::write(&path, vcd).unwrap();
         let m = BatchMeta {
+            metadata_path: dir.path().join("meta.json"),
             v1: None,
             trace_path: path,
             clock_period: Some(10),
