@@ -118,7 +118,6 @@ pub(super) fn segment_mean<T: TraceSample>(
     rows: &[&[T]],
     ids: &[u32],
     j0: usize,
-    scale_exp: i32,
     origin: &mut [f64],
     offset: &mut [f64],
 ) {
@@ -128,13 +127,13 @@ pub(super) fn segment_mean<T: TraceSample>(
         .iter_mut()
         .zip(&rows[ids[0] as usize][j0..j0 + width])
     {
-        *o = scale_sample(x.to_f64(), -scale_exp);
+        *o = x.to_f64();
     }
     offset.fill(0.0);
     for &i in &ids[1..] {
         let x = &rows[i as usize][j0..j0 + width];
         for ((s, o), x) in offset.iter_mut().zip(origin.iter()).zip(x) {
-            *s += scale_sample(x.to_f64(), -scale_exp) - o;
+            *s += x.to_f64() - o;
         }
     }
     let nb = ids.len() as f64;
@@ -155,11 +154,10 @@ pub(super) fn segment_block<T: TraceSample>(
     ids: &[u32],
     j0: usize,
     d: usize,
-    scale_exp: i32,
-    center: (&[f64], &[f64]),
+    origin: &[f64],
+    offset: &[f64],
     out: &mut [f64],
 ) {
-    let (origin, offset) = center;
     let w = origin.len();
     debug_assert!(w <= W && offset.len() == w);
     let (out_origin, rest) = out.split_at_mut(W);
@@ -169,11 +167,11 @@ pub(super) fn segment_block<T: TraceSample>(
     // The number of central sums is 2d - 1. The compiler can unroll the loop over the
     // orders if it knows the number at compile time. Larger orders use the general code.
     match d {
-        1 => sums_fixed::<T, 1>(rows, ids, j0, scale_exp, origin, offset, sums),
-        2 => sums_fixed::<T, 3>(rows, ids, j0, scale_exp, origin, offset, sums),
-        3 => sums_fixed::<T, 5>(rows, ids, j0, scale_exp, origin, offset, sums),
-        4 => sums_fixed::<T, 7>(rows, ids, j0, scale_exp, origin, offset, sums),
-        _ => sums_general(rows, ids, j0, d, scale_exp, (origin, offset), sums),
+        1 => sums_fixed::<T, 1>(rows, ids, j0, origin, offset, sums),
+        2 => sums_fixed::<T, 3>(rows, ids, j0, origin, offset, sums),
+        3 => sums_fixed::<T, 5>(rows, ids, j0, origin, offset, sums),
+        4 => sums_fixed::<T, 7>(rows, ids, j0, origin, offset, sums),
+        _ => sums_general(rows, ids, j0, d, origin, offset, sums),
     }
 }
 
@@ -182,7 +180,6 @@ fn sums_fixed<T: TraceSample, const P: usize>(
     rows: &[&[T]],
     ids: &[u32],
     j0: usize,
-    scale_exp: i32,
     origin: &[f64],
     offset: &[f64],
     sums: &mut [f64],
@@ -192,7 +189,7 @@ fn sums_fixed<T: TraceSample, const P: usize>(
     for &i in ids {
         let x = &rows[i as usize][j0..j0 + w];
         for q in 0..w {
-            let dev = (scale_sample(x[q].to_f64(), -scale_exp) - origin[q]) - offset[q];
+            let dev = (x[q].to_f64() - origin[q]) - offset[q];
             let mut pow = dev;
             for a in acc.iter_mut() {
                 pow *= dev;
@@ -211,11 +208,10 @@ fn sums_general<T: TraceSample>(
     ids: &[u32],
     j0: usize,
     d: usize,
-    scale_exp: i32,
-    center: (&[f64], &[f64]),
+    origin: &[f64],
+    offset: &[f64],
     sums: &mut [f64],
 ) {
-    let (origin, offset) = center;
     let w = origin.len();
     sums.fill(0.0);
     let mut dev = [0.0f64; W];
@@ -230,7 +226,7 @@ fn sums_general<T: TraceSample>(
             .zip(x)
             .zip(origin.iter().zip(offset.iter()))
         {
-            *dv = (scale_sample(x.to_f64(), -scale_exp) - o) - f;
+            *dv = (x.to_f64() - o) - f;
             *pw = *dv;
         }
         for row in sums.as_chunks_mut::<W>().0.iter_mut().take(n_sums) {
@@ -240,19 +236,6 @@ fn sums_general<T: TraceSample>(
             }
         }
     }
-}
-
-#[inline]
-fn scale_sample(mut value: f64, mut exponent: i32) -> f64 {
-    while exponent > 512 {
-        value *= 2.0f64.powi(512);
-        exponent -= 512;
-    }
-    while exponent < -512 {
-        value *= 2.0f64.powi(-512);
-        exponent += 512;
-    }
-    value * 2.0f64.powi(exponent)
 }
 
 /// Merges the block `blk` (set `B`) into the block `acc` (set `A`).
@@ -335,22 +318,14 @@ mod tests {
         let ids: Vec<u32> = (0..n as u32).collect();
         let mut origin = vec![0.0; w];
         let mut offset = vec![0.0; w];
-        segment_mean(&rows, &ids, 0, 0, &mut origin, &mut offset);
+        segment_mean(&rows, &ids, 0, &mut origin, &mut offset);
         for d in 1..=4 {
             let mut fixed = vec![0.0; block_len(d)];
-            segment_block(&rows, &ids, 0, d, 0, (&origin, &offset), &mut fixed);
+            segment_block(&rows, &ids, 0, d, &origin, &offset, &mut fixed);
             let mut general = vec![0.0; block_len(d)];
             general[..W][..w].copy_from_slice(&origin);
             general[W..2 * W][..w].copy_from_slice(&offset);
-            sums_general(
-                &rows,
-                &ids,
-                0,
-                d,
-                0,
-                (&origin, &offset),
-                &mut general[2 * W..],
-            );
+            sums_general(&rows, &ids, 0, d, &origin, &offset, &mut general[2 * W..]);
             assert_eq!(fixed, general, "d = {d}");
         }
     }

@@ -104,8 +104,6 @@ struct Group {
 pub struct MomentAccumulator {
     pub(super) ns: usize,
     pub(super) d: usize,
-    /// Power-of-two scale applied to the input values stored in `classes`.
-    scale_exp: i32,
     pub(super) classes: BTreeMap<u16, ClassState>,
 }
 
@@ -137,7 +135,6 @@ impl MomentAccumulator {
         Ok(Self {
             ns,
             d,
-            scale_exp: 0,
             classes: BTreeMap::new(),
         })
     }
@@ -197,19 +194,6 @@ impl MomentAccumulator {
         if n_traces == 0 || ns == 0 {
             return Ok(());
         }
-        let input_exp = sample_scale_exp(traces.iter().map(|v| v.to_f64()), self.scale_exp);
-        let input_exp = if (-64..=64).contains(&input_exp) {
-            0
-        } else {
-            input_exp
-        };
-        let has_data = self.classes.values().any(|class| class.n != 0);
-        let scale_exp = if has_data {
-            self.scale_exp.max(input_exp)
-        } else {
-            input_exp
-        };
-        self.rescale_to(scale_exp);
         let d = self.d;
 
         // Make sure that every row of the input is a contiguous slice.
@@ -280,7 +264,7 @@ impl MomentAccumulator {
                 let reduce = |&(gi, si): &(usize, usize)| {
                     let ids = &groups[gi].ids;
                     let ids = &ids[si * SEGMENT..((si + 1) * SEGMENT).min(ids.len())];
-                    segment_partial(&rows, ids, b0, b1, ns, d, scale_exp)
+                    segment_partial(&rows, ids, b0, b1, ns, d)
                 };
                 let partials: Vec<Vec<f64>> = if parallel {
                     wave.par_iter().map(reduce).collect()
@@ -353,19 +337,8 @@ impl MomentAccumulator {
                 .checked_add(b.n)
                 .ok_or(StatsError::CountOverflow)?;
         }
-        let self_has_data = self.classes.values().any(|class| class.n != 0);
-        let other_has_data = other.classes.values().any(|class| class.n != 0);
-        let scale_exp = match (self_has_data, other_has_data) {
-            (false, true) => other.scale_exp,
-            (true, false) => self.scale_exp,
-            (true, true) => self.scale_exp.max(other.scale_exp),
-            (false, false) => self.scale_exp,
-        };
-        self.rescale_to(scale_exp);
-        let mut other_scaled = other.clone();
-        other_scaled.rescale_to(scale_exp);
         let (ns, d) = (self.ns, self.d);
-        for (label, b) in &other_scaled.classes {
+        for (label, b) in &other.classes {
             if b.n == 0 {
                 continue;
             }
@@ -411,10 +384,7 @@ impl MomentAccumulator {
     /// The mean at each sample point for class `label`, or `None` for an unknown class.
     pub fn mean(&self, label: u16) -> Option<Array1<f64>> {
         let c = self.classes.get(&label)?;
-        Some(
-            (self.gather_row(c, 0) + self.gather_row(c, 1))
-                .mapv(|value| scale_float(value, self.scale_exp)),
-        )
+        Some(self.gather_row(c, 0) + self.gather_row(c, 1))
     }
 
     /// The central sum `sum_i (x_i - mean)^p` at each sample point for class `label`.
@@ -426,10 +396,7 @@ impl MomentAccumulator {
             return None;
         }
         let c = self.classes.get(&label)?;
-        Some(
-            self.gather_row(c, p)
-                .mapv(|value| scale_float(value, self.scale_exp * p as i32)),
-        )
+        Some(self.gather_row(c, p))
     }
 
     /// Exports the complete state as plain data.
@@ -444,16 +411,7 @@ impl MomentAccumulator {
             .map(|(&label, c)| {
                 let mut data = vec![0.0; rows * ns];
                 for r in 0..rows {
-                    let exponent = if r < 2 {
-                        self.scale_exp
-                    } else {
-                        self.scale_exp * r as i32
-                    };
-                    let row = self
-                        .gather_row(c, r)
-                        .mapv(|value| scale_float(value, exponent));
-                    data[r * ns..(r + 1) * ns]
-                        .copy_from_slice(row.as_slice().expect("row is contiguous"));
+                    data[r * ns..(r + 1) * ns].copy_from_slice(&self.gather_row(c, r).to_vec());
                 }
                 ClassMoments {
                     label,
@@ -502,26 +460,6 @@ impl MomentAccumulator {
         Ok(acc)
     }
 
-    /// Changes the shared input scale of all stored classes.
-    fn rescale_to(&mut self, scale_exp: i32) {
-        let shift = self.scale_exp - scale_exp;
-        if shift == 0 {
-            return;
-        }
-        for class in self.classes.values_mut() {
-            for block in class.data.chunks_exact_mut(block_len(self.d)) {
-                for row in 0..rows_per_block(self.d) {
-                    let exponent = if row < 2 { shift } else { shift * row as i32 };
-                    let start = row * W;
-                    for value in &mut block[start..start + W] {
-                        *value = scale_float(*value, exponent);
-                    }
-                }
-            }
-        }
-        self.scale_exp = scale_exp;
-    }
-
     /// Reads row `r` of the block layout as a vector over sample points.
     fn gather_row(&self, c: &ClassState, r: usize) -> Array1<f64> {
         let (ns, d) = (self.ns, self.d);
@@ -545,14 +483,13 @@ fn segment_partial<T: TraceSample>(
     b1: usize,
     ns: usize,
     d: usize,
-    scale_exp: i32,
 ) -> Vec<f64> {
     let len = block_len(d);
     let j0 = b0 * W;
     let j1 = (b1 * W).min(ns);
     let mut origin = vec![0.0; j1 - j0];
     let mut offset = vec![0.0; j1 - j0];
-    segment_mean(rows, ids, j0, scale_exp, &mut origin, &mut offset);
+    segment_mean(rows, ids, j0, &mut origin, &mut offset);
     let mut out = vec![0.0; (b1 - b0) * len];
     for (bi, block) in out.chunks_exact_mut(len).enumerate() {
         let lo = bi * W;
@@ -562,31 +499,10 @@ fn segment_partial<T: TraceSample>(
             ids,
             j0 + lo,
             d,
-            scale_exp,
-            (&origin[lo..hi], &offset[lo..hi]),
+            &origin[lo..hi],
+            &offset[lo..hi],
             block,
         );
     }
     out
-}
-
-fn sample_scale_exp(values: impl Iterator<Item = f64>, fallback: i32) -> i32 {
-    let max = values.map(f64::abs).fold(0.0, f64::max);
-    if max == 0.0 || !max.is_finite() {
-        fallback
-    } else {
-        max.log2().floor() as i32
-    }
-}
-
-fn scale_float(mut value: f64, mut exponent: i32) -> f64 {
-    while exponent > 512 {
-        value *= 2.0f64.powi(512);
-        exponent -= 512;
-    }
-    while exponent < -512 {
-        value *= 2.0f64.powi(-512);
-        exponent += 512;
-    }
-    value * 2.0f64.powi(exponent)
 }

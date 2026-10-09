@@ -3,6 +3,17 @@
 //! The preprocessing for each order follows Schneider and Moradi, CHES 2015,
 //! ePrint 2015/207, Section 4 and Appendix A. The central sums use Pébay's
 //! parallel moment formulas, SAND2008-6212.
+//!
+//! The accumulator stores raw central sums through order `2d` in `f64`. For a positive-
+//! variance class, each needed `CS_p` must be finite and each `CM_p = CS_p / n` must be finite
+//! and normal. A needed `CM_p` that is zero or subnormal returns NaN. A zero-variance class
+//! keeps the zero-denominator rules below. The exact rule applies to the moments used by the
+//! requested order: `p = 2` for order 1; `p = 2, 4` for order 2; and `p = 2, k, 2k` for order
+//! `k >= 3`. In particular, the largest needed sum scales as `n * sd^(2d)` and must stay in
+//! the normal `f64` range. For `d = 4`, this gives an approximate standard-deviation range of
+//! `1e-38` to `1e38` for ordinary class sizes. The scale stays at one when `2^-60 <= CM_2 <=
+//! 2^60`, which preserves the original operation order and bit pattern in the normal range.
+//! A non-finite scaled intermediate returns NaN.
 
 /// Central moments for one class at one sample point.
 ///
@@ -50,31 +61,40 @@ pub fn welch_t(order: usize, a: &ClassSample<'_>, b: &ClassSample<'_>) -> f64 {
     {
         return f64::NAN;
     }
-    let (diff, va, vb) = if order == 1 {
-        (
-            (a.origin - b.origin) + (a.offset - b.offset),
-            a.cs[0] / a.n as f64,
-            b.cs[0] / b.n as f64,
-        )
-    } else if order == 2 {
+    let (diff, va, vb) = if order <= 2 {
         let cm2a = a.cs[0] / a.n as f64;
         let cm2b = b.cs[0] / b.n as f64;
-        let exponent = [cm2a, cm2b]
-            .into_iter()
-            .filter(|v| *v > 0.0 && v.is_finite())
-            .map(|v| v.log2().floor() as i32)
-            .max()
-            .unwrap_or(0)
-            .div_euclid(2);
-        let cm2a_scaled = scale_pow2(cm2a, -2 * exponent);
-        let cm2b_scaled = scale_pow2(cm2b, -2 * exponent);
-        let cm4a_scaled = scale_pow2(a.cs[2 * a.cs_stride] / a.n as f64, -4 * exponent);
-        let cm4b_scaled = scale_pow2(b.cs[2 * b.cs_stride] / b.n as f64, -4 * exponent);
-        (
-            cm2a_scaled - cm2b_scaled,
-            cm4a_scaled - cm2a_scaled * cm2a_scaled,
-            cm4b_scaled - cm2b_scaled * cm2b_scaled,
-        )
+        if (cm2a > 0.0 && !normal(cm2a)) || (cm2b > 0.0 && !normal(cm2b)) {
+            return f64::NAN;
+        }
+        let exponent = scale_exponent(cm2a.max(cm2b));
+        if order == 1 {
+            let diff = (scale_pow2(a.origin, -exponent) - scale_pow2(b.origin, -exponent))
+                + (scale_pow2(a.offset, -exponent) - scale_pow2(b.offset, -exponent));
+            let va = scale_pow2(cm2a, -2 * exponent);
+            let vb = scale_pow2(cm2b, -2 * exponent);
+            if ![diff, va, vb].into_iter().all(f64::is_finite) {
+                return f64::NAN;
+            }
+            (diff, va, vb)
+        } else {
+            let cm4a = a.cs[2 * a.cs_stride] / a.n as f64;
+            let cm4b = b.cs[2 * b.cs_stride] / b.n as f64;
+            if (cm2a > 0.0 && !normal(cm4a)) || (cm2b > 0.0 && !normal(cm4b)) {
+                return f64::NAN;
+            }
+            let cm2a = scale_pow2(cm2a, -2 * exponent);
+            let cm2b = scale_pow2(cm2b, -2 * exponent);
+            let cm4a = scale_pow2(cm4a, -4 * exponent);
+            let cm4b = scale_pow2(cm4b, -4 * exponent);
+            let diff = cm2a - cm2b;
+            let va = cm4a - cm2a * cm2a;
+            let vb = cm4b - cm2b * cm2b;
+            if ![diff, va, vb].into_iter().all(f64::is_finite) {
+                return f64::NAN;
+            }
+            (diff, va, vb)
+        }
     } else {
         let cm = |s: &ClassSample<'_>, p: usize| s.cs[(p - 2) * s.cs_stride] / s.n as f64;
         let (ma, va) = preprocessed(order, cm(a, 2), |p| cm(a, p));
@@ -84,8 +104,11 @@ pub fn welch_t(order: usize, a: &ClassSample<'_>, b: &ClassSample<'_>) -> f64 {
     if va < 0.0 || vb < 0.0 {
         return f64::NAN;
     }
+    if !diff.is_finite() {
+        return f64::NAN;
+    }
     let variance = va / a.n as f64 + vb / b.n as f64;
-    if variance < 0.0 || variance.is_nan() {
+    if variance < 0.0 || !variance.is_finite() {
         return f64::NAN;
     }
     if variance == 0.0 {
@@ -97,7 +120,12 @@ pub fn welch_t(order: usize, a: &ClassSample<'_>, b: &ClassSample<'_>) -> f64 {
             f64::NAN
         };
     }
-    diff / variance.sqrt()
+    let result = diff / variance.sqrt();
+    if !result.is_finite() {
+        f64::NAN
+    } else {
+        result
+    }
 }
 
 #[inline]
@@ -111,20 +139,46 @@ fn preprocessed(order: usize, cm2: f64, cm: impl Fn(usize) -> f64) -> (f64, f64)
 
     // Scale moments by an exact power of two so the standardized values stay near one.
     // The exponent comes from CM_2 and is applied before any products or powers form.
-    let exponent = cm2.log2().floor() as i32;
-    let scale_exponent = exponent.div_euclid(2);
+    let scale_exponent = scale_exponent(cm2);
     let scaled = |p: usize| scale_pow2(cm(p), -scale_exponent * p as i32);
     let cm2_scaled = scaled(2);
+    let cmk_raw = cm(order);
+    let cm2k_raw = cm(2 * order);
+    if !normal(cmk_raw) || !normal(cm2k_raw) {
+        return (f64::NAN, f64::NAN);
+    }
     if order == 2 {
         let cm4_scaled = scaled(4);
         (cm2_scaled, cm4_scaled - cm2_scaled * cm2_scaled)
     } else {
         let k = order as i32;
-        let cmk = scaled(order);
-        let cm2k = scaled(2 * order);
-        let mean = cmk / cm2_scaled.powf(k as f64 / 2.0);
+        let cmk = scale_pow2(cmk_raw, -scale_exponent * k);
+        let cm2k = scale_pow2(cm2k_raw, -scale_exponent * 2 * k);
+        let mean = cmk / cm2_scaled.sqrt().powi(k);
         let out_var = (cm2k - cmk * cmk) / cm2_scaled.powi(k);
+        if ![cm2_scaled, cmk, cm2k, mean, out_var]
+            .into_iter()
+            .all(f64::is_finite)
+        {
+            return (f64::NAN, f64::NAN);
+        }
         (mean, out_var)
+    }
+}
+
+#[inline]
+fn normal(value: f64) -> bool {
+    value.is_finite() && value.abs() >= f64::MIN_POSITIVE
+}
+
+#[inline]
+fn scale_exponent(cm2: f64) -> i32 {
+    if (2.0f64.powi(-60)..=2.0f64.powi(60)).contains(&cm2) {
+        0
+    } else if cm2 > 0.0 && cm2.is_finite() {
+        (cm2.log2().floor() as i32).div_euclid(2)
+    } else {
+        0
     }
 }
 
@@ -180,7 +234,7 @@ mod tests {
     #[test]
     fn every_order_matches_direct_preprocessing_and_is_antisymmetric() {
         let xa = [-3.0, -1.0, 0.0, 1.0, 3.0, 4.0];
-        let xb = [-2.0, -1.0, 0.0, 0.5, 1.0, 2.0, 3.0];
+        let xb = [-2.0, -1.0, 0.0, 0.5, 1.0, 2.0, 4.0];
         let moments = |x: &[f64]| {
             let mean = x.iter().sum::<f64>() / x.len() as f64;
             let sums = (2..=8)
@@ -236,7 +290,7 @@ mod tests {
     #[test]
     fn standardized_orders_are_invariant_to_power_of_two_scale() {
         let base_a = [0.0, 0.0, 0.0, 1.0];
-        let base_b = [0.0, 0.0, 1.0, 1.0];
+        let base_b = [0.0, 0.0, 1.0, 1.0, 1.0];
         let values = |samples: &[f64], e: i32| {
             let scale = 2.0f64.powi(e);
             let x: Vec<f64> = samples.iter().map(|v| v * scale).collect();
@@ -249,8 +303,8 @@ mod tests {
         let reference = |e| {
             let (ma, ca) = values(&base_a, e);
             let (mb, cb) = values(&base_b, e);
-            let a = sample(4, ma, 0.0, &ca);
-            let b = sample(4, mb, 0.0, &cb);
+            let a = sample(base_a.len() as u64, ma, 0.0, &ca);
+            let b = sample(base_b.len() as u64, mb, 0.0, &cb);
             (1..=4).map(|k| welch_t(k, &a, &b)).collect::<Vec<_>>()
         };
         let expected = reference(0);
@@ -261,6 +315,77 @@ mod tests {
                     (actual - want).abs() <= 1e-12 * want.abs().max(1.0),
                     "scale exponent {e}, order {}: {actual} vs {want}",
                     k + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normal_range_matches_frozen_18bc793_formula_bit_for_bit() {
+        fn frozen(order: usize, a: &ClassSample<'_>, b: &ClassSample<'_>) -> f64 {
+            let (diff, va, vb) = if order == 1 {
+                (
+                    (a.origin - b.origin) + (a.offset - b.offset),
+                    a.cs[0] / a.n as f64,
+                    b.cs[0] / b.n as f64,
+                )
+            } else {
+                let cm = |s: &ClassSample<'_>, p: usize| s.cs[p - 2] / s.n as f64;
+                let preprocess = |s: &ClassSample<'_>| {
+                    let cm2 = cm(s, 2);
+                    if order == 2 {
+                        (cm2, cm(s, 4) - cm2 * cm2)
+                    } else {
+                        let k = order as i32;
+                        (
+                            cm(s, order) / cm2.sqrt().powi(k),
+                            (cm(s, 2 * order) - cm(s, order).powi(2)) / cm2.powi(k),
+                        )
+                    }
+                };
+                let (ma, va) = preprocess(a);
+                let (mb, vb) = preprocess(b);
+                (ma - mb, va, vb)
+            };
+            let variance = va / a.n as f64 + vb / b.n as f64;
+            diff / variance.sqrt()
+        }
+
+        let mut seed = 0x9e37_79b9_u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as i32 % 2001) as f64 / 100.0
+        };
+        for _ in 0..128 {
+            let xa: Vec<f64> = (0..19).map(|_| next()).collect();
+            let xb: Vec<f64> = (0..23).map(|_| next()).collect();
+            let moments = |x: &[f64]| {
+                let mean = x.iter().sum::<f64>() / x.len() as f64;
+                let sums = (2..=8)
+                    .map(|p| x.iter().map(|v| (v - mean).powi(p)).sum::<f64>())
+                    .collect::<Vec<_>>();
+                (mean, sums)
+            };
+            let (ma, ca) = moments(&xa);
+            let (mb, cb) = moments(&xb);
+            let a = ClassSample {
+                n: xa.len() as u64,
+                origin: ma,
+                offset: 0.0,
+                cs: &ca,
+                cs_stride: 1,
+            };
+            let b = ClassSample {
+                n: xb.len() as u64,
+                origin: mb,
+                offset: 0.0,
+                cs: &cb,
+                cs_stride: 1,
+            };
+            for order in 1..=4 {
+                assert_eq!(
+                    welch_t(order, &a, &b).to_bits(),
+                    frozen(order, &a, &b).to_bits()
                 );
             }
         }
