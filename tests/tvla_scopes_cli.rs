@@ -312,3 +312,29 @@ fn the_legacy_sampling_works_with_channels_and_leaves_traces_npz_alone() {
     assert!(out.join("channels.tsv").exists());
     assert!(!batch.dir.path().join("traces.npz").exists());
 }
+
+#[test]
+fn selected_signals_outside_the_scope_go_to_an_extra_channel() {
+    let batch = write_leak_batch(&LeakSpec::default());
+    let out = batch.dir.path().join("out");
+    // The default selection includes `tb.clk`, which is not in `tb.dut`.
+    let output = tvla(
+        &batch.meta,
+        &out,
+        &["--plot=false", "--clock", "tb.clk", "--per-scope", "tb.dut"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let names = std::fs::read_to_string(out.join("channels.txt")).unwrap();
+    assert_eq!(names, "(outside tb.dut)\ntb.dut.a\ntb.dut.b\n");
+    let (_, rows) = tsv(&out);
+    assert_eq!(rows.len(), 3);
+    let outside = rows.iter().find(|r| r[1] == "(outside tb.dut)").unwrap();
+    assert_eq!(outside[2], "1");
+    let file = out.join("t_values_channels.npz");
+    assert_eq!(read_t(&file, "t_0").dim(), (2, 6));
+    let log = stderr(&output);
+    assert!(
+        log.contains("1 selected signals outside the scope"),
+        "{log}"
+    );
+}

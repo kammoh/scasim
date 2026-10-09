@@ -70,12 +70,13 @@ fn depth_one_gives_the_child_scopes_and_the_scope_itself() {
     assert_eq!(
         summary(&g),
         [
+            ("(outside tb.dut)".to_string(), 2),
             ("tb.dut".to_string(), 1),
             ("tb.dut.a".to_string(), 2),
             ("tb.dut.b".to_string(), 2)
         ]
     );
-    // clk and q have no path in tb.dut.
+    // clk and q have no path in tb.dut. They are in the channel `(outside tb.dut)`.
     assert_eq!(g.outside, 2);
 }
 
@@ -86,6 +87,7 @@ fn depth_two_splits_the_nested_scope() {
     assert_eq!(
         summary(&g),
         [
+            ("(outside tb.dut)".to_string(), 2),
             ("tb.dut".to_string(), 1),
             ("tb.dut.a".to_string(), 1),
             ("tb.dut.a.sub".to_string(), 1),
@@ -132,8 +134,8 @@ fn every_selected_handle_in_the_scope_is_in_exactly_one_channel() {
                 assert!(seen.insert(handle), "handle {handle} is in two channels");
             }
         }
-        // top_reg, x, y, s, and z.
-        assert_eq!(seen.len(), 5, "depth {depth}");
+        // top_reg, x, y, s, z, and the two signals outside the scope: clk and q.
+        assert_eq!(seen.len(), 7, "depth {depth}");
     }
 }
 
@@ -152,11 +154,21 @@ fn a_scope_without_selected_signals_makes_no_channel() {
         1,
     );
     let names: Vec<&str> = g.channels.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["(outside tb.dut)", "tb.dut", "tb.dut.a"],
+        "{names:?}"
+    );
+    // With nothing selected outside the scope, there is no outside channel.
+    let g = groups(&path, &["+scope:tb.dut", "-scope:tb.dut.b"], "tb.dut", 1);
+    let names: Vec<&str> = g.channels.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["tb.dut", "tb.dut.a"], "{names:?}");
-    // A scope that does not exist, or has no selected signal at all, gives no channel.
-    assert!(groups(&path, &[], "tb.nope", 1).channels.is_empty());
+    // A scope that does not exist holds nothing: every selected signal is outside it.
+    let g = groups(&path, &[], "tb.nope", 1);
+    assert_eq!(summary(&g), [("(outside tb.nope)".to_string(), 7)]);
+    // Nothing selected, no channel at all.
     assert!(
-        groups(&path, &["+scope:tb.other"], "tb.dut", 1)
+        groups(&path, &["+scope:tb.nothing"], "tb.dut", 1)
             .channels
             .is_empty()
     );
@@ -167,11 +179,13 @@ fn the_channel_traces_add_up_to_the_trace_of_the_whole_selection_bit_for_bit() {
     let fx = fixture();
     let (_dir, path) = paths(&fx);
     let index = hierarchy_index(&path).unwrap();
-    let base = Selection::parse(&["+scope:tb.dut"]).unwrap();
+    // The default selection includes `tb.clk` and `tb.other.q`, outside `tb.dut`.
+    let base = Selection::all();
     let selected = base.resolve(&index).unwrap().selected;
     let g = group_by_scope(&index, &selected, "tb.dut", 1);
     let plan = scope_plan(base, &g);
     assert_eq!(plan.channels.len(), 1 + g.channels.len());
+    assert!(plan.channels.iter().any(|c| c.name == "(outside tb.dut)"));
     assert_eq!(plan.channels[0].name, "total");
     let meta = BatchMeta {
         trace_path: path.clone(),

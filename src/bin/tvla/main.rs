@@ -172,7 +172,8 @@ struct Args {
     /// levels below SCOPE and holds selected signals, and one channel named SCOPE for the
     /// signals directly in SCOPE. A signal in a deeper scope belongs to its ancestor at that
     /// depth. A signal with several names (aliases) belongs to the channel of its name with
-    /// the deepest scope in SCOPE (the smallest name if several are equally deep). The
+    /// the deepest scope in SCOPE (the smallest name if several are equally deep). A selected
+    /// signal with no name in SCOPE goes to the channel `(outside SCOPE)`. The
     /// selection rules apply first. The usual outputs stay for the whole selection. Also
     /// writes `channels.tsv` (the ranking by max |t|), `channels.txt`, `t_values_channels.npz`,
     /// and with --chi2 `chi2_channels.npz`. Plots only the best channel, into `top_channel/`.
@@ -428,7 +429,9 @@ fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Res
                 .wrap_err("cannot apply the selection rules")?
                 .selected;
             let groups = group_by_scope(&index, &selected, scope, *depth);
-            if groups.channels.is_empty() {
+            let handles: usize = groups.channels.iter().map(|c| c.paths.len()).sum();
+            // Only signals outside the scope: the scope name is probably wrong.
+            if handles == groups.outside {
                 return Err(miette!(
                     "{}: no selected signal is in the scope {scope}, so --per-scope makes no \
                      channel",
@@ -440,8 +443,8 @@ fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Res
             handle_counts = groups.channels.iter().map(|c| c.paths.len()).collect();
             info!(
                 "{}: {} channels below {scope} (depth {depth}); {} signals with several names \
-                 (aliases) are in the channel of their deepest name; {} selected signals are \
-                 not in the scope",
+                 (aliases) are in the channel of their deepest name; {} selected signals outside the \
+                 scope are in the channel (outside {scope})",
                 trace_file_path.display(),
                 groups.channels.len(),
                 groups.aliased,

@@ -22,7 +22,8 @@ pub struct ScopeGroups {
     pub channels: Vec<ScopeChannel>,
     /// The number of selected signals with more than one path in the scope (aliases).
     pub aliased: usize,
-    /// The number of selected signals that have no path in the scope. They are in no channel.
+    /// The number of selected signals that have no path in the scope. They are in the channel
+    /// `(outside SCOPE)`.
     pub outside: usize,
 }
 
@@ -35,8 +36,10 @@ pub struct ScopeGroups {
 ///
 /// A signal can have several paths (aliases). It belongs to exactly one channel: the channel of
 /// its path with the deepest scope that lies in `scope`. If several paths have equally deep
-/// scopes, the smallest path (by text) decides. A signal without a path in `scope` is in no
-/// channel. A scope without selected signals gives no channel.
+/// scopes, the smallest path (by text) decides. A scope without selected signals gives no channel.
+///
+/// A selected signal with no path in `scope` goes to one more channel, named
+/// `(outside SCOPE)`, with its smallest path. So the channels always partition the selection.
 ///
 /// `selected` has one flag for each handle of `index`.
 pub fn group_by_scope(
@@ -59,6 +62,15 @@ pub fn group_by_scope(
             .min_by_key(|(_, p)| (std::cmp::Reverse(p.scope_names.len()), &p.path))
         else {
             groups.outside += 1;
+            let smallest = paths
+                .iter()
+                .map(|p| &p.path)
+                .min()
+                .expect("a selected signal has a path");
+            by_name
+                .entry(format!("(outside {scope})"))
+                .or_default()
+                .push(smallest.clone());
             continue;
         };
         if inside.len() > 1 {

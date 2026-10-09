@@ -101,7 +101,7 @@ cargo run --release --bin tvla -- --meta-list path_to_meta_list \
 
 `tvla` makes one channel for each scope exactly `--depth` levels below the scope (default 1) that holds selected signals. A signal in a deeper scope belongs to its ancestor at that depth. A channel with the name of the scope itself holds the signals directly in it. The selection rules apply first. All channels use the same sampling and the same segments, and `tvla` reads the waveform once.
 
-A signal with several names (aliases) belongs to one channel only: the channel of its name with the deepest scope in the given scope. If several names are equally deep, the smallest name decides. `tvla` reports the number of such signals. A selected signal with no name in the scope is in no channel.
+A signal with several names (aliases) belongs to one channel only: the channel of its name with the deepest scope in the given scope. If several names are equally deep, the smallest name decides. `tvla` reports the number of such signals. A selected signal with no name in the scope goes to one more channel, named `(outside SCOPE)`. So the channels always partition the selection, and their traces add up to the trace of the whole selection.
 
 The outputs for the whole selection do not change. In `--ttest-output-dir`, `--per-scope` adds:
 
