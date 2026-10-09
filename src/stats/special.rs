@@ -35,7 +35,7 @@
 //! * Wichura, "Algorithm AS 241: The percentage points of the normal distribution", Applied
 //!   Statistics 37 (1988): `normal_isf`.
 
-use std::f64::consts::{LN_10, PI};
+use std::f64::consts::{EULER_GAMMA, LN_10, PI};
 
 /// `ln(sqrt(2 pi))`.
 const LN_SQRT_2PI: f64 = 0.918_938_533_204_672_8;
@@ -54,9 +54,6 @@ const ITER_LIMIT: usize = 30_000_000;
 
 /// Shapes below this value use the direct form of the upper tail (see `ln_q_small_shape`).
 const SMALL_SHAPE: f64 = 0.5;
-
-/// The Euler-Mascheroni constant.
-const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
 
 /// Riemann zeta function `zeta(k)` for `k = 2..=64` (generated with mpmath).
 const ZETA: [f64; 63] = [
@@ -604,7 +601,7 @@ mod tests {
         assert_relative_eq!(v, -0.693_152_919_809_646_5, max_relative = 1e-9);
         // mpmath: ln Q(1e12, 1e12).
         let v = ln_gamma_q(1e12, 1e12);
-        assert_relative_eq!(v, -0.693_147_446_521_500_9, max_relative = 1e-9);
+        assert_relative_eq!(v, -0.693_147_446_521_501, max_relative = 1e-9);
         assert_relative_eq!(
             ln_gamma_q(1e7, 1e7),
             -0.693_231_288_514_367_5,
