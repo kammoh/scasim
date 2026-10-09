@@ -25,16 +25,16 @@ pub fn read_batch_meta(meta_path: &Path) -> miette::Result<BatchMeta> {
         .into_diagnostic()
         .wrap_err_with(|| format!("cannot open {}", meta_path.display()))?;
     let mut text = Vec::new();
-    if meta_path.extension().is_some_and(|e| e == "gz") {
-        flate2::read::GzDecoder::new(file)
-            .read_to_end(&mut text)
-            .into_diagnostic()?;
+    let read = if meta_path.extension().is_some_and(|e| e == "gz") {
+        flate2::read::GzDecoder::new(file).read_to_end(&mut text)
     } else {
-        std::io::BufReader::new(file)
-            .read_to_end(&mut text)
-            .into_diagnostic()?;
-    }
-    let json: serde_json::Value = serde_json::from_slice(&text).into_diagnostic()?;
+        std::io::BufReader::new(file).read_to_end(&mut text)
+    };
+    read.into_diagnostic()
+        .wrap_err_with(|| format!("cannot read {}", meta_path.display()))?;
+    let json: serde_json::Value = serde_json::from_slice(&text)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("{} is not valid JSON", meta_path.display()))?;
     let trace_filename = json
         .get("trace_filename")
         .and_then(|v| v.as_str())
@@ -232,6 +232,20 @@ mod tests {
             assert_eq!(meta.trace_path, dir.path().join("tvla.fst"));
             assert_eq!(meta.clock_period, Some(10));
             assert_eq!(meta.markers, vec![(3710, 7420, 0), (7420, 11130, 1)]);
+        }
+    }
+
+    #[test]
+    fn read_batch_meta_errors_name_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_gzip = dir.path().join("bad.json.gz");
+        std::fs::write(&bad_gzip, b"this is not gzip").unwrap();
+        let bad_json = dir.path().join("bad.json");
+        std::fs::write(&bad_json, b"{ not json").unwrap();
+        for path in [bad_gzip, bad_json] {
+            let error = read_batch_meta(&path).unwrap_err();
+            let shown = error.to_string();
+            assert!(shown.contains(&path.display().to_string()), "{shown}");
         }
     }
 
