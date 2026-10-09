@@ -78,5 +78,6 @@ The runner sets them. The arguments of `Tvla` override them.
 
 The metadata is written synchronously (never with `await`), in a `finally` block or in
 `with tvla:`. It is `committed` if the test passed, else `diagnostic`. An open segment is
-never listed. Do not `await` in your own `finally` blocks: cocotb raises a second error when the
+never listed. If the loop ends early (`break`), the file is a `diagnostic` with
+`extensions.diagnostic.reason` = "schedule not completed: k of n segments"; a shortened run is never committed. Do not `await` in your own `finally` blocks: cocotb raises a second error when the
 test times out.

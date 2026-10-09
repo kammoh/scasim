@@ -340,3 +340,41 @@ def test_bad_arguments(tmp_path, clock):
         session.Tvla(None, {0: 1, 1: 1}, schedule="x", out=tmp_path)
     with pytest.raises(ValueError):
         session.Tvla(None, {0: 1, 70000: 1}, out=tmp_path)
+
+
+def test_break_inside_context_is_a_diagnostic(tmp_path, clock):
+    tvla = session.Tvla(None, {0: 1, 1: 2}, warmup=1, seed=1, batch="b", out=tmp_path)
+
+    async def main():
+        with tvla:
+            async for seg in tvla.segments(5):
+                clock.t += 10
+                if seg.id == 3:
+                    break  # the run is shortened: 2 of 5 scheduled segments were closed
+
+    run(main())
+    meta = read_meta(tmp_path / "meta.json")
+    assert meta["batch"]["status"] == "diagnostic"
+    assert [s["id"] for s in meta["segments"]] == [1, 2]
+    assert meta["extensions"]["diagnostic"]["reason"] == "schedule not completed: 2 of 5 segments"
+
+
+def test_context_without_running_the_schedule_is_a_diagnostic(tmp_path, clock):
+    tvla = session.Tvla(None, {0: 1, 1: 2}, warmup=0, seed=1, batch="b", out=tmp_path)
+    with tvla:
+        pass
+    meta = read_meta(tmp_path / "meta.json")
+    assert meta["batch"]["status"] == "diagnostic"
+    assert meta["extensions"]["diagnostic"]["reason"] == "schedule not completed: 0 of 0 segments"
+
+
+def test_full_run_has_no_diagnostic_reason(tmp_path, clock):
+    tvla = session.Tvla(None, {0: 1, 1: 2}, warmup=0, seed=1, batch="b", out=tmp_path)
+
+    async def main():
+        with tvla:
+            async for seg in tvla.segments(3):
+                clock.t += 10
+
+    run(main())
+    assert "diagnostic" not in read_meta(tmp_path / "meta.json")["extensions"]

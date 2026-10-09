@@ -142,6 +142,11 @@ class MetaWriter:
         self._check_open()
         self._design_random = dict(record)
 
+    def set_extension(self, key: str, value: Any) -> None:
+        """Set one key of `extensions`."""
+        self._check_open()
+        self._extensions[key] = value
+
     # -- writing --------------------------------------------------------------------------
 
     def commit(self) -> None:

@@ -242,6 +242,9 @@ class Tvla:
         self._managed = False
         self._started = False
         self._finished = False
+        self._completed = False  # the whole schedule ran and every segment closed
+        self._num_tests = 0
+        self._recorded = 0
 
     # -- streams --------------------------------------------------------------------------
 
@@ -262,14 +265,18 @@ class Tvla:
 
     # -- finishing ------------------------------------------------------------------------
 
-    def finish(self, passed: bool) -> None:
+    def finish(self, passed: bool, reason: str | None = None) -> None:
         """Write the metadata: committed if `passed`, else diagnostic. Synchronous, runs once.
+
+        `reason` is stored as `extensions["diagnostic"]["reason"]` in a diagnostic file.
 
         It never awaits, so it is safe in a `finally` block, also when the test times out.
         """
         if self._finished:
             return
         self._finished = True
+        if not passed and reason is not None:
+            self._writer.set_extension("diagnostic", {"reason": reason})
         if passed:
             try:
                 self._writer.commit()
@@ -284,7 +291,11 @@ class Tvla:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
-        self.finish(exc_type is None)
+        if exc_type is None and not self._completed:
+            # A `break` (or no loop at all) shortened the run. Never commit that.
+            self.finish(False, f"schedule not completed: {self._recorded} of {self._num_tests} segments")
+        else:
+            self.finish(exc_type is None)
         return False
 
     # -- the schedule ---------------------------------------------------------------------
@@ -306,6 +317,7 @@ class Tvla:
         if self._started:
             raise RuntimeError("segments() can be used once per session")
         self._started = True
+        self._num_tests = num_tests
         completed = False
         try:
             await self._apply_design_random()
@@ -326,9 +338,13 @@ class Tvla:
                 yield seg
                 self._close(seg, record=True)
             completed = True
+            self._completed = True
         finally:
             if not self._managed:
-                self.finish(completed)
+                reason = None if completed else (
+                    f"schedule not completed: {self._recorded} of {self._num_tests} segments"
+                )
+                self.finish(completed, reason)
 
     def _close(self, seg: Segment, record: bool) -> None:
         end = seg._end if seg._end is not None else _now()
@@ -339,6 +355,7 @@ class Tvla:
             )
         if record:
             self._writer.segment(seg.start, end, seg.label, seg.group)
+            self._recorded += 1
 
     async def _apply_design_random(self) -> None:
         if self._design_mode is None:
