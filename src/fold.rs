@@ -1,6 +1,7 @@
 //! The analysis state that the `tvla` and `plot` binaries share: the fold of batches into a
 //! histogram accumulator, the max-|t| curve, and the `t_values.npz` file.
 
+use crate::batch::LengthPolicy;
 use crate::stats::threshold::CONVENTIONAL;
 use crate::stats::{Binning, HistAccumulator, TestOptions, TestResult};
 use log::{error, warn};
@@ -53,6 +54,9 @@ pub fn chi2_results(hist: &HistAccumulator) -> miette::Result<Vec<TestResult>> {
 pub struct Fold {
     pub order: usize,
     pub chi2: bool,
+    /// What to do with a batch whose traces have another length than those of the first batch.
+    /// See [`LengthPolicy`].
+    pub policy: LengthPolicy,
     pub hist: Option<HistAccumulator>,
     /// The number of samples per trace, set by the first batch.
     pub samples: usize,
@@ -71,6 +75,7 @@ impl Fold {
         Fold {
             order,
             chi2,
+            policy: LengthPolicy::Pad,
             hist: None,
             samples: 0,
             max_t: vec![vec![0.0]; order],
@@ -110,26 +115,48 @@ impl Fold {
         let traces = if self.samples == cur_samples_per_trace {
             traces
         } else {
-            error!(
-                "Inconsistent number of samples per trace: expected {}, found {}",
-                self.samples, cur_samples_per_trace
-            );
-            if cur_samples_per_trace > self.samples {
-                warn!(
-                    "Using the first {} samples of the longer trace",
-                    self.samples
-                );
-                traces.slice(s![.., ..self.samples]).to_owned()
-            } else {
-                warn!(
-                    "padding the traces with {cur_samples_per_trace} samples with zeros up to {}",
-                    self.samples
-                );
-                let mut t = Array2::<f32>::zeros((num_traces, self.samples));
-                for (i, row) in traces.outer_iter().enumerate() {
-                    t.slice_mut(s![i, ..row.len()]).assign(&row);
+            match self.policy {
+                LengthPolicy::Error => {
+                    return Err(miette!(
+                        "the batch {} has {cur_samples_per_trace} samples per trace, but the first \
+                         batch has {}. Use --length-policy pad or truncate to accept this",
+                        metadata.display(),
+                        self.samples
+                    ));
                 }
-                t
+                LengthPolicy::Truncate if cur_samples_per_trace < self.samples => {
+                    return Err(miette!(
+                        "the batch {} has {cur_samples_per_trace} samples per trace, fewer than \
+                         the {} of the first batch. The policy truncate cannot make traces \
+                         longer. Use --length-policy pad to pad them with zeros",
+                        metadata.display(),
+                        self.samples
+                    ));
+                }
+                LengthPolicy::Truncate => traces.slice(s![.., ..self.samples]).to_owned(),
+                LengthPolicy::Pad => {
+                    error!(
+                        "Inconsistent number of samples per trace: expected {}, found {}",
+                        self.samples, cur_samples_per_trace
+                    );
+                    if cur_samples_per_trace > self.samples {
+                        warn!(
+                            "Using the first {} samples of the longer trace",
+                            self.samples
+                        );
+                        traces.slice(s![.., ..self.samples]).to_owned()
+                    } else {
+                        warn!(
+                            "padding the traces with {cur_samples_per_trace} samples with zeros up to {}",
+                            self.samples
+                        );
+                        let mut t = Array2::<f32>::zeros((num_traces, self.samples));
+                        for (i, row) in traces.outer_iter().enumerate() {
+                            t.slice_mut(s![i, ..row.len()]).assign(&row);
+                        }
+                        t
+                    }
+                }
             }
         };
         self.num_traces
@@ -225,6 +252,38 @@ pub fn write_t_values_npz(output_dir: &Path, t_values: &Array2<f64>) -> miette::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn loaded(samples: usize) -> Loaded {
+        Loaded {
+            metadata: PathBuf::from("m.json"),
+            source: PathBuf::from("w.fst"),
+            traces: Array2::from_shape_fn((4, samples), |(i, j)| (i * 3 + j) as f32),
+            labels: Array1::from_vec(vec![0, 1, 0, 1]),
+        }
+    }
+
+    #[test]
+    fn the_length_policy_applies_to_a_batch_of_another_length() {
+        for (policy, longer, shorter) in [
+            (LengthPolicy::Pad, true, true),
+            (LengthPolicy::Truncate, true, false),
+            (LengthPolicy::Error, false, false),
+        ] {
+            let mut fold = Fold::new(1, false);
+            fold.policy = policy;
+            fold.add(loaded(3)).unwrap();
+            assert_eq!(fold.add(loaded(5)).is_ok(), longer, "{policy:?} longer");
+            assert_eq!(fold.add(loaded(2)).is_ok(), shorter, "{policy:?} shorter");
+            assert_eq!(fold.samples, 3);
+            assert!(fold.add(loaded(3)).is_ok(), "{policy:?} same");
+        }
+        let mut fold = Fold::new(1, false);
+        fold.policy = LengthPolicy::Error;
+        fold.add(loaded(3)).unwrap();
+        let message = fold.add(loaded(5)).unwrap_err().to_string();
+        assert!(message.contains("5 samples per trace"), "{message}");
+        assert!(message.contains("first batch has 3"), "{message}");
+    }
 
     #[test]
     fn max_abs_finite_skips_values_that_are_not_finite() {

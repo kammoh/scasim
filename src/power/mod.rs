@@ -7,7 +7,9 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::Path;
 
+pub mod edges;
 pub mod fst;
+pub mod probe;
 pub mod reference;
 mod slots;
 pub mod stats;
@@ -32,6 +34,8 @@ pub enum PowerError {
     TimeTable { previous: u64, next: u64 },
     #[error("invalid bins: {0}")]
     Bins(String),
+    #[error("probe `{path}`: {reason}")]
+    Probe { path: String, reason: String },
     #[error(
         "{what} would need about {needed} bytes, more than the limit of {limit} bytes; \
          select fewer signals or channels, or raise the limit"

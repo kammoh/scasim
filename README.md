@@ -68,3 +68,24 @@ If the selected signals lie in more than one top-level scope, `tvla` prints a no
 `tvla` stores the power traces of a batch in `traces.npz` next to the metadata file. These traces are for the selection of all selectable signals. When you give rules, `tvla` neither reads nor writes `traces.npz`. `tvla` reuses `traces.npz` only if it is newer than the waveform and newer than the metadata file, or if the waveform no longer exists. It stops with an error if the file is damaged, for example if its trace indices are not `0..n`. Delete the file or use `--use-existing=false` then.
 
 If the metadata has a `clock_period`, `tvla` keeps only the time points that are multiples of it. The activity between these time points is dropped. `tvla` warns if this sampling keeps less than half of the toggles of the selected signals.
+
+## Sampling on clock edges
+
+By default, `tvla` uses the `clock_period` of the metadata. It keeps only the time points that are multiples of the period (see above). Activity between these points is lost. To count all activity, sample on the edges of the clock signal in the waveform:
+
+```bash
+cargo run --release --bin tvla -- --meta-list path_to_meta_list \
+    --include scope:TOP.dut --clock TOP.dut.clk
+```
+
+- `--clock PATH` is the exact path of a 1-bit clock signal (see `--list-signals`). One sample is the number of toggles of the selected signals from one clock edge to the next. The `clock_period` of the metadata is not used. A segment of the metadata covers the samples whose clock edge lies in it. The clock signal stays in the selection. To leave it out, add `--exclude signal:PATH`.
+- `--edges rising|falling|both` chooses the edges (default `rising`). A change to or from `x` or `z` is not an edge. The first value of the clock is not an edge.
+- `--offset N` adds `N` ticks to every edge (default 0). A negative offset is allowed if no edge goes below time 0.
+- `--length-policy pad|truncate|error` decides what happens when traces have different lengths. The default is `pad` without `--clock`, and `error` with `--clock`.
+  - `pad`: inside a batch, pad shorter traces with zeros. Between batches, pad a shorter batch with zeros and cut a longer batch to the length of the first batch.
+  - `truncate`: inside a batch, cut all traces to the shortest trace. Between batches, cut a longer batch to the length of the first batch. A shorter batch is an error.
+  - `error`: any difference is an error. The message gives the histogram of the trace lengths for each class.
+
+With `--clock` or with a policy other than `pad`, `traces.npz` is neither read nor written.
+
+`tvla` logs the number of clock edges, the statistics of the clock periods, and where the toggles are: inside the bins, before the first edge, and after the last edge. The three counts add up to all toggles of the selection. It warns if the segments start at different places in the clock period.

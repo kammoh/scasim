@@ -1,4 +1,4 @@
-use clap::{ArgGroup, ArgMatches, CommandFactory, FromArgMatches, Parser};
+use clap::{ArgGroup, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use itertools::Itertools;
 use log::*;
 use miette::{IntoDiagnostic, WrapErr, miette};
@@ -6,12 +6,14 @@ use ndarray::{Array1, Array2};
 use ndarray_npz::NpzWriter;
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use scasim::batch::{
-    BatchDiagnostics, batch_traces, read_batch_meta, read_trace_cache, write_trace_cache,
+    BatchDiagnostics, EdgeReport, EdgeSampling, LengthPolicy, Sampling, compute_batch,
+    read_batch_meta, read_trace_cache, write_trace_cache,
 };
 use scasim::fold::{Fold, Loaded, create_output_dir, read_path_list, write_t_values_npz};
 use scasim::hierarchy::{HierarchyIndex, Selection};
 use scasim::plot::*;
-use scasim::power::hierarchy_index;
+use scasim::power::edges::EdgeKind;
+use scasim::power::{PowerPlan, hierarchy_index};
 use scasim::stats::threshold::{CONVENTIONAL, bonferroni, family_size, t_bonferroni};
 use scasim::stats::{HistAccumulator, TestResult};
 use std::fs::File;
@@ -24,6 +26,42 @@ const ALPHA: f64 = 1e-5;
 
 /// The conventional TVLA threshold on |t|.
 const T_THRESHOLD: f64 = 4.5;
+
+/// Which clock edges open a bin (`--edges`).
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EdgesArg {
+    Rising,
+    Falling,
+    Both,
+}
+
+impl From<EdgesArg> for EdgeKind {
+    fn from(value: EdgesArg) -> Self {
+        match value {
+            EdgesArg::Rising => EdgeKind::Rising,
+            EdgesArg::Falling => EdgeKind::Falling,
+            EdgesArg::Both => EdgeKind::Both,
+        }
+    }
+}
+
+/// What to do when traces have different lengths (`--length-policy`).
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LengthPolicyArg {
+    Pad,
+    Truncate,
+    Error,
+}
+
+impl From<LengthPolicyArg> for LengthPolicy {
+    fn from(value: LengthPolicyArg) -> Self {
+        match value {
+            LengthPolicyArg::Pad => LengthPolicy::Pad,
+            LengthPolicyArg::Truncate => LengthPolicy::Truncate,
+            LengthPolicyArg::Error => LengthPolicy::Error,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "scasim-tvla")]
@@ -104,6 +142,33 @@ struct Args {
     /// select it, then exit.
     #[arg(long = "list-signals")]
     list_signals: bool,
+    /// Sample on the edges of this clock signal (the exact path of a 1-bit signal, see
+    /// --list-signals). One sample is the number of toggles of the selected signals between two
+    /// edges. The `clock_period` of the metadata is not used. The clock signal stays in the
+    /// selection unless you exclude it with `--exclude signal:PATH`. With --clock, `traces.npz`
+    /// files are neither read nor written. Without --clock, `tvla` keeps the time points at
+    /// multiples of the `clock_period` of the metadata.
+    #[arg(long, value_name = "PATH")]
+    clock: Option<String>,
+    /// Which edges of the --clock open a sample. A change to or from `x` or `z` is not an edge.
+    #[arg(long, value_enum, default_value_t = EdgesArg::Rising, requires = "clock")]
+    edges: EdgesArg,
+    /// Ticks (time units of the waveform) added to every edge of the --clock. Use it to move the
+    /// samples, for example to a phase of the clock period. The shifted time must not be below 0.
+    #[arg(
+        long,
+        default_value_t = 0,
+        allow_hyphen_values = true,
+        requires = "clock"
+    )]
+    offset: i64,
+    /// What to do when the traces have different lengths. `pad`: pad shorter traces with zeros.
+    /// A later batch is padded or cut to the length of the first batch. `truncate`: cut traces to
+    /// the shortest trace of the batch, and a longer batch to the length of the first batch. A
+    /// shorter batch is an error. `error`: any difference is an error. Default: `pad` without
+    /// --clock, `error` with --clock. A policy other than `pad` turns `traces.npz` off.
+    #[arg(long = "length-policy", value_enum)]
+    length_policy: Option<LengthPolicyArg>,
     #[arg(
         long,
         value_name = "PLOTS_OUTPUT_DIR",
@@ -184,6 +249,40 @@ fn report_selection(batch: &str, d: &BatchDiagnostics) {
             d.kept_toggles, d.total_toggles
         );
     }
+    if let Some(e) = &d.edges {
+        info!(
+            "{batch}: {} clock edges; periods: min {}, max {}, mean {:.2}; first edge at {}; \
+             toggles: {} inside the bins, {} before the first edge, {} after the last edge \
+             ({:.2}% outside)",
+            e.summary.edges,
+            e.summary.min_period,
+            e.summary.max_period,
+            e.summary.mean_period,
+            e.summary.first_edge,
+            e.inside,
+            e.before,
+            e.after,
+            100.0 * e.outside_fraction()
+        );
+        if e.offset_varies() {
+            warn!(
+                "{batch}: the segments start at different places in the clock period. The \
+                 distance from a segment start to its first bin is between {} and {} ticks. \
+                 Samples of different traces are then at different places in the period",
+                e.offset_min, e.offset_max
+            );
+        }
+    }
+}
+
+/// How `tvla` turns a batch into traces.
+struct BatchSettings<'a> {
+    selection: &'a Selection,
+    sampling: Sampling,
+    policy: LengthPolicy,
+    use_existing: bool,
+    /// False if `traces.npz` must be neither read nor written.
+    cache_allowed: bool,
 }
 
 /// True if `cache` can replace the computation for the batch. The cache must be newer than the
@@ -206,12 +305,11 @@ fn cache_is_fresh(cache: &Path, waveform: &Path, metadata: &Path) -> bool {
 }
 
 /// Reads the traces and labels of one batch from the cache or computes them from the waveform.
+/// Also returns the edge report of the batch, if it was computed in edges mode.
 fn batch_data(
     metadata_path: &Path,
-    use_existing: bool,
-    cache_allowed: bool,
-    selection: &Selection,
-) -> miette::Result<Loaded> {
+    settings: &BatchSettings<'_>,
+) -> miette::Result<(Loaded, Option<EdgeReport>)> {
     if !metadata_path.exists() {
         return Err(miette!(
             "the metadata file {} does not exist",
@@ -229,8 +327,8 @@ fn batch_data(
         labels,
     };
 
-    if use_existing
-        && cache_allowed
+    if settings.use_existing
+        && settings.cache_allowed
         && npz_path.exists()
         && cache_is_fresh(&npz_path, &trace_file_path, metadata_path)
     {
@@ -239,7 +337,7 @@ fn batch_data(
             npz_path.display()
         );
         let data = read_trace_cache(&npz_path)?;
-        return Ok(loaded(npz_path, data));
+        return Ok((loaded(npz_path, data), None));
     }
 
     println!(
@@ -247,7 +345,15 @@ fn batch_data(
         trace_file_path.display()
     );
     let start_time = std::time::Instant::now();
-    let (traces_array, labels_array, diagnostics) = batch_traces(&meta, selection)?;
+    let plan = PowerPlan::toggles(settings.selection.clone());
+    let output = compute_batch(&meta, &plan, &settings.sampling, settings.policy)?;
+    let diagnostics = output.diagnostics;
+    let labels_array = output.labels;
+    let traces_array = output
+        .channels
+        .into_iter()
+        .next()
+        .expect("the plan has one channel");
     let (num_traces, cur_samples_per_trace) = traces_array.dim();
     println!(
         "Computed {num_traces} traces with up to {cur_samples_per_trace} samples in {:.2}s",
@@ -264,7 +370,7 @@ fn batch_data(
     );
     report_selection(&trace_file_path.display().to_string(), &diagnostics);
 
-    if cache_allowed {
+    if settings.cache_allowed {
         println!("Saving traces and labels to NPZ file...");
         let start_time = std::time::Instant::now();
         write_trace_cache(&npz_path, &traces_array, &labels_array)?;
@@ -274,7 +380,10 @@ fn batch_data(
             start_time.elapsed().as_secs_f32()
         );
     }
-    Ok(loaded(trace_file_path, (traces_array, labels_array)))
+    Ok((
+        loaded(trace_file_path, (traces_array, labels_array)),
+        diagnostics.edges,
+    ))
 }
 
 fn main() -> miette::Result<()> {
@@ -315,12 +424,45 @@ fn main() -> miette::Result<()> {
         .into_diagnostic()
         .wrap_err("the order is too large")?;
 
+    let sampling = match &args.clock {
+        Some(clock) => Sampling::Edges(EdgeSampling {
+            clock: clock.clone(),
+            kind: args.edges.into(),
+            offset: args.offset,
+        }),
+        None => Sampling::Legacy,
+    };
+    let policy = args
+        .length_policy
+        .map(LengthPolicy::from)
+        .unwrap_or(match sampling {
+            Sampling::Legacy => LengthPolicy::Pad,
+            Sampling::Edges(_) => LengthPolicy::Error,
+        });
     let mut fold = Fold::new(order, args.chi2);
+    fold.policy = policy;
 
-    // `traces.npz` holds the traces of the default selection (all signals). A run with rules
-    // computes other traces. It must not reuse the file, and it must not overwrite it, because
-    // a later run without rules would then read the traces of this selection.
-    let cache_allowed = rules.is_empty();
+    // `traces.npz` holds the traces of the default selection (all signals), sampled at the
+    // multiples of the clock period of the metadata, and padded to the longest trace. A run with
+    // rules, with --clock, or with a policy other than `pad` computes other traces. It must not
+    // reuse the file, and it must not overwrite it, because a later run without these options
+    // would then read these traces.
+    let cache_allowed = rules.is_empty() && args.clock.is_none() && policy == LengthPolicy::Pad;
+    let settings = BatchSettings {
+        selection: &selection,
+        sampling,
+        policy,
+        use_existing: args.use_existing,
+        cache_allowed,
+    };
+    if let Some(clock) = &args.clock {
+        info!(
+            "Sampling on the {:?} edges of {clock}. The clock signal is part of the selection \
+             unless you exclude it with --exclude signal:{clock}",
+            EdgeKind::from(args.edges)
+        );
+    }
+    let mut edge_totals = summary::EdgeTotals::default();
 
     if let Some(n) = args.num_threads {
         rayon::ThreadPoolBuilder::new()
@@ -337,13 +479,14 @@ fn main() -> miette::Result<()> {
     // order of the meta list, then drop it. At most one window of traces is in memory. The
     // histograms hold exact counts, so the result does not depend on the window size.
     for window in filenames.chunks(threads) {
-        let loaded: Vec<Loaded> = window
+        let loaded: Vec<(Loaded, Option<EdgeReport>)> = window
             .par_iter()
-            .map(|metadata_path| {
-                batch_data(metadata_path, args.use_existing, cache_allowed, &selection)
-            })
+            .map(|metadata_path| batch_data(metadata_path, &settings))
             .collect::<miette::Result<_>>()?;
-        for batch in loaded {
+        for (batch, edges) in loaded {
+            if let Some(edges) = &edges {
+                edge_totals.add(edges);
+            }
             fold.add(batch)?;
         }
     }
@@ -381,6 +524,7 @@ fn main() -> miette::Result<()> {
             family: t_family,
             chi2: chi2_report,
             memory_bytes,
+            edges: (edge_totals.batches > 0).then_some(edge_totals),
         })
     );
     if let Some(c) = &chi2_report

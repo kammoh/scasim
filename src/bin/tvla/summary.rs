@@ -2,6 +2,7 @@
 //! results. The functions here only compute and format. They do not log.
 
 use ndarray::ArrayView2;
+use scasim::batch::EdgeReport;
 use scasim::stats::TestResult;
 use scasim::stats::chi2::Summary2;
 
@@ -86,6 +87,38 @@ pub fn chi2_report(results: &[TestResult], thresholds: [f64; 2]) -> Chi2Report {
     }
 }
 
+/// How the toggles split at the clock edges, summed over all batches (edges mode).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EdgeTotals {
+    pub batches: usize,
+    /// The number of bins (clock periods) in all batches.
+    pub bins: usize,
+    pub inside: u64,
+    pub before: u64,
+    pub after: u64,
+}
+
+impl EdgeTotals {
+    /// Adds the report of one batch.
+    pub fn add(&mut self, e: &EdgeReport) {
+        self.batches += 1;
+        self.bins += e.summary.edges - 1;
+        self.inside += e.inside;
+        self.before += e.before;
+        self.after += e.after;
+    }
+
+    /// The fraction of the toggles outside all bins. 0 if there are no toggles.
+    pub fn outside_fraction(&self) -> f64 {
+        let total = self.inside + self.before + self.after;
+        if total == 0 {
+            0.0
+        } else {
+            (self.before + self.after) as f64 / total as f64
+        }
+    }
+}
+
 /// The inputs of the summary text.
 pub struct SummaryInput<'a> {
     pub t_values: ArrayView2<'a, f64>,
@@ -96,6 +129,8 @@ pub struct SummaryInput<'a> {
     pub family: u64,
     pub chi2: Option<Chi2Report>,
     pub memory_bytes: usize,
+    /// Present in edges mode.
+    pub edges: Option<EdgeTotals>,
 }
 
 fn mib(bytes: usize) -> f64 {
@@ -172,6 +207,19 @@ pub fn render(input: &SummaryInput<'_>) -> String {
             ));
         }
     }
+    if let Some(e) = &input.edges {
+        lines.push(format!(
+            "  clock edges: {} bins in {} batches; toggles: {} inside the bins + {} before the \
+             first edge + {} after the last edge = {} in total; {:.2}% outside",
+            e.bins,
+            e.batches,
+            e.inside,
+            e.before,
+            e.after,
+            e.inside + e.before + e.after,
+            100.0 * e.outside_fraction()
+        ));
+    }
     lines.push(format!(
         "  accumulator memory: {:.2} MiB",
         mib(input.memory_bytes)
@@ -222,6 +270,7 @@ mod tests {
             family: 4,
             chi2: None,
             memory_bytes: 3 << 20,
+            edges: None,
         });
         assert_eq!(text.matches("d=1: max |t| 1.000 at sample 0").count(), 1);
         assert_eq!(text.matches("d=2: max |t| 7.000 at sample 1").count(), 1);
@@ -266,9 +315,38 @@ mod tests {
             family: 1,
             chi2: Some(c),
             memory_bytes: 0,
+            edges: None,
         });
         assert!(text.contains("max -log10(p) 6.000 at sample 1 (dof 3, 2 bins merged)"));
         assert!(text.contains("1 p-values failed"));
+    }
+
+    #[test]
+    fn the_summary_reports_the_split_of_the_toggles_at_the_clock_edges() {
+        let t = array![[1.0]];
+        let edges = EdgeTotals {
+            batches: 2,
+            bins: 20,
+            inside: 90,
+            before: 6,
+            after: 4,
+        };
+        assert_eq!(edges.outside_fraction(), 0.1);
+        let text = render(&SummaryInput {
+            t_values: t.view(),
+            conventional: 4.5,
+            alpha: 1e-5,
+            bonferroni: 4.4,
+            family: 1,
+            chi2: None,
+            memory_bytes: 0,
+            edges: Some(edges),
+        });
+        assert!(
+            text.contains("20 bins in 2 batches; toggles: 90 inside the bins + 6 before"),
+            "{text}"
+        );
+        assert!(text.contains("= 100 in total; 10.00% outside"), "{text}");
     }
 
     #[test]

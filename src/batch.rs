@@ -1,10 +1,13 @@
 //! One simulation batch: legacy metadata, power trace, and traces cut at the markers.
 
 use crate::hierarchy::Selection;
-use crate::power::{PowerTrace, RunInfo, power_trace};
+use crate::power::edges::{EdgeKind, EdgeSummary, edge_bins, edge_times, summarize_edges};
+use crate::power::probe::probe_changes;
+use crate::power::{PowerPlan, PowerTrace, RunInfo, activity, activity_binned, power_trace};
 use miette::{Context, IntoDiagnostic, miette};
-use ndarray::{Array1, Array2, s};
+use ndarray::{Array1, Array2};
 use ndarray_npz::{NpzReader, NpzWriter};
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -225,19 +228,104 @@ fn marker_ranges(trace: &PowerTrace, markers: &[(u64, u64, u16)]) -> Vec<(usize,
         .collect()
 }
 
-/// Cuts one trace per marker. A marker covers the time points in `[start, end)`. Shorter traces
-/// are padded with zeros to the length of the longest trace.
-pub fn cut_traces(trace: &PowerTrace, markers: &[(u64, u64, u16)]) -> (Array2<f32>, Array1<u16>) {
-    let ranges = marker_ranges(trace, markers);
-    let max_len = ranges.iter().map(|(lo, hi, _)| hi - lo).max().unwrap_or(0);
-    let mut traces = Array2::<f32>::zeros((ranges.len(), max_len));
+/// What to do when the segments (traces) do not all have the same length.
+///
+/// The policy applies at two levels. Inside a batch, it decides how the segments become the rows
+/// of one array. Between batches, it decides how a batch fits the length of the first batch,
+/// which sets the number of samples of the accumulator.
+///
+/// - `Pad`: inside a batch, shorter traces are padded with zeros to the longest trace. Between
+///   batches, a shorter batch is padded with zeros and a longer batch is cut to the length of
+///   the first batch. This is the behavior of `tvla` before the policy existed.
+/// - `Truncate`: inside a batch, all traces are cut to the shortest trace. Between batches, a
+///   longer batch is cut to the length of the first batch. A shorter batch is an error, because
+///   the first batch fixed the length.
+/// - `Error`: any difference in length, inside a batch or between batches, is an error.
+///   Inside a batch, the message has the histogram of the lengths for each class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LengthPolicy {
+    #[default]
+    Pad,
+    Truncate,
+    Error,
+}
+
+/// The lengths of the segments, counted per class: `class -> length -> number of segments`.
+fn length_histogram(ranges: &[(usize, usize, u16)]) -> BTreeMap<u16, BTreeMap<usize, usize>> {
+    let mut histogram: BTreeMap<u16, BTreeMap<usize, usize>> = BTreeMap::new();
+    for &(low, high, label) in ranges {
+        *histogram
+            .entry(label)
+            .or_default()
+            .entry(high - low)
+            .or_default() += 1;
+    }
+    histogram
+}
+
+/// The histogram as one line: `class 0: 3 samples x 2; class 1: 2 samples x 1, 4 samples x 1`.
+fn describe_lengths(ranges: &[(usize, usize, u16)]) -> String {
+    length_histogram(ranges)
+        .iter()
+        .map(|(class, lengths)| {
+            let lengths = lengths
+                .iter()
+                .map(|(length, count)| format!("{length} samples x {count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("class {class}: {lengths}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Builds one row per range from `values`. The ranges are index ranges `[low, high)` with a
+/// label. The length policy decides what happens when the ranges differ in length.
+fn cut_ranges(
+    values: &[u64],
+    ranges: &[(usize, usize, u16)],
+    policy: LengthPolicy,
+) -> miette::Result<(Array2<f32>, Array1<u16>)> {
+    let lengths = || ranges.iter().map(|(lo, hi, _)| hi - lo);
+    let longest = lengths().max().unwrap_or(0);
+    let shortest = lengths().min().unwrap_or(0);
+    if policy == LengthPolicy::Error && longest != shortest {
+        return Err(miette!(
+            "the segments have different lengths ({}). Use --length-policy pad or truncate to \
+             accept this",
+            describe_lengths(ranges)
+        ));
+    }
+    let width = match policy {
+        LengthPolicy::Truncate => shortest,
+        LengthPolicy::Pad | LengthPolicy::Error => longest,
+    };
+    let mut traces = Array2::<f32>::zeros((ranges.len(), width));
     let mut labels = Array1::<u16>::zeros(ranges.len());
     for (i, &(lo, hi, label)) in ranges.iter().enumerate() {
         labels[i] = label;
-        let values: Array1<f32> = trace.power[lo..hi].iter().map(|&p| p as f32).collect();
-        traces.slice_mut(s![i, ..hi - lo]).assign(&values);
+        let hi = hi.min(lo + width);
+        for (cell, &value) in traces.row_mut(i).iter_mut().zip(&values[lo..hi]) {
+            *cell = value as f32;
+        }
     }
-    (traces, labels)
+    Ok((traces, labels))
+}
+
+/// Cuts one trace per marker. A marker covers the time points in `[start, end)`. The length
+/// policy decides what happens to traces of different lengths.
+pub fn cut_traces_with(
+    trace: &PowerTrace,
+    markers: &[(u64, u64, u16)],
+    policy: LengthPolicy,
+) -> miette::Result<(Array2<f32>, Array1<u16>)> {
+    cut_ranges(&trace.power, &marker_ranges(trace, markers), policy)
+}
+
+/// Cuts one trace per marker. A marker covers the time points in `[start, end)`. Shorter traces
+/// are padded with zeros to the length of the longest trace.
+pub fn cut_traces(trace: &PowerTrace, markers: &[(u64, u64, u16)]) -> (Array2<f32>, Array1<u16>) {
+    cut_traces_with(trace, markers, LengthPolicy::Pad).expect("padding cannot fail")
 }
 
 /// The toggles at the time points that at least one marker covers.
@@ -255,24 +343,65 @@ fn toggles_in_markers(trace: &PowerTrace, markers: &[(u64, u64, u16)]) -> u64 {
         .sum()
 }
 
+/// How the activity splits at the clock edges (edges mode), for the report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeReport {
+    /// The number of edges, and the statistics of the periods.
+    pub summary: EdgeSummary,
+    /// Toggles in all bins (between the first and the last edge).
+    pub inside: u64,
+    /// Toggles before the first edge.
+    pub before: u64,
+    /// Toggles at or after the last edge.
+    pub after: u64,
+    /// The smallest and the largest distance from a segment start to the start of its first bin.
+    pub offset_min: u64,
+    pub offset_max: u64,
+}
+
+impl EdgeReport {
+    /// All toggles. The activity in the bins plus the activity outside them.
+    pub fn total(&self) -> u64 {
+        self.inside + self.before + self.after
+    }
+
+    /// The fraction of the toggles that lie outside all bins. 0 if there are no toggles.
+    pub fn outside_fraction(&self) -> f64 {
+        match self.total() {
+            0 => 0.0,
+            total => (self.before + self.after) as f64 / total as f64,
+        }
+    }
+
+    /// True if the segments do not start at the same place in the clock period. Then the
+    /// samples of different traces are not at the same place in the period.
+    pub fn offset_varies(&self) -> bool {
+        self.offset_min != self.offset_max
+    }
+}
+
 /// Counts that show how much activity the legacy sampling and the markers leave out.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BatchDiagnostics {
     /// Toggles of the selected signals in the whole waveform.
     pub total_toggles: u64,
-    /// Toggles at the time points that the legacy sampling keeps.
+    /// Toggles at the time points that the legacy sampling keeps. In edges mode, the toggles in
+    /// the bins.
     pub kept_toggles: u64,
-    /// Toggles at kept time points that at least one marker covers.
+    /// Toggles at kept time points that at least one marker covers. In edges mode, the toggles
+    /// in the bins that at least one segment covers.
     pub segment_toggles: u64,
     /// What the selection matched.
     pub info: RunInfo,
+    /// The report of the edges mode. `None` in legacy mode.
+    pub edges: Option<EdgeReport>,
 }
 
 impl BatchDiagnostics {
     /// True if the legacy sampling drops more than half of the toggles. Then the traces probably
     /// miss most of the activity of the selected signals.
     pub fn sampling_drops_most(&self) -> bool {
-        self.kept_toggles.saturating_mul(2) < self.total_toggles
+        self.edges.is_none() && self.kept_toggles.saturating_mul(2) < self.total_toggles
     }
 
     /// True if the selected signals lie below more than one top-level scope. Then the selection
@@ -287,7 +416,8 @@ fn traces_from_power(
     trace: PowerTrace,
     meta: &BatchMeta,
     info: RunInfo,
-) -> (Array2<f32>, Array1<u16>, BatchDiagnostics) {
+    policy: LengthPolicy,
+) -> miette::Result<(Array2<f32>, Array1<u16>, BatchDiagnostics)> {
     let total_toggles = trace.total();
     let kept = match meta.clock_period {
         Some(period) => trace.keep_multiples_of(period),
@@ -298,12 +428,14 @@ fn traces_from_power(
         kept_toggles: kept.total(),
         segment_toggles: toggles_in_markers(&kept, &meta.markers),
         info,
+        edges: None,
     };
-    let (traces, labels) = cut_traces(&kept, &meta.markers);
-    (traces, labels, diagnostics)
+    let (traces, labels) = cut_traces_with(&kept, &meta.markers, policy)?;
+    Ok((traces, labels, diagnostics))
 }
 
-/// Computes the traces, labels, and diagnostics of one batch from the selected signals.
+/// Computes the traces, labels, and diagnostics of one batch from the selected signals, with the
+/// legacy sampling and zero padding.
 pub fn batch_traces(
     meta: &BatchMeta,
     selection: &Selection,
@@ -311,7 +443,157 @@ pub fn batch_traces(
     let (trace, info) = power_trace(&meta.trace_path, selection)
         .into_diagnostic()
         .wrap_err_with(|| format!("cannot compute power of {}", meta.trace_path.display()))?;
-    Ok(traces_from_power(trace, meta, info))
+    traces_from_power(trace, meta, info, LengthPolicy::Pad)
+}
+
+/// Sampling at the edges of a clock signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeSampling {
+    /// The exact path of the 1-bit clock signal.
+    pub clock: String,
+    pub kind: EdgeKind,
+    /// Ticks added to every edge time.
+    pub offset: i64,
+}
+
+/// How the activity becomes the samples of a trace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sampling {
+    /// Keep the time points at multiples of the `clock_period` of the metadata, and drop all
+    /// other activity. Without a `clock_period`, keep all time points.
+    Legacy,
+    /// One sample for each clock period: the toggles between two edges. The `clock_period` of
+    /// the metadata is not used.
+    Edges(EdgeSampling),
+}
+
+/// The traces of one batch: one array for each channel of the plan.
+#[derive(Debug, Clone)]
+pub struct BatchOutput {
+    /// `channels[c]` has one row for each segment and one column for each sample.
+    pub channels: Vec<Array2<f32>>,
+    pub labels: Array1<u16>,
+    /// The diagnostics of the first channel.
+    pub diagnostics: BatchDiagnostics,
+}
+
+/// Computes the traces of all channels of `plan` for one batch. All channels use the same
+/// sampling and the same segments.
+pub fn compute_batch(
+    meta: &BatchMeta,
+    plan: &PowerPlan,
+    sampling: &Sampling,
+    policy: LengthPolicy,
+) -> miette::Result<BatchOutput> {
+    let wrap = |e: crate::power::PowerError| {
+        Err::<(), _>(e)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("cannot compute power of {}", meta.trace_path.display()))
+            .unwrap_err()
+    };
+    match sampling {
+        Sampling::Legacy => {
+            let mut activity = activity(&meta.trace_path, plan).map_err(wrap)?;
+            let info = std::mem::take(&mut activity.info);
+            let times = activity.times;
+            let mut channels = Vec::new();
+            let mut first = None;
+            for (c, channel) in activity.channels.into_iter().enumerate() {
+                let trace = PowerTrace {
+                    times: times.clone(),
+                    power: channel.toggles,
+                };
+                if c == 0 {
+                    let (traces, labels, diagnostics) =
+                        traces_from_power(trace, meta, info.clone(), policy)?;
+                    channels.push(traces);
+                    first = Some((labels, diagnostics));
+                } else {
+                    let kept = match meta.clock_period {
+                        Some(period) => trace.keep_multiples_of(period),
+                        None => trace,
+                    };
+                    channels.push(cut_traces_with(&kept, &meta.markers, policy)?.0);
+                }
+            }
+            let (labels, diagnostics) = first.expect("a plan has a channel");
+            Ok(BatchOutput {
+                channels,
+                labels,
+                diagnostics,
+            })
+        }
+        Sampling::Edges(spec) => {
+            let probe = probe_changes(&meta.trace_path, &spec.clock).map_err(wrap)?;
+            let edges = edge_times(&probe, spec.kind, spec.offset).map_err(wrap)?;
+            let bins = edge_bins(&edges).map_err(wrap)?;
+            let mut result = activity_binned(&meta.trace_path, plan, &bins).map_err(wrap)?;
+            let starts = bins.starts();
+            let mut ranges = Vec::with_capacity(meta.markers.len());
+            let (mut offset_min, mut offset_max) = (u64::MAX, 0);
+            for (i, &(start, end, label)) in meta.markers.iter().enumerate() {
+                // A segment covers the bins whose start lies in `[start, end)`.
+                let low = starts.partition_point(|&s| s < start);
+                let high = starts.partition_point(|&s| s < end).max(low);
+                if low == high {
+                    return Err(miette!(
+                        "{}: segment {i} [{start}, {end}) has no clock edge in it (the clock \
+                         edges in use are in [{}, {}])",
+                        meta.trace_path.display(),
+                        edges[0],
+                        edges[edges.len() - 1]
+                    ));
+                }
+                let offset = starts[low] - start;
+                offset_min = offset_min.min(offset);
+                offset_max = offset_max.max(offset);
+                ranges.push((low, high, label));
+            }
+            if ranges.is_empty() {
+                offset_min = 0;
+            }
+            let first = &result.channels[0];
+            let inside: u64 = first.toggles.iter().sum();
+            let mut covered = vec![false; starts.len()];
+            for &(low, high, _) in &ranges {
+                covered[low..high].fill(true);
+            }
+            let segment_toggles = first
+                .toggles
+                .iter()
+                .zip(&covered)
+                .filter(|(_, c)| **c)
+                .map(|(t, _)| t)
+                .sum();
+            let report = EdgeReport {
+                summary: summarize_edges(&edges),
+                inside,
+                before: first.before.toggles,
+                after: first.after.toggles,
+                offset_min,
+                offset_max,
+            };
+            let diagnostics = BatchDiagnostics {
+                total_toggles: report.total(),
+                kept_toggles: inside,
+                segment_toggles,
+                info: std::mem::take(&mut result.info),
+                edges: Some(report),
+            };
+            let mut channels = Vec::new();
+            let mut labels = None;
+            for channel in &result.channels {
+                let (traces, l) = cut_ranges(&channel.toggles, &ranges, policy)?;
+                channels.push(traces);
+                labels.get_or_insert(l);
+            }
+            Ok(BatchOutput {
+                channels,
+                labels: labels.expect("a plan has a channel"),
+                diagnostics,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -333,6 +615,35 @@ mod tests {
         let (traces, labels) = cut_traces(&trace(), &[(10, 30, 0), (30, 60, 1)]);
         assert_eq!(traces, array![[2.0, 3.0, 0.0], [4.0, 5.0, 6.0]]);
         assert_eq!(labels, array![0u16, 1]);
+    }
+
+    #[test]
+    fn the_length_policy_decides_what_happens_to_traces_of_different_lengths() {
+        let markers = [(10, 30, 0), (30, 60, 1), (40, 60, 1)];
+        let (padded, _) = cut_traces_with(&trace(), &markers, LengthPolicy::Pad).unwrap();
+        assert_eq!(
+            padded,
+            array![[2.0, 3.0, 0.0], [4.0, 5.0, 6.0], [5.0, 6.0, 0.0]]
+        );
+        let (cut, labels) = cut_traces_with(&trace(), &markers, LengthPolicy::Truncate).unwrap();
+        assert_eq!(cut, array![[2.0, 3.0], [4.0, 5.0], [5.0, 6.0]]);
+        assert_eq!(labels, array![0u16, 1, 1]);
+        let message = cut_traces_with(&trace(), &markers, LengthPolicy::Error)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("class 0: 2 samples x 1; class 1: 2 samples x 1, 3 samples x 1"),
+            "{message}"
+        );
+        // Equal lengths are fine with every policy.
+        for policy in [
+            LengthPolicy::Pad,
+            LengthPolicy::Truncate,
+            LengthPolicy::Error,
+        ] {
+            let (same, _) = cut_traces_with(&trace(), &[(10, 30, 0), (30, 50, 1)], policy).unwrap();
+            assert_eq!(same, array![[2.0, 3.0], [4.0, 5.0]]);
+        }
     }
 
     #[test]
@@ -468,7 +779,8 @@ mod tests {
         };
         // Sampling keeps the times 0, 10, and 20. The markers cover the points at 0 and 10.
         let m = meta(Some(10), vec![(0, 10, 0), (10, 15, 1)]);
-        let (traces, labels, d) = traces_from_power(trace, &m, RunInfo::default());
+        let (traces, labels, d) =
+            traces_from_power(trace, &m, RunInfo::default(), LengthPolicy::Pad).unwrap();
         assert_eq!(
             (d.total_toggles, d.kept_toggles, d.segment_toggles),
             (6, 4, 3)
@@ -484,7 +796,8 @@ mod tests {
             power: vec![1, 2, 4],
         };
         let m = meta(None, vec![(0, 20, 0), (10, 30, 1)]);
-        let (_, _, d) = traces_from_power(trace, &m, RunInfo::default());
+        let (_, _, d) =
+            traces_from_power(trace, &m, RunInfo::default(), LengthPolicy::Pad).unwrap();
         assert_eq!(
             (d.total_toggles, d.kept_toggles, d.segment_toggles),
             (7, 7, 7)
@@ -500,6 +813,7 @@ mod tests {
                 top_scopes: top_scopes.iter().map(|s| s.to_string()).collect(),
                 ..RunInfo::default()
             },
+            edges: None,
         }
     }
 
@@ -528,8 +842,13 @@ mod tests {
         let (traces, labels) = cut_traces(&trace(), &[(30, 10, 1), (10, 30, 0)]);
         assert_eq!(traces, array![[0.0, 0.0], [2.0, 3.0]]);
         assert_eq!(labels, array![1u16, 0]);
-        let (_, _, d) =
-            traces_from_power(trace(), &meta(None, vec![(30, 10, 1)]), RunInfo::default());
+        let (_, _, d) = traces_from_power(
+            trace(),
+            &meta(None, vec![(30, 10, 1)]),
+            RunInfo::default(),
+            LengthPolicy::Pad,
+        )
+        .unwrap();
         assert_eq!(d.segment_toggles, 0);
     }
 

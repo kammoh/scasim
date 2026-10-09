@@ -55,6 +55,106 @@ fn real_batch_matches_reference_npz() {
     }
 }
 
+/// Compares the clock-edge sampling with the legacy sampling on a real batch. The test only reads
+/// the batch directory.
+///
+/// Environment variables:
+///   SCASIM_REAL_BATCH    the batch directory (metadata file and waveform)
+///   SCASIM_REAL_CLOCK    the exact path of the clock signal (find it with `--list-signals`)
+///   SCASIM_REAL_EXCLUDE  optional, comma-separated paths of more signals to leave out, for
+///                        example another net of the same clock
+///
+/// The clock signals are left out in both modes. The test asserts conservation: the toggles in
+/// the bins, before the first edge, and after the last edge add up to the toggles of the legacy
+/// run. If the legacy sampling drops no toggle, the traces must be equal. Otherwise every
+/// sample of the edge traces is at least the sample of the legacy traces, and the test prints
+/// how much activity the legacy sampling drops.
+///
+/// Run with:
+///   SCASIM_REAL_BATCH=<batch dir> SCASIM_REAL_CLOCK=<path> \
+///     cargo test --release --test real_data edges_mode -- --ignored --nocapture
+#[test]
+#[ignore = "needs SCASIM_REAL_BATCH and SCASIM_REAL_CLOCK"]
+fn edges_mode_agrees_with_legacy_mode_or_conserves_the_activity() {
+    use scasim::batch::{EdgeSampling, LengthPolicy, Sampling, compute_batch};
+    use scasim::power::PowerPlan;
+    use scasim::power::edges::EdgeKind;
+
+    let dir = PathBuf::from(std::env::var("SCASIM_REAL_BATCH").expect("set SCASIM_REAL_BATCH"));
+    let clock = std::env::var("SCASIM_REAL_CLOCK").expect("set SCASIM_REAL_CLOCK");
+    let meta_path = ["meta.json.gz", "meta.json"]
+        .iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.exists())
+        .expect("no meta.json(.gz) in SCASIM_REAL_BATCH");
+    let meta = scasim::batch::read_batch_meta(&meta_path).unwrap();
+    let mut rules = vec![format!("-signal:{clock}")];
+    if let Ok(more) = std::env::var("SCASIM_REAL_EXCLUDE") {
+        rules.extend(more.split(',').map(|path| format!("-signal:{path}")));
+    }
+    let plan = PowerPlan::toggles(Selection::parse(&rules).unwrap());
+
+    let legacy = compute_batch(&meta, &plan, &Sampling::Legacy, LengthPolicy::Pad).unwrap();
+    let edges = compute_batch(
+        &meta,
+        &plan,
+        &Sampling::Edges(EdgeSampling {
+            clock,
+            kind: EdgeKind::Rising,
+            offset: 0,
+        }),
+        LengthPolicy::Error,
+    )
+    .unwrap();
+    let report = edges.diagnostics.edges.as_ref().unwrap();
+    let ld = &legacy.diagnostics;
+    eprintln!(
+        "legacy: {} toggles in total, {} at the kept time points ({} dropped), {} in segments",
+        ld.total_toggles,
+        ld.kept_toggles,
+        ld.total_toggles - ld.kept_toggles,
+        ld.segment_toggles
+    );
+    eprintln!(
+        "edges: {} bins; {} inside + {} before + {} after = {} in total ({:.4}% outside); \
+         {} in segments",
+        report.summary.edges - 1,
+        report.inside,
+        report.before,
+        report.after,
+        report.total(),
+        100.0 * report.outside_fraction(),
+        edges.diagnostics.segment_toggles
+    );
+    // Conservation.
+    assert_eq!(report.total(), ld.total_toggles);
+    assert_eq!(edges.labels, legacy.labels);
+    let (e, l) = (&edges.channels[0], &legacy.channels[0]);
+    assert_eq!(e.dim(), l.dim(), "the traces have different shapes");
+    if ld.total_toggles == ld.kept_toggles {
+        assert_eq!(
+            e, l,
+            "the legacy sampling drops no toggle, so the traces must be equal"
+        );
+        eprintln!("the traces are equal");
+    } else {
+        let sum = |a: &Array2<f32>| a.iter().map(|&v| f64::from(v)).sum::<f64>();
+        let differing = e.iter().zip(l.iter()).filter(|(a, b)| a != b).count();
+        assert!(
+            e.iter().zip(l.iter()).all(|(a, b)| a >= b),
+            "an edge sample is smaller"
+        );
+        eprintln!(
+            "{differing} of {} samples differ; the edge traces hold {} toggles more than the \
+             legacy traces ({} against {})",
+            e.len(),
+            sum(e) - sum(l),
+            sum(e),
+            sum(l)
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // t-value oracles. The files are in `tests/data/real_tvalues/`; the README there tells how
 // they were made.
