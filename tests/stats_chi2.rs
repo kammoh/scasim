@@ -82,7 +82,7 @@ fn run(table: &[Vec<u32>], statistic: Statistic) -> TestResult {
         statistic,
         min_expected: 0.0,
     };
-    test_table(&rows, &opts, &mut Workspace::default())
+    test_table(&rows, &opts, &mut Workspace::default()).expect("equal row lengths")
 }
 
 #[derive(Default)]
@@ -99,6 +99,18 @@ struct Worst {
 
 fn compare(case: &Case, statistic: Statistic, reference: &Reference, worst: &mut Worst) {
     let got = run(&case.table, statistic);
+    // NaN compares false and `f64::max` drops it, so check finiteness first.
+    assert!(
+        got.statistic.is_finite() && got.neg_log10_p.is_finite(),
+        "{} {statistic:?}: {got:?}",
+        case.name
+    );
+    assert!(
+        reference.stat.is_finite(),
+        "{}: reference {}",
+        case.name,
+        reference.stat
+    );
     assert_eq!(got.dof, reference.dof, "{} {:?}", case.name, statistic);
     if reference.stat > 0.0 {
         worst.stat_rel = worst
@@ -149,6 +161,7 @@ fn g_matches_mpmath_and_scipy() {
     for case in &cases {
         compare(case, Statistic::G, &case.g, &mut vs_scipy);
         let got = run(&case.table, Statistic::G).statistic;
+        assert!(got.is_finite(), "{}: G statistic {got}", case.name);
         if case.g_mpmath > 0.0 {
             worst_mp = worst_mp.max((got - case.g_mpmath).abs() / case.g_mpmath);
         }
@@ -371,6 +384,7 @@ fn normal_isf_matches_scipy() {
     let mut worst = (0.0_f64, 0.0_f64);
     for &(p, z) in &points {
         let got = normal_isf(p);
+        assert!(got.is_finite(), "normal_isf({p:e}) = {got}");
         let e = (got - z).abs() / z.abs();
         if e > worst.0 {
             worst = (e, p);

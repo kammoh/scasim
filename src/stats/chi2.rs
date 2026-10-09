@@ -51,6 +51,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::error::StatsError;
 use super::special::{bd0, neg_log10_chi2_sf};
 
 /// Which test statistic to compute.
@@ -139,10 +140,32 @@ pub struct Workspace {
 ///
 /// `rows` has one slice per class. All slices must have the same length (the number of bins), and
 /// the bins must be in increasing order of value. Rows or columns that are all zero are ignored.
-pub fn test_table(rows: &[&[u32]], opts: &TestOptions, ws: &mut Workspace) -> TestResult {
+///
+/// Returns [`StatsError::RowLengthMismatch`] if the rows have different lengths. The check comes
+/// before any total is computed.
+pub fn test_table(
+    rows: &[&[u32]],
+    opts: &TestOptions,
+    ws: &mut Workspace,
+) -> Result<TestResult, StatsError> {
     let width = rows.first().map_or(0, |r| r.len());
-    debug_assert!(rows.iter().all(|r| r.len() == width));
+    if let Some((row, r)) = rows.iter().enumerate().find(|(_, r)| r.len() != width) {
+        return Err(StatsError::RowLengthMismatch {
+            row,
+            expected: width,
+            got: r.len(),
+        });
+    }
+    Ok(test_equal_rows(rows, width, opts, ws))
+}
 
+/// The body of [`test_table`]. All rows have `width` columns.
+fn test_equal_rows(
+    rows: &[&[u32]],
+    width: usize,
+    opts: &TestOptions,
+    ws: &mut Workspace,
+) -> TestResult {
     // Rule 1: drop empty rows.
     ws.live.clear();
     ws.row_total.clear();
@@ -383,7 +406,7 @@ mod tests {
             statistic: Statistic::Pearson,
             min_expected: 0.0,
         };
-        let r = test_table(&[&a, &b], &opts, &mut Workspace::default());
+        let r = test_table(&[&a, &b], &opts, &mut Workspace::default()).unwrap();
         assert_eq!(r.dof, 3);
         assert_relative_eq!(r.statistic, 8.64, epsilon = 0.01);
         // p is about 0.0345.
@@ -400,8 +423,8 @@ mod tests {
             min_expected: 0.0,
         };
         let mut ws = Workspace::default();
-        let with = test_table(&[&a, &empty, &b], &opts, &mut ws);
-        let without = test_table(&[&[10, 20, 30], &[20, 20, 20]], &opts, &mut ws);
+        let with = test_table(&[&a, &empty, &b], &opts, &mut ws).unwrap();
+        let without = test_table(&[&[10, 20, 30], &[20, 20, 20]], &opts, &mut ws).unwrap();
         assert_eq!(with.dof, 2);
         assert_eq!(with.statistic.to_bits(), without.statistic.to_bits());
     }
@@ -412,7 +435,7 @@ mod tests {
         let a = [100, 400, 400, 90, 8, 2];
         let b = [90, 410, 380, 100, 15, 5];
         let opts = TestOptions::default();
-        let r = test_table(&[&a, &b], &opts, &mut Workspace::default());
+        let r = test_table(&[&a, &b], &opts, &mut Workspace::default()).unwrap();
         assert!(r.is_valid());
         assert!(r.min_expected >= 20.0, "{r:?}");
         assert!(r.merged > 0);
@@ -424,9 +447,74 @@ mod tests {
             &[&[0, 5, 0], &[0, 7, 0]],
             &TestOptions::default(),
             &mut Workspace::default(),
-        );
+        )
+        .unwrap();
         assert!(!r.is_valid());
         assert_eq!(r.neg_log10_p, 0.0);
+    }
+
+    #[test]
+    fn rows_of_unequal_length_are_an_error() {
+        let opts = TestOptions::default();
+        let mut ws = Workspace::default();
+        // A longer second row: the extra column must not reach the row totals.
+        let err = test_table(&[&[1, 1], &[1, 1, 100]], &opts, &mut ws).unwrap_err();
+        assert_eq!(
+            err,
+            StatsError::RowLengthMismatch {
+                row: 1,
+                expected: 2,
+                got: 3
+            }
+        );
+        // A shorter second row.
+        let err = test_table(&[&[1, 1, 100], &[1, 1]], &opts, &mut ws).unwrap_err();
+        assert!(matches!(err, StatsError::RowLengthMismatch { row: 1, .. }));
+        // The workspace still works after an error.
+        assert!(test_table(&[&[10, 20], &[20, 10]], &opts, &mut ws).is_ok());
+        // No rows at all is an empty, invalid table, not an error.
+        let r = test_table(&[], &opts, &mut ws).unwrap();
+        assert!(!r.is_valid());
+    }
+
+    /// Merging by hand. Row totals 100 and 300 (N = 400), `min_expected` 20: the threshold on
+    /// a group's column total is 20 * 400 / 100 = 80. Column totals are [3, 4, 8, 135, 250].
+    /// Columns 0..=3 reach 150 and close group 0; column 4 (250) is group 1.
+    /// Merged table [[50, 50], [100, 200]], expected [[37.5, 62.5], [112.5, 187.5]].
+    /// Pearson = 156.25 * (1/37.5 + 1/62.5 + 1/112.5 + 1/187.5) = 8.8889 (= 80 / 9).
+    #[test]
+    fn merging_with_unequal_row_totals_by_hand() {
+        let a = [2, 3, 5, 40, 50];
+        let b = [1, 1, 3, 95, 200];
+        let r = test_table(
+            &[&a, &b],
+            &TestOptions::default(),
+            &mut Workspace::default(),
+        )
+        .unwrap();
+        assert_eq!((r.rows, r.columns, r.merged, r.dof, r.n), (2, 2, 3, 1, 400));
+        assert_relative_eq!(r.statistic, 80.0 / 9.0, max_relative = 1e-14);
+        assert_relative_eq!(r.min_expected, 37.5, max_relative = 1e-14);
+    }
+
+    /// The remainder at the end joins the last closed group. Row totals 100 and 200 (N = 300),
+    /// threshold 20 * 300 / 100 = 60, column totals [160, 120, 10, 10]. Column 0 closes group 0,
+    /// column 1 closes group 1, columns 2 and 3 (total 20) join group 1.
+    /// Merged table [[60, 40], [100, 100]], column totals [160, 140].
+    /// Pearson = 2000^2 / (160 * 100 * 200) + 2000^2 / (140 * 100 * 200) = 1.25 + 1.428571...
+    #[test]
+    fn a_small_remainder_joins_the_last_group_by_hand() {
+        let a = [60, 30, 6, 4];
+        let b = [100, 90, 4, 6];
+        let r = test_table(
+            &[&a, &b],
+            &TestOptions::default(),
+            &mut Workspace::default(),
+        )
+        .unwrap();
+        assert_eq!((r.rows, r.columns, r.merged, r.dof, r.n), (2, 2, 2, 1, 300));
+        assert_relative_eq!(r.statistic, 1.25 + 10.0 / 7.0, max_relative = 1e-14);
+        assert_relative_eq!(r.min_expected, 100.0 * 140.0 / 300.0, max_relative = 1e-14);
     }
 
     fn result(neg_log10_p: f64, dof: u32) -> TestResult {

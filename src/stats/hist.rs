@@ -875,7 +875,10 @@ impl HistAccumulator {
             .par_iter()
             .map_init(
                 || (Workspace::default(), Vec::<u32>::new()),
-                |(ws, scratch), h| h.with_rows(&slots, scratch, |rows| test_table(rows, opts, ws)),
+                |(ws, scratch), h| {
+                    h.with_rows(&slots, scratch, |rows| test_table(rows, opts, ws))
+                        .and_then(|result| result)
+                },
             )
             .collect()
     }

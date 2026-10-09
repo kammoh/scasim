@@ -104,7 +104,7 @@ fn main() -> Result<(), DynError> {
                                 statistic,
                                 min_expected,
                             };
-                            let r = test_table(&[&a, &b], &opts, &mut ws);
+                            let r = test_table(&[&a, &b], &opts, &mut ws)?;
                             for (k, count) in acc[v].iter_mut().enumerate() {
                                 if r.is_valid() && r.neg_log10_p >= (k + 1) as f64 {
                                     *count += 1;

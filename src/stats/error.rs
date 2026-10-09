@@ -38,6 +38,16 @@ pub enum StatsError {
     /// A test lists the same class label twice.
     #[error("class label {0} is listed twice")]
     DuplicateLabel(u16),
+    /// The rows of a contingency table have different lengths.
+    #[error("row {row} has {got} columns but row 0 has {expected}")]
+    RowLengthMismatch {
+        /// Index of the first row with a wrong length.
+        row: usize,
+        /// Length of row 0.
+        expected: usize,
+        /// Length of that row.
+        got: usize,
+    },
     /// Two accumulators cannot be merged.
     #[error("incompatible accumulators: {0}")]
     Incompatible(String),

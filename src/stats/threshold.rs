@@ -45,8 +45,10 @@ pub fn t_bonferroni(alpha: f64, m: u64) -> f64 {
 }
 
 /// Number of tests in a family: channels, samples, and class pairs (or other test counts).
-pub fn family_size(channels: u64, samples: u64, tests_per_sample: u64) -> u64 {
-    channels * samples * tests_per_sample
+///
+/// Returns `None` if the product does not fit in a `u64`.
+pub fn family_size(channels: u64, samples: u64, tests_per_sample: u64) -> Option<u64> {
+    channels.checked_mul(samples)?.checked_mul(tests_per_sample)
 }
 
 /// Converts `-log10(p)` to the natural-log p-value, for combining evidence in the log domain.
@@ -94,5 +96,14 @@ mod tests {
         // The threshold grows with the family size and shrinks with alpha.
         assert!(t_bonferroni(1e-5, 1484) > t_bonferroni(1e-5, 742));
         assert!(t_bonferroni(1e-3, 742) < t_bonferroni(1e-5, 742));
+    }
+
+    #[test]
+    fn family_size_multiplies_and_detects_overflow() {
+        assert_eq!(family_size(1000, 371, 1), Some(371_000));
+        assert_eq!(family_size(0, u64::MAX, u64::MAX), Some(0));
+        assert_eq!(family_size(u64::MAX, 2, 1), None);
+        assert_eq!(family_size(1 << 32, 1 << 32, 1), None);
+        assert_eq!(family_size(1 << 31, 1 << 32, 1), Some(1 << 63));
     }
 }
