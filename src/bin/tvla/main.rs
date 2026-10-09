@@ -689,6 +689,17 @@ fn main() -> miette::Result<()> {
             fold.add(result.total)?;
         }
     }
+    if edge_totals.batches > 1
+        && edge_totals.offsets_differ()
+        && let Some((min, max)) = edge_totals.offset_range()
+    {
+        warn!(
+            "the segments of the batches start at different places in the clock period. The \
+             distance from a segment start to its first bin is between {min} and {max} ticks \
+             across the batches. Samples of different traces are then at different places in the \
+             period"
+        );
+    }
     let total_collected_traces = fold.num_traces.last().copied().unwrap_or(0);
     let t_values = fold
         .t_values

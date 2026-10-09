@@ -97,9 +97,22 @@ pub struct EdgeTotals {
     pub inside: u64,
     pub before: u64,
     pub after: u64,
+    /// The smallest and the largest distance from a segment start to its first bin, over all
+    /// segments of all batches. `None` before the first batch.
+    offsets: Option<(u64, u64)>,
 }
 
 impl EdgeTotals {
+    /// The smallest and the largest segment offset over all batches added so far.
+    pub fn offset_range(&self) -> Option<(u64, u64)> {
+        self.offsets
+    }
+
+    /// True if the segments do not all start at the same place in the clock period.
+    pub fn offsets_differ(&self) -> bool {
+        self.offsets.is_some_and(|(min, max)| min != max)
+    }
+
     /// Adds the report of one batch.
     pub fn add(&mut self, e: &EdgeReport) {
         self.batches += 1;
@@ -107,6 +120,10 @@ impl EdgeTotals {
         self.inside += e.inside;
         self.before += e.before;
         self.after += e.after;
+        self.offsets = Some(match self.offsets {
+            None => (e.offset_min, e.offset_max),
+            Some((min, max)) => (min.min(e.offset_min), max.max(e.offset_max)),
+        });
     }
 
     /// The fraction of the toggles outside all bins. 0 if there are no toggles.
@@ -381,6 +398,33 @@ mod tests {
     }
 
     #[test]
+    fn the_totals_track_the_range_of_the_segment_offsets_over_all_batches() {
+        use scasim::power::edges::EdgeSummary;
+        let report = |min, max| EdgeReport {
+            summary: EdgeSummary {
+                edges: 3,
+                first_edge: 0,
+                min_period: 1,
+                max_period: 1,
+                mean_period: 1.0,
+            },
+            inside: 1,
+            before: 0,
+            after: 0,
+            offset_min: min,
+            offset_max: max,
+        };
+        let mut totals = EdgeTotals::default();
+        assert_eq!(totals.offset_range(), None);
+        totals.add(&report(0, 0));
+        assert_eq!(totals.offset_range(), Some((0, 0)));
+        assert!(!totals.offsets_differ());
+        totals.add(&report(9, 9));
+        assert_eq!(totals.offset_range(), Some((0, 9)));
+        assert!(totals.offsets_differ());
+    }
+
+    #[test]
     fn the_summary_reports_the_split_of_the_toggles_at_the_clock_edges() {
         let t = array![[1.0]];
         let edges = EdgeTotals {
@@ -389,6 +433,7 @@ mod tests {
             inside: 90,
             before: 6,
             after: 4,
+            ..EdgeTotals::default()
         };
         assert_eq!(edges.outside_fraction(), 0.1);
         let text = render(&SummaryInput {

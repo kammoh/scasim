@@ -44,6 +44,35 @@ pub struct LeakBatch {
     pub labels: Vec<u16>,
     /// The fixture that was written.
     pub fixture: Fixture,
+    cycles: u64,
+}
+
+impl LeakBatch {
+    /// Writes another metadata file `name` next to `meta.json` for the same waveform. Every
+    /// segment starts and ends `shift` ticks later. The last segment is left out, because a
+    /// shifted one would end after the last clock edge.
+    pub fn write_shifted_meta(&self, name: &str, shift: u64) -> PathBuf {
+        let markers: Vec<String> = self
+            .labels
+            .iter()
+            .enumerate()
+            .take(self.labels.len() - 1)
+            .map(|(i, class)| {
+                let start = 10 + i as u64 * self.cycles * 10 + shift;
+                format!("[{start}, {}, {class}]", start + self.cycles * 10)
+            })
+            .collect();
+        let path = self.dir.path().join(name);
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"trace_filename": "tvla.vcd", "clock_period": 10, "markers": [{}]}}"#,
+                markers.join(", ")
+            ),
+        )
+        .unwrap();
+        path
+    }
 }
 
 /// Writes `tvla.vcd` and `meta.json` into a new directory.
@@ -105,5 +134,6 @@ pub fn write_leak_batch(spec: &LeakSpec) -> LeakBatch {
         meta,
         labels,
         fixture,
+        cycles: spec.cycles,
     }
 }

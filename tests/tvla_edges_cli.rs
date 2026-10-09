@@ -186,3 +186,43 @@ fn a_policy_other_than_pad_leaves_traces_npz_alone() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(!batch.dir.path().join("traces.npz").exists());
 }
+
+#[test]
+fn different_alignments_in_different_batches_give_one_warning_at_the_end() {
+    let batch = write_leak_batch(&LeakSpec {
+        traces: 20,
+        ..LeakSpec::default()
+    });
+    // Batch A: every segment starts at an edge (offset 0). Batch B: every segment starts one
+    // tick after an edge (offset 9). Each batch alone is aligned.
+    batch.write_shifted_meta("a.json", 0);
+    batch.write_shifted_meta("b.json", 1);
+    let list = batch.dir.path().join("meta.list");
+    std::fs::write(&list, "a.json\nb.json\n").unwrap();
+    let out = batch.dir.path().join("out");
+    let run = |list: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_tvla"))
+            .env_remove("RUST_LOG")
+            .arg("--meta-list")
+            .arg(list)
+            .arg("--ttest-output-dir")
+            .arg(&out)
+            .args(["--plot=false", "-d", "1", "--clock", "tb.clk"])
+            .output()
+            .unwrap()
+    };
+    let output = run(&list);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let log = stderr(&output);
+    assert_eq!(
+        log.matches("different places in the clock period").count(),
+        1,
+        "{log}"
+    );
+    assert!(log.contains("across the batches"), "{log}");
+    assert!(log.contains("between 0 and 9 ticks"), "{log}");
+    // The same alignment in all batches: no warning.
+    std::fs::write(&list, "a.json\na.json\n").unwrap();
+    let log = stderr(&run(&list));
+    assert!(!log.contains("different places"), "{log}");
+}

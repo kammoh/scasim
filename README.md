@@ -90,7 +90,7 @@ The traces are `f32`, which holds integers exactly up to 2^24 = 16,777,216. With
 
 With `--clock` or with a policy other than `pad`, `traces.npz` is neither read nor written.
 
-`tvla` logs the number of clock edges, the statistics of the clock periods, and where the toggles are: inside the bins, before the first edge, and after the last edge. The three counts add up to all toggles of the selection. It warns if the segments start at different places in the clock period.
+`tvla` logs the number of clock edges, the statistics of the clock periods, and where the toggles are: inside the bins, before the first edge, and after the last edge. The three counts add up to all toggles of the selection. It warns if the segments start at different places in the clock period, inside one batch (per batch) and across all batches (once at the end, with the range of the offsets).
 
 ## Ranking the leakage by scope
 
