@@ -22,8 +22,12 @@ pub enum PowerError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Selection(#[from] SelectionError),
-    #[error("channel `{0}` selects no signals")]
-    EmptyChannel(String),
+    #[error("channel `{name}` selects no signals{}", unmatched_suffix(.unmatched_rules))]
+    EmptyChannel {
+        name: String,
+        /// The rules that match no signal. They are the likely cause of an empty selection.
+        unmatched_rules: Vec<String>,
+    },
     #[error("the time table of the waveform decreases from {previous} to {next}")]
     TimeTable { previous: u64, next: u64 },
     #[error("invalid bins: {0}")]
@@ -38,6 +42,15 @@ pub enum PowerError {
         needed: u64,
         limit: u64,
     },
+}
+
+/// The end of the message about an empty selection: the rules that match no signal.
+fn unmatched_suffix(rules: &[String]) -> String {
+    if rules.is_empty() {
+        String::new()
+    } else {
+        format!("; no signal matches these rules: {}", rules.join(", "))
+    }
 }
 
 /// How a bit state other than `0`, `1`, `l`, and `h` counts in the Hamming weight.
@@ -257,7 +270,10 @@ impl PowerPlan {
         for (c, channel) in self.channels.iter().enumerate() {
             let resolution = channel.selection.resolve(index)?;
             if !resolution.selected.contains(&true) {
-                return Err(PowerError::EmptyChannel(channel.name.clone()));
+                return Err(PowerError::EmptyChannel {
+                    name: channel.name.clone(),
+                    unmatched_rules: resolution.unmatched_rules,
+                });
             }
             for (h, selected) in resolution.selected.into_iter().enumerate() {
                 if selected {
@@ -849,7 +865,24 @@ mod tests {
         let plan = PowerPlan::toggles(Selection::all());
         assert!(matches!(
             plan.resolve(&index),
-            Err(PowerError::EmptyChannel(name)) if name == "all"
+            Err(PowerError::EmptyChannel { name, .. }) if name == "all"
         ));
+    }
+
+    #[test]
+    fn an_empty_selection_names_the_rules_that_match_nothing() {
+        let index = HierarchyIndex::default();
+        let plan = PowerPlan::toggles(
+            Selection::parse(&["+signal:does.not.exist", "-scope:nowhere"]).unwrap(),
+        );
+        let message = plan.resolve(&index).err().unwrap().to_string();
+        assert_eq!(
+            message,
+            "channel `all` selects no signals; no signal matches these rules: \
+             +signal:does.not.exist, -scope:nowhere"
+        );
+        let plan = PowerPlan::toggles(Selection::all());
+        let message = plan.resolve(&index).err().unwrap().to_string();
+        assert_eq!(message, "channel `all` selects no signals");
     }
 }

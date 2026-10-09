@@ -574,11 +574,11 @@ fn a_channel_that_selects_nothing_is_an_error() {
     let plan = plan(&[("none", &["+scope:nowhere"])], false, UnknownPolicy::Half);
     assert!(matches!(
         activity_fst(&path, &plan),
-        Err(PowerError::EmptyChannel(name)) if name == "none"
+        Err(PowerError::EmptyChannel { name, .. }) if name == "none"
     ));
     assert!(matches!(
         activity_reference(&path, &plan),
-        Err(PowerError::EmptyChannel(name)) if name == "none"
+        Err(PowerError::EmptyChannel { name, .. }) if name == "none"
     ));
 }
 
@@ -1118,7 +1118,7 @@ fn check_corpus_file(path: &Path, name: &str) -> Checked {
         return Checked::Skipped(reason.clone());
     }
     let fast = activity_fst(path, &full);
-    if let Err(PowerError::EmptyChannel(_)) = &fast {
+    if let Err(PowerError::EmptyChannel { .. }) = &fast {
         // Acceptable only if the file has no signal with a bit-vector value.
         let index = scasim::power::hierarchy_index(path).unwrap();
         assert!(index.paths.iter().all(|p| p.is_empty()), "{name}");
@@ -1148,7 +1148,10 @@ fn check_corpus_file(path: &Path, name: &str) -> Checked {
         match (activity_fst(path, &plan), activity_reference(path, &plan)) {
             (Ok(f), Ok(r)) => assert_eq!(f, r, "{name}, {unknown:?}"),
             // The only signal is excluded: both paths must say so.
-            (Err(PowerError::EmptyChannel(f)), Err(PowerError::EmptyChannel(r))) => {
+            (
+                Err(PowerError::EmptyChannel { name: f, .. }),
+                Err(PowerError::EmptyChannel { name: r, .. }),
+            ) => {
                 assert_eq!((f, r), ("rest".to_string(), "rest".to_string()), "{name}")
             }
             (f, r) => panic!(
@@ -1278,7 +1281,10 @@ fn check_against_read_signals(path: &Path, name: &str) -> OracleChecked {
     if expected.selected_handles == 0 {
         let half = plan_all(true, UnknownPolicy::Half);
         assert!(
-            matches!(activity_fst(path, &half), Err(PowerError::EmptyChannel(_))),
+            matches!(
+                activity_fst(path, &half),
+                Err(PowerError::EmptyChannel { .. })
+            ),
             "{name}"
         );
         return OracleChecked::Skipped("no selectable signal".into());

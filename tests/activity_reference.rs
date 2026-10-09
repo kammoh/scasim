@@ -157,7 +157,7 @@ fn a_channel_that_selects_nothing_is_an_error() {
     let p = plan(&[("none", &["+scope:nowhere"])], false, UnknownPolicy::Half);
     assert!(matches!(
         activity_reference(&path, &p),
-        Err(PowerError::EmptyChannel(name)) if name == "none"
+        Err(PowerError::EmptyChannel { name, .. }) if name == "none"
     ));
 }
 

@@ -4,6 +4,7 @@ use crate::hierarchy::Selection;
 use crate::power::{PowerTrace, RunInfo, power_trace};
 use miette::{Context, IntoDiagnostic, miette};
 use ndarray::{Array1, Array2, s};
+use ndarray_npz::{NpzReader, NpzWriter};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -82,6 +83,117 @@ pub fn read_batch_meta(meta_path: &Path) -> miette::Result<BatchMeta> {
         clock_period,
         markers,
     })
+}
+
+/// Reads the traces and labels from a `traces.npz` cache file.
+///
+/// The file has the arrays `trace_<i>` and `labels`. The indices `i` must be exactly `0..n`, in
+/// any order in the archive. The traces have the same length, and `labels` has `n` entries.
+/// Any other file is an error, and the message names the file.
+pub fn read_trace_cache(path: &Path) -> miette::Result<(Array2<f32>, Array1<u16>)> {
+    let name = path.display();
+    let file = std::fs::File::open(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("cannot open {name}"))?;
+    let mut npz = NpzReader::new(file)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("{name} is not a valid npz file"))?;
+    let labels: Array1<u16> = npz
+        .by_name("labels")
+        .into_diagnostic()
+        .wrap_err_with(|| format!("cannot read the array `labels` in {name}"))?;
+    let names = npz
+        .names()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("cannot list the arrays in {name}"))?;
+    let trace_names: Vec<&String> = names.iter().filter(|n| n.starts_with("trace_")).collect();
+    let order =
+        trace_order(trace_names.iter().map(|n| n.as_str()), labels.len()).map_err(|problem| {
+            miette!("{name}: {problem}. Delete the file or use --use-existing=false")
+        })?;
+    let mut rows = Vec::with_capacity(order.len());
+    for &position in &order {
+        let row_name = trace_names[position];
+        let row: Array1<f32> = npz
+            .by_name(row_name)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("cannot read the array `{row_name}` in {name}"))?;
+        rows.push(row);
+    }
+    let len = rows[0].len();
+    if let Some(bad) = rows.iter().position(|r| r.len() != len) {
+        return Err(miette!(
+            "{name}: trace_{bad} has {} samples, but trace_0 has {len}. Delete the file or use \
+             --use-existing=false",
+            rows[bad].len()
+        ));
+    }
+    let traces = Array2::from_shape_vec((rows.len(), len), rows.into_iter().flatten().collect())
+        .into_diagnostic()?;
+    Ok((traces, labels))
+}
+
+/// Sorts the names `trace_<i>` by the index `i`. Returns, for each index, the position of its
+/// name in `names`. Fails if the indices are not exactly `0..n`, if there are none, or if there
+/// are not `labels` entries for them.
+fn trace_order<'a>(
+    names: impl Iterator<Item = &'a str>,
+    labels: usize,
+) -> Result<Vec<usize>, String> {
+    let mut indexed = Vec::new();
+    for (position, name) in names.enumerate() {
+        let index = name["trace_".len()..]
+            .parse::<usize>()
+            .map_err(|_| format!("the array name `{name}` has no trace index"))?;
+        indexed.push((index, position));
+    }
+    if indexed.is_empty() {
+        return Err("the file has no traces".into());
+    }
+    indexed.sort_unstable();
+    if let Some(wrong) = indexed
+        .iter()
+        .enumerate()
+        .find(|(i, (index, _))| i != index)
+    {
+        let expected = wrong.0;
+        return Err(format!(
+            "the trace indices are not 0..{}: trace_{expected} is missing or repeated",
+            indexed.len()
+        ));
+    }
+    if labels != indexed.len() {
+        return Err(format!(
+            "the file has {} traces, but {labels} labels",
+            indexed.len()
+        ));
+    }
+    Ok(indexed.into_iter().map(|(_, position)| position).collect())
+}
+
+/// Writes the traces and labels to a `traces.npz` cache file.
+pub fn write_trace_cache(
+    path: &Path,
+    traces: &Array2<f32>,
+    labels: &Array1<u16>,
+) -> miette::Result<()> {
+    let name = path.display();
+    let file = std::fs::File::create(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("cannot create {name}"))?;
+    let mut npz = NpzWriter::new_compressed(file);
+    for (i, trace) in traces.outer_iter().enumerate() {
+        npz.add_array(format!("trace_{i}"), &trace)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("cannot write {name}"))?;
+    }
+    npz.add_array("labels", labels)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("cannot write {name}"))?;
+    npz.finish()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("cannot write {name}"))?;
+    Ok(())
 }
 
 /// The index range `[low, high)` of the time points that each marker covers, and its label.
@@ -233,6 +345,59 @@ mod tests {
             assert_eq!(meta.clock_period, Some(10));
             assert_eq!(meta.markers, vec![(3710, 7420, 0), (7420, 11130, 1)]);
         }
+    }
+
+    #[test]
+    fn trace_order_sorts_by_the_parsed_index() {
+        // A text sort puts `trace_10` before `trace_2`. The parsed index does not.
+        let names: Vec<String> = [2, 10, 0, 1, 3, 4, 5, 6, 7, 8, 9]
+            .iter()
+            .map(|i| format!("trace_{i}"))
+            .collect();
+        let order = trace_order(names.iter().map(String::as_str), 11).unwrap();
+        let sorted: Vec<&str> = order.iter().map(|&p| names[p].as_str()).collect();
+        let want: Vec<String> = (0..11).map(|i| format!("trace_{i}")).collect();
+        assert_eq!(sorted, want);
+    }
+
+    #[test]
+    fn trace_order_rejects_gaps_repeats_and_other_problems() {
+        let err = |names: &[&'static str], labels| trace_order(names.iter().copied(), labels);
+        assert!(err(&["trace_0", "trace_1"], 2).is_ok());
+        assert!(err(&[], 0).unwrap_err().contains("no traces"));
+        assert!(
+            err(&["trace_0", "trace_2"], 2)
+                .unwrap_err()
+                .contains("trace_1")
+        );
+        assert!(err(&["trace_0", "trace_0"], 2).is_err());
+        assert!(
+            err(&["trace_1", "trace_2"], 2)
+                .unwrap_err()
+                .contains("trace_0")
+        );
+        assert!(
+            err(&["trace_0", "trace_x"], 2)
+                .unwrap_err()
+                .contains("trace_x")
+        );
+        assert!(
+            err(&["trace_0", "trace_1"], 3)
+                .unwrap_err()
+                .contains("labels")
+        );
+    }
+
+    #[test]
+    fn the_trace_cache_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("traces.npz");
+        let traces = Array2::from_shape_fn((12, 3), |(i, j)| (10 * i + j) as f32);
+        let labels = Array1::from_iter((0..12).map(|i| (i % 2) as u16));
+        write_trace_cache(&path, &traces, &labels).unwrap();
+        let (got_traces, got_labels) = read_trace_cache(&path).unwrap();
+        assert_eq!(got_traces, traces);
+        assert_eq!(got_labels, labels);
     }
 
     #[test]
