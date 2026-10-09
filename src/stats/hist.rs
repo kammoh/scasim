@@ -1370,7 +1370,9 @@ mod tests {
     fn the_dense_window_limit_is_capped() {
         let acc = HistAccumulator::with_max_dense_bins(1, Binning::Exact, usize::MAX);
         assert_eq!(acc.max_dense_bins, MAX_DENSE_BINS_LIMIT);
-        let traces = Array2::from_shape_vec((2, 1), vec![i64::MIN, i64::MAX]).unwrap();
+        // The values are the largest bins that the histogram accepts (below 2^53).
+        let limit = (1_i64 << 53) - 1;
+        let traces = Array2::from_shape_vec((2, 1), vec![-limit, limit]).unwrap();
         let mut acc = acc;
         acc.update(traces.view(), Array1::from(vec![0_u16, 1]).view())
             .unwrap();
