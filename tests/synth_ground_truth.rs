@@ -283,8 +283,8 @@ fn no_leak_and_shuffled_runs_have_no_bonferroni_exceedance() {
     // Under the null hypothesis, the chance of any exceedance of a Bonferroni threshold is at
     // most 1e-5 for each family (the t-values, the chi-squared values). The seeds are fixed, so
     // the test cannot flake. With 1000 traces or more, the t-statistic of a sum of bit flips is
-    // close to normal. Margin at these seeds: the largest |t| is 1.5 (no leak) and 2.0
-    // (shuffled), against the threshold 4.93. The largest chi-squared value is 1.5 and 0.3,
+    // close to normal. Margin at these seeds: the largest |t| is 1.5 (no leak) and 1.7
+    // (shuffled), against the threshold 4.93. The largest chi-squared value is 1.5 and 0.4,
     // against 5.78.
     let dir = tempfile::tempdir().unwrap();
     let plain = SynthSpec {
