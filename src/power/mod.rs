@@ -190,10 +190,11 @@ pub struct PowerPlan {
     /// Also record rise, fall, and Hamming-weight statistics. Without it, only toggles.
     pub full_stats: bool,
     pub unknown: UnknownPolicy,
-    /// Upper limit for the memory of the result and of the decode buffers, in bytes.
+    /// Limit for the estimated memory of the result and of the decode buffers, in bytes.
     ///
+    /// This is a check before the allocation, not a hard limit on the memory of the process.
     /// Before each allocation that grows with the number of time points, bins, or channels, the
-    /// run adds up the memory that it holds at that point. It fails with
+    /// run adds up the estimated memory that it holds at that point. It fails with
     /// [`PowerError::Memory`] if the sum is more than the limit. The sum counts:
     ///
     /// - the result: the bin starts, and `bins + 2` slots per channel and statistic (the two
@@ -202,14 +203,25 @@ pub struct PowerPlan {
     /// - the placement of the time points of one section: 4 bytes for each time point;
     /// - the decode buffers of one section: one set of slots per channel for each parallel part
     ///   (at most `2 * threads` parts) in the fast path;
-    /// - the signals that `wellen` loads in the reference path. This is an upper bound. The
-    ///   reference path loads the signals in batches, and counts the signals of one batch.
+    /// - the largest signal that `wellen` loads in the reference path. The estimate assumes one
+    ///   change at each time point. The reference path loads the signals in batches. The
+    ///   estimates of the signals of one batch fit in the memory that is left.
     ///
-    /// It does not count what the readers allocate before the run can check anything: the time
-    /// table of the file, the compressed data of a section and its decoded time table (the fork
-    /// of `fst-reader` does not tell the size before it reads), the hierarchy, the `wellen`
-    /// body, and the last values of the signals. It does not count the fixed size of the
-    /// structures either. An estimate that overflows counts as too large.
+    /// The estimate does not count:
+    ///
+    /// - what the readers allocate before the run can check anything: the time table of the
+    ///   file, the compressed data of a section, its decoded time table, the hierarchy, and the
+    ///   `wellen` body;
+    /// - in the fast path, the decompressed signal chains and frames of a section (the fork of
+    ///   `fst-reader` does not tell their size before it reads them): a 1024-bit vector with
+    ///   100000 changes in one section decompresses at least 12.8 MB;
+    /// - in the reference path, several changes at one time stamp (delta cycles), so a signal
+    ///   can need more than the estimate: a 1-bit signal with 4 changes at each of 1000000
+    ///   time stamps needs at least 20 MB, and the estimate is 6 MB;
+    /// - the slack of `Vec` growth, the internal storage and the decompression buffers of
+    ///   `wellen`, the last values of the signals, and the fixed size of the structures.
+    ///
+    /// An estimate that overflows counts as too large.
     pub memory_limit: u64,
 }
 

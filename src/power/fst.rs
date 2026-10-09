@@ -7,11 +7,11 @@
 //! frame values of the first section. It excludes every change after the end time in the file
 //! header.
 //!
-//! Memory: the run checks the memory limit before every allocation that grows with the number of
-//! time points, bins, or channels (see [`PowerPlan::memory_limit`]). The reader allocates some
-//! memory before any check can run: the time table of the file, and, for each section, its
-//! compressed data and its decoded time table. The fork of `fst-reader` does not tell their sizes
-//! before it reads them, so they are not counted.
+//! Memory: the run estimates the memory and checks the limit before every allocation that grows
+//! with the number of time points, bins, or channels (see [`PowerPlan::memory_limit`]). The
+//! estimate does not count what the reader allocates: the time table of the file, and, for each
+//! section, its compressed data, its decoded time table, and its decompressed signal chains and
+//! frames. The fork of `fst-reader` does not tell these sizes before it reads them.
 
 use super::slots::{Placement, SlotStats, assemble_trace, merge_channel_stats, new_channel_stats};
 use super::stats::{
@@ -292,8 +292,7 @@ fn run<const FULL: bool>(
             if info.start_time > end_time {
                 continue;
             }
-            // The compressed data and the time table of the section are not counted: see the
-            // module documentation.
+            // The reader's memory for the section is not counted: see the module documentation.
             let section = reader.read_section(section_index)?;
             let times = section.time_table();
 

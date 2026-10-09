@@ -6,12 +6,14 @@
 //! about the selection, so the memory limit does not count it. The run checks the memory limit
 //! before it makes identity bins and before it loads the selected signals.
 //!
-//! `wellen` does not tell the size of a signal before it loads it. The run uses an upper bound
-//! (see [`signal_bytes`]) that is far above the real size when a signal changes rarely. A check
-//! of the sum of all bounds would refuse files that load without problems. Therefore the run
-//! loads the signals in batches. The bounds of the signals of a batch add up to at most the
-//! memory that is left. The run fails only if the bound of one signal alone does not fit. The
-//! batches do not change the result: the statistics of the signals are sums.
+//! `wellen` does not tell the size of a signal before it loads it. The run uses an estimate (see
+//! [`signal_bytes`]) that is far above the real size when a signal changes rarely, and below it
+//! when a signal has several changes at one time stamp. A check of the sum of all estimates would
+//! refuse files that load without problems. Therefore the run loads the signals in batches. The
+//! estimates of the signals of a batch add up to at most the memory that is left. The run fails
+//! only if the estimate of one signal alone does not fit. The batches do not change the result:
+//! the statistics of the signals are sums. [`PowerPlan::memory_limit`] lists what the estimate
+//! does not count.
 
 use super::slots::{Placement, assemble_trace, new_channel_stats};
 use super::stats::{chars_delta, chars_first};
@@ -36,11 +38,11 @@ fn timescale_exponent(timescale: wellen::Timescale) -> Option<i8> {
     (10u32.pow(factor_exponent) == timescale.factor).then(|| unit + factor_exponent as i8)
 }
 
-/// An upper bound for the bytes that `wellen` needs to hold the changes of the signal with the
-/// handle index `handle`, for a time table of `time_points` entries. `None` if the bound
+/// An estimate of the bytes that `wellen` needs to hold the changes of the signal with the
+/// handle index `handle`, for a time table of `time_points` entries. `None` if the estimate
 /// overflows.
 ///
-/// The bound assumes the worst case: the signal changes at every time point. A change needs 4
+/// The estimate assumes that the signal changes once at every time point. A change needs 4
 /// bytes for its time index, and its value:
 ///
 /// - a bit vector of `w` bits: `ceil(w / 2)` bytes (4 bits per bit, nine states), and 1 meta byte;
@@ -96,6 +98,15 @@ fn run(
     plan: &PowerPlan,
     given_bins: Option<&Bins>,
 ) -> Result<ActivityTrace, PowerError> {
+    run_counting_batches(path, plan, given_bins).map(|(trace, _)| trace)
+}
+
+/// Like [`run`]. Also returns the number of calls to `load_signals` (the batches).
+fn run_counting_batches(
+    path: &Path,
+    plan: &PowerPlan,
+    given_bins: Option<&Bins>,
+) -> Result<(ActivityTrace, usize), PowerError> {
     let header = wellen::viewers::read_header_from_file(path, &load_options())?;
     let hierarchy = header.hierarchy;
     let index = HierarchyIndex::from_wellen(&hierarchy);
@@ -109,13 +120,8 @@ fn run(
     let mut stats = new_channel_stats(plan, bins);
     if body.time_table.is_empty() {
         // `wellen` panics when it loads signals of an FST file without time points.
-        return Ok(assemble_trace(
-            plan,
-            bins,
-            stats,
-            timescale_exponent,
-            resolved.info,
-        ));
+        let trace = assemble_trace(plan, bins, stats, timescale_exponent, resolved.info);
+        return Ok((trace, 0));
     }
 
     // Load the selected signals. A derived signal never has channels, because the index maps
@@ -142,7 +148,9 @@ fn run(
     let mut source = body.source;
     let placement = Placement::new(&body.time_table, bins, None);
     let (mut previous, mut current) = (Vec::new(), Vec::new());
+    let mut batch_count = 0;
     for batch in batches(&costs, budget) {
+        batch_count += 1;
         let signals = source.load_signals(&refs[batch], &hierarchy, true);
         for signal in &signals {
             let channels = &resolved.handle_channels[signal.signal_ref().index()];
@@ -173,18 +181,53 @@ fn run(
             }
         }
     }
-    Ok(assemble_trace(
-        plan,
-        bins,
-        stats,
-        timescale_exponent,
-        resolved.info,
-    ))
+    let trace = assemble_trace(plan, bins, stats, timescale_exponent, resolved.info);
+    Ok((trace, batch_count))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::batches;
+    use super::*;
+    use crate::hierarchy::Selection;
+    use std::io::Write;
+
+    /// A VCD file with three signals of 1, 4, and 70 bits that change at 5 time points.
+    fn write_vcd(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("t.vcd");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            "$timescale 1ps $end\n$scope module tb $end\n$var wire 1 ! a $end\n\
+             $var wire 4 \" b $end\n$var wire 70 # c $end\n$upscope $end\n$enddefinitions $end\n\
+             #0\n$dumpvars\n0!\nb0000 \"\nb{} #\n$end\n",
+            "0".repeat(70)
+        )
+        .unwrap();
+        for t in 1..=5u32 {
+            writeln!(f, "#{}\n{}!\nb{:04b} \"\nb{:070b} #", t * 10, t % 2, t, t).unwrap();
+        }
+        path
+    }
+
+    /// The signals load in as few batches as the limit allows. The result does not depend on the
+    /// number of batches.
+    #[test]
+    fn the_limit_decides_the_number_of_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_vcd(dir.path());
+        let mut plan = PowerPlan::toggles(Selection::all());
+        plan.full_stats = true;
+        // 6 time points. The estimates are 36, 42, and 240 bytes, 318 bytes together. With the
+        // identity bins, the result needs 352 bytes and the placement 24 bytes.
+        let (one, count) = run_counting_batches(&path, &plan, None).unwrap();
+        assert_eq!(count, 1);
+        plan.memory_limit = 352 + 24 + 318;
+        let (same, count) = run_counting_batches(&path, &plan, None).unwrap();
+        assert_eq!((count, &same), (1, &one));
+        plan.memory_limit = 352 + 24 + 240;
+        let (split, count) = run_counting_batches(&path, &plan, None).unwrap();
+        assert_eq!((count, &split), (2, &one));
+    }
 
     #[test]
     fn batches_group_consecutive_signals_up_to_the_budget() {
