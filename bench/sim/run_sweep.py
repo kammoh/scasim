@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 
+sys.dont_write_bytecode = True  # keep the repo clean
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gen_design  # noqa: E402

@@ -60,8 +60,9 @@ def main():
             hdl_toplevel=a.top,
             hdl_toplevel_lang="verilog",
             build_dir=a.build_dir,
-            test_dir=os.path.dirname(os.path.abspath(__file__)),
-            extra_env=dict(e.split("=", 1) for e in a.env),
+            test_dir=a.build_dir,  # results.xml goes here, not into the repo
+            extra_env={"PYTHONPATH": os.path.dirname(os.path.abspath(__file__)),
+                       "PYTHONDONTWRITEBYTECODE": "1", **dict(e.split("=", 1) for e in a.env)},
             waves=a.waves,
             test_args=["--trace-file", a.trace_file] if a.waves else [],
             timescale=("1ns", "1ps"),
