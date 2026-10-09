@@ -88,7 +88,10 @@ macro_rules! impl_bin_value_int {
     ($($t:ty),*) => {$(
         impl BinValue for $t {
             #[inline(always)]
-            fn exact_bin(self) -> Option<i64> { i64::try_from(self).ok() }
+            fn exact_bin(self) -> Option<i64> {
+                // Same range as for floats, so every bin converts to `f64` exactly.
+                i64::try_from(self).ok().filter(|v| v.unsigned_abs() < (1u64 << 53))
+            }
             #[inline(always)]
             fn to_f64(self) -> f64 { self as f64 }
         }
@@ -115,6 +118,16 @@ impl_bin_value_float!(f32, f64);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integers_at_or_above_two_to_the_53_are_rejected() {
+        // Above 2^53, two integers can map to the same f64, so moments would be wrong.
+        assert_eq!((1i64 << 53).exact_bin(), None);
+        assert_eq!((-(1i64 << 53)).exact_bin(), None);
+        assert_eq!(u64::MAX.exact_bin(), None);
+        assert_eq!(((1i64 << 53) - 1).exact_bin(), Some((1i64 << 53) - 1));
+        assert_eq!((1u32 << 31).exact_bin(), Some(1i64 << 31));
+    }
 
     #[test]
     fn exact_integers_and_floats() {

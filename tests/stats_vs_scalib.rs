@@ -31,12 +31,24 @@ struct NonFinite {
     kind: String,
 }
 
-fn check(name: &str, got: &Array2<f64>, case: &Case, path: &str, worst: &mut f64) {
+/// `too_few` is true when class 0 or 1 has fewer than two traces. Ruling A2 then requires NaN
+/// for every t-value, also where SCALib reports a number or an infinity. Everywhere else the
+/// result must match the fixture: the same finite value, or the same non-finite kind.
+fn check(name: &str, got: &Array2<f64>, case: &Case, path: &str, too_few: bool, worst: &mut f64) {
     for ((order_sample, &value), fixture) in got
         .indexed_iter()
         .zip(case.t_values.iter().flat_map(|r| r.iter()))
     {
         let (order, sample) = order_sample;
+        if too_few {
+            assert!(
+                value.is_nan(),
+                "{path} {name} order {} sample {}: a class has fewer than two traces, got {value}",
+                order + 1,
+                sample
+            );
+            continue;
+        }
         if let Some(nf) = case
             .non_finite
             .iter()
@@ -58,25 +70,15 @@ fn check(name: &str, got: &Array2<f64>, case: &Case, path: &str, worst: &mut f64
             continue;
         }
         if let Some(expected) = fixture.as_f64() {
-            if value.is_finite() {
-                let err = (value - expected).abs() / 1.0f64.max(value.abs()).max(expected.abs());
-                *worst = worst.max(err);
-                assert!(
-                    err <= 1e-9,
-                    "{path} {name} order {} sample {}: {value} versus {expected}, error {err:e}",
-                    order + 1,
-                    sample
-                );
-            } else {
-                // A2 returns NaN when a class has fewer than two traces, even if SCALib
-                // reports infinity for a zero denominator.
-                assert!(
-                    value.is_nan(),
-                    "{path} {name} order {} sample {}: {value}",
-                    order + 1,
-                    sample
-                );
-            }
+            // A non-finite `value` gives a NaN error, which fails the assertion.
+            let err = (value - expected).abs() / 1.0f64.max(value.abs()).max(expected.abs());
+            *worst = worst.max(err);
+            assert!(
+                err <= 1e-9,
+                "{path} {name} order {} sample {}: {value} versus {expected}, error {err:e}",
+                order + 1,
+                sample
+            );
         } else {
             assert!(
                 value.is_nan(),
@@ -108,6 +110,8 @@ fn both_t_test_paths_match_every_scalib_fixture_case() {
         )
         .unwrap();
         let labels = Array1::from_vec(data.labels.clone());
+        let count = |c: u16| data.labels.iter().filter(|&&l| l == c).count();
+        let too_few = count(0) < 2 || count(1) < 2;
         let mut hist = HistAccumulator::new(case.ns, Binning::Exact);
         let mut moments = MomentAccumulator::new(case.ns, case.d).unwrap();
         let mut start = 0;
@@ -126,6 +130,7 @@ fn both_t_test_paths_match_every_scalib_fixture_case() {
             &hist.t_values(0, 1, case.d).unwrap(),
             case,
             "histogram",
+            too_few,
             &mut worst_hist,
         );
         check(
@@ -133,6 +138,7 @@ fn both_t_test_paths_match_every_scalib_fixture_case() {
             &moments.t_values(0, 1),
             case,
             "moments",
+            too_few,
             &mut worst_mom,
         );
     }

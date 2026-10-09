@@ -2,6 +2,11 @@ use ndarray::{Array1, Array2, s};
 use scasim::stats::ttest::MomentAccumulator;
 use scasim::stats::{Binning, HistAccumulator};
 
+/// The bit patterns of all values, so that `-0.0` differs from `0.0` and NaN payloads count.
+fn bits(a: &ndarray::Array2<f64>) -> Vec<u64> {
+    a.iter().map(|v| v.to_bits()).collect()
+}
+
 #[path = "common/ttest_data.rs"]
 mod common;
 
@@ -59,12 +64,12 @@ fn merge_and_thread_count_are_bit_exact() {
         for p in &parts[1..] {
             forward.merge(p).unwrap();
         }
-        assert_eq!(forward.t_values(0, 2, 4).unwrap(), want);
+        assert_eq!(bits(&forward.t_values(0, 2, 4).unwrap()), bits(&want));
         let mut backward = parts.last().unwrap().clone();
         for p in parts[..parts.len() - 1].iter().rev() {
             backward.merge(p).unwrap();
         }
-        assert_eq!(backward.t_values(0, 2, 4).unwrap(), want);
+        assert_eq!(bits(&backward.t_values(0, 2, 4).unwrap()), bits(&want));
         let mut tree = parts.clone();
         while tree.len() > 1 {
             let mut next = Vec::new();
@@ -77,14 +82,14 @@ fn merge_and_thread_count_are_bit_exact() {
             }
             tree = next;
         }
-        assert_eq!(tree[0].t_values(0, 2, 4).unwrap(), want);
+        assert_eq!(bits(&tree[0].t_values(0, 2, 4).unwrap()), bits(&want));
     }
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()
         .unwrap();
     let one = pool.install(|| whole.t_values(0, 2, 4).unwrap());
-    assert_eq!(one, want);
+    assert_eq!(bits(&one), bits(&want));
 }
 
 #[test]
@@ -141,7 +146,7 @@ fn thread_count_does_not_change_bits() {
             .build()
             .unwrap()
             .install(|| h.t_values(0, 2, 4).unwrap());
-        assert_eq!(got, want, "{threads} threads");
+        assert_eq!(bits(&got), bits(&want), "{threads} threads");
     }
 }
 
