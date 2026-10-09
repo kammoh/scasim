@@ -1,0 +1,15 @@
+[package]
+name = "scalib-fixtures"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# This crate is its own workspace. It is not a member of the scasim workspace, so it keeps
+# working after scasim drops the SCALib submodule.
+[workspace]
+
+[dependencies]
+# The package `scalib` is at `src/scalib_ext/scalib` in this repository. Cargo finds it by name.
+scalib = { git = "https://github.com/kammoh/SCALib.git", rev = "f1e2d9d" }
+ndarray = "0.16"
+serde_json = "1"
