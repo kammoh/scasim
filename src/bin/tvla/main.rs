@@ -4,16 +4,25 @@ use log::*;
 use miette::{IntoDiagnostic, WrapErr, miette};
 use ndarray::{Array1, Array2, s};
 use ndarray_npz::NpzWriter;
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
-use scalib::ttest;
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use scasim::batch::{
     BatchDiagnostics, batch_traces, read_batch_meta, read_trace_cache, write_trace_cache,
 };
 use scasim::hierarchy::{HierarchyIndex, Selection};
 use scasim::plot::*;
 use scasim::power::hierarchy_index;
+use scasim::stats::threshold::{CONVENTIONAL, bonferroni, family_size, t_bonferroni};
+use scasim::stats::{Binning, HistAccumulator, TestOptions, TestResult};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+
+mod summary;
+
+/// The family-wise error level of the Bonferroni thresholds in the summary and the plots.
+const ALPHA: f64 = 1e-5;
+
+/// The conventional TVLA threshold on |t|.
+const T_THRESHOLD: f64 = 4.5;
 
 #[derive(Parser, Debug)]
 #[command(name = "scasim-tvla")]
@@ -59,6 +68,15 @@ struct Args {
         default_value_t = true
     )]
     plot: bool,
+    #[arg(
+        long,
+        help = "Run the chi-squared test and write its results and plots (`chi2.npz`, `chi2.*`, `max_chi2.*`)",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = true
+    )]
+    chi2: bool,
     #[arg(
         long = "use-existing",
         help = "Skip generation of power trace data if `traces.npz` exists next to the metadata file and is newer than the waveform and the metadata file. Use its stored data instead.",
@@ -217,13 +235,23 @@ fn read_meta_list(list_path: &Path) -> miette::Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// The traces and labels of one batch, and where they came from.
+struct Loaded {
+    /// The metadata file of the batch.
+    metadata: PathBuf,
+    /// The file that the traces were read from or computed from: `traces.npz` or the waveform.
+    source: PathBuf,
+    traces: Array2<f32>,
+    labels: Array1<u16>,
+}
+
 /// Reads the traces and labels of one batch from the cache or computes them from the waveform.
 fn batch_data(
     metadata_path: &Path,
     use_existing: bool,
     cache_allowed: bool,
     selection: &Selection,
-) -> miette::Result<(Array2<f32>, Array1<u16>)> {
+) -> miette::Result<Loaded> {
     if !metadata_path.exists() {
         return Err(miette!(
             "the metadata file {} does not exist",
@@ -234,6 +262,12 @@ fn batch_data(
     let trace_file_path = meta.trace_path.clone();
     let parent_folder_path = metadata_path.parent().unwrap_or(Path::new("."));
     let npz_path = parent_folder_path.join("traces.npz");
+    let loaded = |source: PathBuf, (traces, labels): (Array2<f32>, Array1<u16>)| Loaded {
+        metadata: metadata_path.to_path_buf(),
+        source,
+        traces,
+        labels,
+    };
 
     if use_existing
         && cache_allowed
@@ -244,7 +278,8 @@ fn batch_data(
             "Using existing traces and labels from {}",
             npz_path.display()
         );
-        return read_trace_cache(&npz_path);
+        let data = read_trace_cache(&npz_path)?;
+        return Ok(loaded(npz_path, data));
     }
 
     println!(
@@ -279,7 +314,149 @@ fn batch_data(
             start_time.elapsed().as_secs_f32()
         );
     }
-    Ok((traces_array, labels_array))
+    Ok(loaded(trace_file_path, (traces_array, labels_array)))
+}
+
+/// The chi-squared results for the classes 0 and 1. A class without traces gives results that
+/// are not valid tests, so a batch with one class only is not an error.
+fn chi2_results(hist: &HistAccumulator) -> miette::Result<Vec<TestResult>> {
+    if hist.class_count(0) == 0 || hist.class_count(1) == 0 {
+        let none = TestResult {
+            statistic: 0.0,
+            dof: 0,
+            neg_log10_p: 0.0,
+            n: 0,
+            rows: 0,
+            columns: 0,
+            merged: 0,
+            min_expected: 0.0,
+        };
+        return Ok(vec![none; hist.n_samples()]);
+    }
+    hist.test_pair(0, 1, &TestOptions::default())
+        .into_diagnostic()
+        .wrap_err("cannot compute the chi-squared test")
+}
+
+/// The state of the analysis. Batches are added one by one, in the order of the meta list.
+struct Fold {
+    order: usize,
+    chi2: bool,
+    hist: Option<HistAccumulator>,
+    /// The number of samples per trace, set by the first batch.
+    samples: usize,
+    /// Max |t| per order after each batch, starting with 0.0 for no trace.
+    max_t: Vec<Vec<f64>>,
+    /// Max -log10(p) after each batch, starting with 0.0 for no trace.
+    max_chi2: Vec<f64>,
+    /// The number of traces after each batch, starting with 0.
+    num_traces: Vec<usize>,
+    t_values: Option<Array2<f64>>,
+    chi2_results: Option<Vec<TestResult>>,
+}
+
+impl Fold {
+    fn new(order: usize, chi2: bool) -> Self {
+        Fold {
+            order,
+            chi2,
+            hist: None,
+            samples: 0,
+            max_t: vec![vec![0.0]; order],
+            max_chi2: vec![0.0],
+            num_traces: vec![0],
+            t_values: None,
+            chi2_results: None,
+        }
+    }
+
+    /// Adds one batch and records the results so far.
+    fn add(&mut self, batch: Loaded) -> miette::Result<()> {
+        let Loaded {
+            metadata,
+            source,
+            traces,
+            labels,
+        } = batch;
+        let (num_traces, cur_samples_per_trace) = traces.dim();
+        if num_traces <= 1 {
+            return Err(miette!(
+                "the batch {} has {num_traces} traces; a t-test needs at least two traces",
+                metadata.display()
+            ));
+        }
+        if labels.len() != num_traces {
+            return Err(miette!(
+                "the batch {} has {num_traces} traces but {} labels",
+                metadata.display(),
+                labels.len()
+            ));
+        }
+        if self.samples == 0 {
+            // The first batch sets the number of samples per trace.
+            self.samples = cur_samples_per_trace;
+        }
+        let traces = if self.samples == cur_samples_per_trace {
+            traces
+        } else {
+            error!(
+                "Inconsistent number of samples per trace: expected {}, found {}",
+                self.samples, cur_samples_per_trace
+            );
+            if cur_samples_per_trace > self.samples {
+                warn!(
+                    "Using the first {} samples of the longer trace",
+                    self.samples
+                );
+                traces.slice(s![.., ..self.samples]).to_owned()
+            } else {
+                warn!(
+                    "padding the traces with {cur_samples_per_trace} samples with zeros up to {}",
+                    self.samples
+                );
+                let mut t = Array2::<f32>::zeros((num_traces, self.samples));
+                for (i, row) in traces.outer_iter().enumerate() {
+                    t.slice_mut(s![i, ..row.len()]).assign(&row);
+                }
+                t
+            }
+        };
+        self.num_traces
+            .push(self.num_traces.last().copied().unwrap_or(0) + num_traces);
+
+        let samples = self.samples;
+        let hist = self
+            .hist
+            .get_or_insert_with(|| HistAccumulator::new(samples, Binning::Exact));
+        hist.update(traces.view(), labels.view())
+            .into_diagnostic()
+            .wrap_err_with(|| format!("cannot add the batch {}", metadata.display()))?;
+        if hist.rejected() > 0 {
+            return Err(miette!(
+                "the traces from {} (batch {}) have {} values that are not integers or are \
+                 2^53 or larger. The statistics need integer-valued traces",
+                source.display(),
+                metadata.display(),
+                hist.rejected()
+            ));
+        }
+
+        let t_values = hist
+            .t_values(0, 1, self.order)
+            .into_diagnostic()
+            .wrap_err("cannot compute the t-values")?;
+        for (max_t, t_row) in self.max_t.iter_mut().zip(t_values.rows()) {
+            max_t.push(max_abs_finite(t_row.iter().copied()));
+        }
+        self.t_values = Some(t_values);
+        if self.chi2 {
+            let results = chi2_results(hist)?;
+            self.max_chi2
+                .push(scasim::stats::summarize(&results, CONVENTIONAL).max_neg_log10_p);
+            self.chi2_results = Some(results);
+        }
+        Ok(())
+    }
 }
 
 fn main() -> miette::Result<()> {
@@ -320,16 +497,7 @@ fn main() -> miette::Result<()> {
         .into_diagnostic()
         .wrap_err("the order is too large")?;
 
-    let mut samples_per_trace = 0;
-    let mut max_t_values = vec![Vec::<f64>::new(); order];
-    let mut num_traces_so_far = vec![];
-    // Initial max |t| is 0.0 for each order corresponding to 0 traces
-    max_t_values.iter_mut().for_each(|v| {
-        v.push(0.0);
-    });
-    num_traces_so_far.push(0);
-
-    let mut maybe_ttacc: Option<ttest::Ttest> = None;
+    let mut fold = Fold::new(order, args.chi2);
 
     // `traces.npz` holds the traces of the default selection (all signals). A run with rules
     // computes other traces. It must not reuse the file, and it must not overwrite it, because
@@ -344,87 +512,28 @@ fn main() -> miette::Result<()> {
             .wrap_err("cannot set the number of threads")?;
     }
 
-    println!(
-        "Using {} threads for parallel processing",
-        rayon::current_num_threads()
-    );
+    let threads = rayon::current_num_threads();
+    println!("Using {threads} threads for parallel processing");
 
-    let batches: Vec<(PathBuf, Array2<f32>, Array1<u16>)> = filenames
-        .into_par_iter()
-        .map(|metadata_path| {
-            let (traces, labels) =
-                batch_data(&metadata_path, args.use_existing, cache_allowed, &selection)?;
-            Ok((metadata_path, traces, labels))
-        })
-        .collect::<miette::Result<_>>()?;
-
-    let mut total_collected_traces: usize = 0;
-    let mut last_t_values: Option<Array2<f64>> = None;
-    // must be done sequentially
-    for (metadata_path, traces_array, labels_array) in batches {
-        let (num_traces, cur_samples_per_trace) = traces_array.dim();
-        total_collected_traces += num_traces;
-        if num_traces <= 1 {
-            return Err(miette!(
-                "the batch {} has {num_traces} traces; a t-test needs at least two traces",
-                metadata_path.display()
-            ));
+    // Load the batches in windows of one batch per thread, in parallel. Fold each window in the
+    // order of the meta list, then drop it. At most one window of traces is in memory. The
+    // histograms hold exact counts, so the result does not depend on the window size.
+    for window in filenames.chunks(threads) {
+        let loaded: Vec<Loaded> = window
+            .par_iter()
+            .map(|metadata_path| {
+                batch_data(metadata_path, args.use_existing, cache_allowed, &selection)
+            })
+            .collect::<miette::Result<_>>()?;
+        for batch in loaded {
+            fold.add(batch)?;
         }
-        if labels_array.len() != num_traces {
-            return Err(miette!(
-                "the batch {} has {num_traces} traces but {} labels",
-                metadata_path.display(),
-                labels_array.len()
-            ));
-        }
-        let traces_array = if samples_per_trace == 0 {
-            // Initialize samples_per_trace with the length of the first trace
-            samples_per_trace = cur_samples_per_trace;
-            traces_array
-        } else if samples_per_trace == cur_samples_per_trace {
-            traces_array
-        } else {
-            error!(
-                "Inconsistent number of samples per trace: expected {}, found {}",
-                samples_per_trace, cur_samples_per_trace
-            );
-            if cur_samples_per_trace > samples_per_trace {
-                warn!(
-                    "Using the first {} samples of the longer trace",
-                    samples_per_trace
-                );
-                traces_array.slice(s![.., ..samples_per_trace]).to_owned()
-            } else {
-                error!(
-                    "skipping trace with {} samples as expected {}",
-                    cur_samples_per_trace, samples_per_trace
-                );
-                // create a larger array with zeros
-                let mut t = Array2::<f32>::zeros((num_traces, samples_per_trace));
-                // fill in each row with the available samples
-                for (i, row) in traces_array.outer_iter().enumerate() {
-                    t.slice_mut(s![i, ..row.len()]).assign(&row);
-                }
-                t
-            }
-        };
-        num_traces_so_far.push(
-            num_traces_so_far
-                .last()
-                .map_or(num_traces, |&last| last + num_traces),
-        );
-
-        let ttacc = maybe_ttacc.get_or_insert_with(|| ttest::Ttest::new(samples_per_trace, order));
-        // Update the ttest accumulator with the current traces and labels
-        ttacc.update(traces_array.view(), labels_array.view());
-
-        let t_values = ttacc.get_ttest();
-        for (max_t, t_row) in max_t_values.iter_mut().zip(t_values.rows()) {
-            max_t.push(max_abs_finite(t_row.iter().copied()));
-        }
-        last_t_values = Some(t_values);
     }
-    let t_values = last_t_values.ok_or_else(|| miette!("there is no batch to analyze"))?;
+    let total_collected_traces = fold.num_traces.last().copied().unwrap_or(0);
+    let t_values = fold
+        .t_values
+        .take()
+        .ok_or_else(|| miette!("there is no batch to analyze"))?;
     if t_values.iter().any(|t| !t.is_finite()) {
         warn!(
             "some t-values are not finite (for example, a sample is constant or a class has too \
@@ -433,6 +542,37 @@ fn main() -> miette::Result<()> {
     }
 
     log::info!("Total number of traces: {}", total_collected_traces);
+
+    // The thresholds of the summary and of the chi-squared plots.
+    let samples = fold.samples;
+    let t_family = family_size(1, samples as u64, order as u64)
+        .ok_or_else(|| miette!("the number of t-tests does not fit in 64 bits"))?;
+    let chi2_thresholds = [CONVENTIONAL, bonferroni(ALPHA, samples as u64)];
+    let chi2_report = fold
+        .chi2_results
+        .as_deref()
+        .map(|results| summary::chi2_report(results, chi2_thresholds));
+    let memory_bytes = fold.hist.as_ref().map_or(0, HistAccumulator::memory_bytes);
+    info!(
+        "{}",
+        summary::render(&summary::SummaryInput {
+            t_values: t_values.view(),
+            conventional: T_THRESHOLD,
+            alpha: ALPHA,
+            bonferroni: t_bonferroni(ALPHA, t_family),
+            family: t_family,
+            chi2: chi2_report,
+            memory_bytes,
+        })
+    );
+    if let Some(c) = &chi2_report
+        && c.summary.failed > 0
+    {
+        warn!(
+            "{} chi-squared p-values failed to converge. They are not in the maxima and counts",
+            c.summary.failed
+        );
+    }
 
     let output_dir = PathBuf::from(&args.ttest_output_dir);
     if !output_dir.exists() {
@@ -457,26 +597,138 @@ fn main() -> miette::Result<()> {
         .wrap_err("cannot write the t-values")?;
     info!("Saved t_values to {}", npz_path.display());
 
-    if args.plot {
-        let t_threshold = Some(4.5);
+    if let Some(results) = &fold.chi2_results {
+        write_chi2_npz(&output_dir.join("chi2.npz"), results)?;
+    }
 
+    if args.plot {
         plot_t_traces(
             t_values.view(),
-            t_threshold,
+            Some(T_THRESHOLD),
             false, // abs_values
             &output_dir,
             args.show_plots,
         )?;
 
         plot_max_t_values(
-            &max_t_values,
-            &num_traces_so_far,
-            t_threshold,
+            &fold.max_t,
+            &fold.num_traces,
+            Some(T_THRESHOLD),
             &output_dir,
             args.show_plots,
         )?;
+
+        if let Some(results) = &fold.chi2_results {
+            plot_chi2(
+                results,
+                &fold.max_chi2,
+                &fold.num_traces,
+                chi2_thresholds[1],
+                &output_dir,
+                args.show_plots,
+            )?;
+        }
     }
 
+    Ok(())
+}
+
+/// Writes the chi-squared results of all samples to a compressed `.npz` file.
+fn write_chi2_npz(path: &Path, results: &[TestResult]) -> miette::Result<()> {
+    info!("Saving chi-squared results to {}", path.display());
+    let column = |f: fn(&TestResult) -> f64| Array1::from_iter(results.iter().map(f));
+    let mut npz = NpzWriter::new_compressed(
+        File::create(path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("cannot create {}", path.display()))?,
+    );
+    let add = |name: &str, result: Result<(), _>| {
+        result
+            .into_diagnostic()
+            .wrap_err_with(|| format!("cannot write {name} to {}", path.display()))
+    };
+    add(
+        "neg_log10_p",
+        npz.add_array("neg_log10_p", &column(|r| r.neg_log10_p)),
+    )?;
+    add(
+        "statistic",
+        npz.add_array("statistic", &column(|r| r.statistic)),
+    )?;
+    add(
+        "dof",
+        npz.add_array("dof", &Array1::from_iter(results.iter().map(|r| r.dof))),
+    )?;
+    add(
+        "columns",
+        npz.add_array(
+            "columns",
+            &Array1::from_iter(results.iter().map(|r| r.columns)),
+        ),
+    )?;
+    add(
+        "merged",
+        npz.add_array(
+            "merged",
+            &Array1::from_iter(results.iter().map(|r| r.merged)),
+        ),
+    )?;
+    add(
+        "min_expected",
+        npz.add_array("min_expected", &column(|r| r.min_expected)),
+    )?;
+    add(
+        "n",
+        npz.add_array("n", &Array1::from_iter(results.iter().map(|r| r.n))),
+    )?;
+    npz.finish()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("cannot write {}", path.display()))?;
+    Ok(())
+}
+
+/// Plots -log10(p) per sample (`chi2.*`) and its maximum versus the number of traces
+/// (`max_chi2.*`).
+fn plot_chi2(
+    results: &[TestResult],
+    max_chi2: &[f64],
+    num_traces: &[usize],
+    bonferroni_threshold: f64,
+    output_dir: &Path,
+    show: bool,
+) -> miette::Result<()> {
+    let thresholds = vec![
+        Threshold::new(CONVENTIONAL, "5"),
+        Threshold::new(bonferroni_threshold, "Bonferroni"),
+    ];
+    let per_sample: Vec<f64> = results.iter().map(|r| r.neg_log10_p).collect();
+    let opts = LineOptions {
+        y_label: "-log10(p)".into(),
+        thresholds: thresholds.clone(),
+        symmetric: false,
+        ..LineOptions::t_values()
+    };
+    plot_series(
+        "chi2",
+        &[Series::indexed("chi2", &per_sample)],
+        &opts,
+        output_dir,
+        show,
+    )?;
+    let x: Vec<f64> = num_traces.iter().map(|&n| n as f64).collect();
+    let opts = LineOptions {
+        y_label: "max(-log10(p))".into(),
+        thresholds,
+        symmetric: false,
+        ..LineOptions::max_t()
+    };
+    plot_series(
+        "max_chi2",
+        &[Series::with_x("max chi2", &x, max_chi2)],
+        &opts,
+        output_dir,
+        show,
+    )?;
     Ok(())
 }
 

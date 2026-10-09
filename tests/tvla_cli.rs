@@ -7,6 +7,7 @@ mod common;
 use common::*;
 use ndarray::{Array1, Array2};
 use ndarray_npz::{NpzReader, NpzWriter};
+use scasim::stats::{Binning, HistAccumulator, TestOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, SystemTime};
@@ -129,6 +130,18 @@ impl Batch {
         }
         npz.finish().unwrap();
         set_modified(&self.npz(), time.unwrap_or_else(|| hours_ago(2)));
+    }
+
+    /// Writes a fresh `traces.npz` with these traces and labels.
+    fn write_cache_data(&self, traces: &Array2<f32>, labels: &[u16]) {
+        let mut npz = NpzWriter::new(std::fs::File::create(self.npz()).unwrap());
+        for (i, row) in traces.outer_iter().enumerate() {
+            npz.add_array(format!("trace_{i}"), &row).unwrap();
+        }
+        npz.add_array("labels", &Array1::from_vec(labels.to_vec()))
+            .unwrap();
+        npz.finish().unwrap();
+        set_modified(&self.npz(), SystemTime::now());
     }
 
     /// The traces and labels in `traces.npz`.
@@ -685,4 +698,249 @@ fn plots_of_traces_without_any_toggle_do_not_panic() {
         assert!(output.status.success(), "{stderr}");
         assert_plot_files(&out, 2);
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Chi-squared output, streaming windows, and integer traces
+// ---------------------------------------------------------------------------------------------
+
+/// Integer traces with a leak: `traces` samples with `n` rows each. The labels alternate. Sample 2
+/// has a different spread in class 1 (a leak that the mean does not show). `seed` changes the
+/// values.
+fn leaky_traces(n: usize, samples: usize, seed: u64) -> (Array2<f32>, Vec<u16>) {
+    let mut state = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as u32
+    };
+    let labels: Vec<u16> = (0..n).map(|i| (i % 2) as u16).collect();
+    let traces = Array2::from_shape_fn((n, samples), |(i, j)| {
+        let base = (next() % 8 + next() % 8) as f32;
+        if j == 2 && labels[i] == 1 {
+            base * 2.0
+        } else {
+            base
+        }
+    });
+    (traces, labels)
+}
+
+fn read_f64(path: &Path, name: &str) -> Array2<f64> {
+    NpzReader::new(std::fs::File::open(path).unwrap())
+        .unwrap()
+        .by_name(name)
+        .unwrap()
+}
+
+fn bits(a: &Array2<f64>) -> Vec<u64> {
+    a.iter().map(|v| v.to_bits()).collect()
+}
+
+#[test]
+fn chi2_npz_equals_a_direct_histogram_computation() {
+    let batch = Batch::new(TOGGLES, None);
+    let (traces, labels) = leaky_traces(300, 5, 1);
+    batch.write_cache_data(&traces, &labels);
+    batch.run_order("2", &[]);
+
+    let mut hist = HistAccumulator::new(5, Binning::Exact);
+    hist.update(traces.view(), Array1::from_vec(labels).view())
+        .unwrap();
+    let want = hist.test_pair(0, 1, &TestOptions::default()).unwrap();
+
+    let file = batch.dir.path().join("out/chi2.npz");
+    let mut npz = NpzReader::new(std::fs::File::open(file).unwrap()).unwrap();
+    let f64s = |npz: &mut NpzReader<std::fs::File>, name: &str| -> Vec<f64> {
+        let a: Array1<f64> = npz.by_name(name).unwrap();
+        a.to_vec()
+    };
+    let u32s = |npz: &mut NpzReader<std::fs::File>, name: &str| -> Vec<u32> {
+        let a: Array1<u32> = npz.by_name(name).unwrap();
+        a.to_vec()
+    };
+    let got_p = f64s(&mut npz, "neg_log10_p");
+    let got_s = f64s(&mut npz, "statistic");
+    let got_min = f64s(&mut npz, "min_expected");
+    let got_dof = u32s(&mut npz, "dof");
+    let got_columns = u32s(&mut npz, "columns");
+    let got_merged = u32s(&mut npz, "merged");
+    let got_n: Array1<u64> = npz.by_name("n").unwrap();
+    assert_eq!(got_p.len(), 5);
+    for (i, w) in want.iter().enumerate() {
+        assert_eq!(got_p[i].to_bits(), w.neg_log10_p.to_bits());
+        assert_eq!(got_s[i].to_bits(), w.statistic.to_bits());
+        assert_eq!(got_min[i].to_bits(), w.min_expected.to_bits());
+        assert_eq!(got_dof[i], w.dof);
+        assert_eq!(got_columns[i], w.columns);
+        assert_eq!(got_merged[i], w.merged);
+        assert_eq!(got_n[i], w.n);
+    }
+    // The planted leak is in sample 2.
+    assert!(got_p[2] > 5.0, "{got_p:?}");
+}
+
+#[test]
+fn chi2_false_writes_no_chi2_files() {
+    let batch = Batch::new(TOGGLES, None);
+    let (output, out) = run_with_plots(&batch, "1", &["--chi2=false"]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert!(out.join("t_values.npz").exists());
+    assert!(out.join("max_t_values.html").exists());
+    let names: Vec<String> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.iter().all(|n| !n.contains("chi2")),
+        "unexpected files: {names:?}"
+    );
+    assert!(
+        !text(&output.stderr).contains("chi2"),
+        "{}",
+        text(&output.stderr)
+    );
+}
+
+#[test]
+fn chi2_is_on_by_default_and_writes_data_and_plots() {
+    let batch = Batch::new(TOGGLES, None);
+    let (output, out) = run_with_plots(&batch, "1", &[]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    for stem in ["chi2", "max_chi2"] {
+        for ext in ["html", "svg", "json"] {
+            let path = out.join(format!("{stem}.{ext}"));
+            assert!(std::fs::metadata(&path).unwrap().len() > 0, "{path:?}");
+        }
+    }
+    assert!(out.join("chi2.npz").exists());
+    // With `--plot=false` the data file is still written, and the plots are not.
+    batch.run(&[]);
+    let out = batch.dir.path().join("out");
+    assert!(out.join("chi2.npz").exists());
+    assert!(!out.join("chi2.html").exists());
+}
+
+/// Three cached batches with different sizes, and the path of their meta list.
+fn three_batches() -> (Vec<Batch>, PathBuf, tempfile::TempDir) {
+    let batches: Vec<Batch> = [(60, 11), (40, 12), (50, 13)]
+        .iter()
+        .map(|&(n, seed)| {
+            let batch = Batch::new(TOGGLES, None);
+            let (traces, labels) = leaky_traces(n, 5, seed);
+            batch.write_cache_data(&traces, &labels);
+            batch
+        })
+        .collect();
+    let list_dir = tempfile::tempdir().unwrap();
+    let list = list_dir.path().join("meta.list");
+    let lines: Vec<String> = batches
+        .iter()
+        .map(|b| b.meta().to_string_lossy().into_owned())
+        .collect();
+    std::fs::write(&list, lines.join("\n")).unwrap();
+    (batches, list, list_dir)
+}
+
+fn run_list(list: &Path, out: &Path, threads: &str) {
+    let output = Command::new(env!("CARGO_BIN_EXE_tvla"))
+        .env_remove("RUST_LOG")
+        .arg("--meta-list")
+        .arg(list)
+        .arg("--ttest-output-dir")
+        .arg(out)
+        .args(["--plot=false", "-d", "3", "--num-threads", threads])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+}
+
+#[test]
+fn the_window_size_does_not_change_the_results_bit_for_bit() {
+    let (_batches, list, _keep) = three_batches();
+    let out = tempfile::tempdir().unwrap();
+    let mut results = Vec::new();
+    // 1 thread: windows of one batch. 2 threads: a window of two, then one. 4 threads: one window.
+    for threads in ["1", "2", "4"] {
+        let dir = out.path().join(threads);
+        run_list(&list, &dir, threads);
+        results.push((
+            bits(&read_f64(&dir.join("t_values.npz"), "t_values")),
+            bits(&read_f64_1d(&dir.join("chi2.npz"), "neg_log10_p")),
+            bits(&read_f64_1d(&dir.join("chi2.npz"), "statistic")),
+        ));
+    }
+    assert!(results[0].0.iter().any(|&b| f64::from_bits(b).abs() > 1.0));
+    assert_eq!(results[0], results[1]);
+    assert_eq!(results[0], results[2]);
+}
+
+fn read_f64_1d(path: &Path, name: &str) -> Array2<f64> {
+    let a: Array1<f64> = NpzReader::new(std::fs::File::open(path).unwrap())
+        .unwrap()
+        .by_name(name)
+        .unwrap();
+    a.insert_axis(ndarray::Axis(0))
+}
+
+#[test]
+fn several_batches_give_the_same_bits_as_one_batch_with_all_traces() {
+    let (_batches, list, _keep) = three_batches();
+    let out = tempfile::tempdir().unwrap();
+    run_list(&list, &out.path().join("many"), "2");
+
+    let parts = [(60, 11), (40, 12), (50, 13)].map(|(n, seed)| leaky_traces(n, 5, seed));
+    let views: Vec<_> = parts.iter().map(|(t, _)| t.view()).collect();
+    let all = ndarray::concatenate(ndarray::Axis(0), &views).unwrap();
+    let labels: Vec<u16> = parts.iter().flat_map(|(_, l)| l.clone()).collect();
+    let one = Batch::new(TOGGLES, None);
+    one.write_cache_data(&all, &labels);
+    let output = one.run_order("3", &[]);
+    assert!(output.status.success());
+
+    let many = read_f64(&out.path().join("many/t_values.npz"), "t_values");
+    let single = read_f64(&one.dir.path().join("out/t_values.npz"), "t_values");
+    assert_eq!(bits(&many), bits(&single));
+    let many = read_f64_1d(&out.path().join("many/chi2.npz"), "neg_log10_p");
+    let single = read_f64_1d(&one.dir.path().join("out/chi2.npz"), "neg_log10_p");
+    assert_eq!(bits(&many), bits(&single));
+}
+
+#[test]
+fn traces_that_are_not_integers_are_an_error_that_names_the_file() {
+    let batch = Batch::new(TOGGLES, None);
+    let mut traces = cached_traces();
+    traces[[1, 0]] = 30.5;
+    batch.write_cache_data(&traces, &LABELS);
+    let output = batch.run_any(&[]);
+    assert_fails_with(&output, &["traces.npz", "integer"]);
+    assert!(!batch.dir.path().join("out/t_values.npz").exists());
+}
+
+#[test]
+fn the_summary_reports_both_tests_and_the_memory() {
+    let batch = Batch::new(TOGGLES, None);
+    let (traces, labels) = leaky_traces(300, 5, 1);
+    batch.write_cache_data(&traces, &labels);
+    let output = batch.run_order("2", &[]);
+    let stderr = text(&output.stderr);
+    for part in [
+        "d=1: max |t|",
+        "d=2: max |t|",
+        "above 4.5",
+        "Bonferroni",
+        "m = 10",
+        "chi2: max -log10(p)",
+        "min expected count",
+        "memory",
+    ] {
+        assert!(stderr.contains(part), "missing {part:?} in:\n{stderr}");
+    }
+    let output = batch.run_order("2", &["--chi2=false"]);
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("d=1: max |t|"), "{stderr}");
+    assert!(!stderr.contains("chi2"), "{stderr}");
 }
