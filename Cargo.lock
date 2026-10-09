@@ -1705,6 +1705,7 @@ dependencies = [
  "rayon",
  "regex",
  "rustc-hash",
+ "scasim",
  "serde",
  "serde_json",
  "statrs",

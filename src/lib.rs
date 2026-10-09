@@ -6,3 +6,6 @@ pub mod power;
 pub mod scopes;
 pub mod shuffle;
 pub mod stats;
+
+#[cfg(feature = "synth")]
+pub mod synth;

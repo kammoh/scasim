@@ -4,16 +4,16 @@
 use ndarray::Array1;
 
 /// A SplitMix64 generator. It is small, fast, and its output is the same on every platform.
-struct SplitMix64(u64);
+pub(crate) struct SplitMix64(pub(crate) u64);
 
 impl SplitMix64 {
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         mix(self.0)
     }
 
     /// A number in `0..n` without bias (Lemire's method). `n` must be greater than 0.
-    fn below(&mut self, n: u64) -> u64 {
+    pub(crate) fn below(&mut self, n: u64) -> u64 {
         let product = |x: u64| u128::from(x) * u128::from(n);
         let mut m = product(self.next());
         if (m as u64) < n {
@@ -28,7 +28,7 @@ impl SplitMix64 {
 }
 
 /// The finalizer of SplitMix64.
-fn mix(mut z: u64) -> u64 {
+pub(crate) fn mix(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
