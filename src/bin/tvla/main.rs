@@ -4,7 +4,10 @@ use log::*;
 use miette::{IntoDiagnostic, WrapErr, miette};
 use ndarray::{Array1, Array2};
 use ndarray_npz::NpzWriter;
-use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+    IntoParallelRefMutIterator, ParallelIterator,
+};
 use scasim::batch::{
     BatchDiagnostics, EdgeReport, EdgeSampling, LengthPolicy, Sampling, compute_batch,
     read_batch_meta, read_trace_cache, write_trace_cache,
@@ -14,11 +17,13 @@ use scasim::hierarchy::{HierarchyIndex, Selection};
 use scasim::plot::*;
 use scasim::power::edges::EdgeKind;
 use scasim::power::{PowerPlan, hierarchy_index};
+use scasim::scopes::{group_by_scope, scope_plan};
 use scasim::stats::threshold::{CONVENTIONAL, bonferroni, family_size, t_bonferroni};
 use scasim::stats::{HistAccumulator, TestResult};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+mod channels;
 mod summary;
 
 /// The family-wise error level of the Bonferroni thresholds in the summary and the plots.
@@ -162,6 +167,25 @@ struct Args {
         requires = "clock"
     )]
     offset: i64,
+    /// Rank the leakage by scope. Make one channel for each scope that is exactly --depth
+    /// levels below SCOPE and holds selected signals, and one channel named SCOPE for the
+    /// signals directly in SCOPE. A signal in a deeper scope belongs to its ancestor at that
+    /// depth. A signal with several names (aliases) belongs to the channel of its name with
+    /// the deepest scope in SCOPE (the smallest name if several are equally deep). The
+    /// selection rules apply first. The usual outputs stay for the whole selection. Also
+    /// writes `channels.tsv` (the ranking by max |t|), `channels.txt`, `t_values_channels.npz`,
+    /// and with --chi2 `chi2_channels.npz`. Plots only the best channel, into `top_channel/`.
+    /// Turns `traces.npz` off.
+    #[arg(long = "per-scope", value_name = "SCOPE")]
+    per_scope: Option<String>,
+    /// The number of scope levels below --per-scope SCOPE.
+    #[arg(
+        long,
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u64).range(1..),
+        requires = "per_scope"
+    )]
+    depth: u64,
     /// What to do when the traces have different lengths. `pad`: pad shorter traces with zeros.
     /// A later batch is padded or cut to the length of the first batch. `truncate`: cut traces to
     /// the shortest trace of the batch, and a longer batch to the length of the first batch. A
@@ -283,6 +307,25 @@ struct BatchSettings<'a> {
     use_existing: bool,
     /// False if `traces.npz` must be neither read nor written.
     cache_allowed: bool,
+    /// The scope and the depth of the per-scope channels.
+    per_scope: Option<(String, usize)>,
+}
+
+/// The traces of one per-scope channel in one batch.
+struct ScopeTraces {
+    name: String,
+    handles: usize,
+    traces: Array2<f32>,
+}
+
+/// One batch: the traces of the whole selection, and the per-scope channels (if asked).
+struct BatchResult {
+    total: Loaded,
+    scopes: Vec<ScopeTraces>,
+    edges: Option<EdgeReport>,
+    /// The number of aliased handles, and of selected handles outside the scope.
+    aliased: usize,
+    outside: usize,
 }
 
 /// True if `cache` can replace the computation for the batch. The cache must be newer than the
@@ -306,10 +349,7 @@ fn cache_is_fresh(cache: &Path, waveform: &Path, metadata: &Path) -> bool {
 
 /// Reads the traces and labels of one batch from the cache or computes them from the waveform.
 /// Also returns the edge report of the batch, if it was computed in edges mode.
-fn batch_data(
-    metadata_path: &Path,
-    settings: &BatchSettings<'_>,
-) -> miette::Result<(Loaded, Option<EdgeReport>)> {
+fn batch_data(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Result<BatchResult> {
     if !metadata_path.exists() {
         return Err(miette!(
             "the metadata file {} does not exist",
@@ -337,7 +377,13 @@ fn batch_data(
             npz_path.display()
         );
         let data = read_trace_cache(&npz_path)?;
-        return Ok((loaded(npz_path, data), None));
+        return Ok(BatchResult {
+            total: loaded(npz_path, data),
+            scopes: Vec::new(),
+            edges: None,
+            aliased: 0,
+            outside: 0,
+        });
     }
 
     println!(
@@ -345,15 +391,61 @@ fn batch_data(
         trace_file_path.display()
     );
     let start_time = std::time::Instant::now();
-    let plan = PowerPlan::toggles(settings.selection.clone());
+    let mut aliased = 0;
+    let mut outside = 0;
+    let mut handle_counts = Vec::new();
+    let plan = match &settings.per_scope {
+        None => PowerPlan::toggles(settings.selection.clone()),
+        Some((scope, depth)) => {
+            let index = hierarchy_index(&trace_file_path)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("cannot read {}", trace_file_path.display()))?;
+            let selected = settings
+                .selection
+                .resolve(&index)
+                .into_diagnostic()
+                .wrap_err("cannot apply the selection rules")?
+                .selected;
+            let groups = group_by_scope(&index, &selected, scope, *depth);
+            if groups.channels.is_empty() {
+                return Err(miette!(
+                    "{}: no selected signal is in the scope {scope}, so --per-scope makes no \
+                     channel",
+                    trace_file_path.display()
+                ));
+            }
+            aliased = groups.aliased;
+            outside = groups.outside;
+            handle_counts = groups.channels.iter().map(|c| c.paths.len()).collect();
+            info!(
+                "{}: {} channels below {scope} (depth {depth}); {} signals with several names \
+                 (aliases) are in the channel of their deepest name; {} selected signals are \
+                 not in the scope",
+                trace_file_path.display(),
+                groups.channels.len(),
+                groups.aliased,
+                groups.outside
+            );
+            scope_plan(settings.selection.clone(), &groups)
+        }
+    };
     let output = compute_batch(&meta, &plan, &settings.sampling, settings.policy)?;
     let diagnostics = output.diagnostics;
     let labels_array = output.labels;
-    let traces_array = output
+    let mut channel_traces = output.channels.into_iter();
+    let traces_array = channel_traces.next().expect("the plan has a channel");
+    let scopes: Vec<ScopeTraces> = plan
         .channels
-        .into_iter()
-        .next()
-        .expect("the plan has one channel");
+        .iter()
+        .skip(1)
+        .zip(handle_counts)
+        .zip(channel_traces)
+        .map(|((spec, handles), traces)| ScopeTraces {
+            name: spec.name.clone(),
+            handles,
+            traces,
+        })
+        .collect();
     let (num_traces, cur_samples_per_trace) = traces_array.dim();
     println!(
         "Computed {num_traces} traces with up to {cur_samples_per_trace} samples in {:.2}s",
@@ -380,10 +472,64 @@ fn batch_data(
             start_time.elapsed().as_secs_f32()
         );
     }
-    Ok((
-        loaded(trace_file_path, (traces_array, labels_array)),
-        diagnostics.edges,
-    ))
+    Ok(BatchResult {
+        total: loaded(trace_file_path, (traces_array, labels_array)),
+        scopes,
+        edges: diagnostics.edges,
+        aliased,
+        outside,
+    })
+}
+
+/// The fold of one per-scope channel.
+struct ScopeFold {
+    name: String,
+    handles: usize,
+    fold: Fold,
+}
+
+/// Adds the traces of the channels of one batch to their folds. The first batch makes the
+/// folds. The channels are the same in all batches. The folds run in parallel.
+fn add_to_scope_folds(
+    folds: &mut Vec<ScopeFold>,
+    total: &Loaded,
+    scopes: Vec<ScopeTraces>,
+    order: usize,
+    chi2: bool,
+    policy: LengthPolicy,
+) -> miette::Result<()> {
+    if folds.is_empty() {
+        folds.extend(scopes.iter().map(|s| {
+            let mut fold = Fold::without_curves(order, chi2);
+            fold.policy = policy;
+            ScopeFold {
+                name: s.name.clone(),
+                handles: s.handles,
+                fold,
+            }
+        }));
+    } else if folds
+        .iter()
+        .map(|f| &f.name)
+        .ne(scopes.iter().map(|s| &s.name))
+    {
+        return Err(miette!(
+            "the batch {} has other per-scope channels than the first batch. All batches must \
+             have the same scopes",
+            total.metadata.display()
+        ));
+    }
+    folds
+        .par_iter_mut()
+        .zip(scopes.into_par_iter())
+        .try_for_each(|(f, scope)| {
+            f.fold.add(Loaded {
+                metadata: total.metadata.clone(),
+                source: total.source.clone(),
+                traces: scope.traces,
+                labels: total.labels.clone(),
+            })
+        })
 }
 
 fn main() -> miette::Result<()> {
@@ -447,13 +593,20 @@ fn main() -> miette::Result<()> {
     // rules, with --clock, or with a policy other than `pad` computes other traces. It must not
     // reuse the file, and it must not overwrite it, because a later run without these options
     // would then read these traces.
-    let cache_allowed = rules.is_empty() && args.clock.is_none() && policy == LengthPolicy::Pad;
+    let cache_allowed = rules.is_empty()
+        && args.clock.is_none()
+        && args.per_scope.is_none()
+        && policy == LengthPolicy::Pad;
     let settings = BatchSettings {
         selection: &selection,
         sampling,
         policy,
         use_existing: args.use_existing,
         cache_allowed,
+        per_scope: args
+            .per_scope
+            .clone()
+            .map(|scope| (scope, args.depth as usize)),
     };
     if let Some(clock) = &args.clock {
         info!(
@@ -477,17 +630,36 @@ fn main() -> miette::Result<()> {
 
     // Load the batches in windows of one batch per thread, in parallel. Fold each window in the
     // order of the meta list, then drop it. At most one window of traces is in memory. The
-    // histograms hold exact counts, so the result does not depend on the window size.
-    for window in filenames.chunks(threads) {
-        let loaded: Vec<(Loaded, Option<EdgeReport>)> = window
+    // histograms hold exact counts, so the result does not depend on the window size. With
+    // per-scope channels, a batch holds the traces of all channels, so a window is one batch.
+    let window_size = if settings.per_scope.is_some() {
+        1
+    } else {
+        threads
+    };
+    let mut scope_folds: Vec<ScopeFold> = Vec::new();
+    let (mut aliased, mut outside) = (0, 0);
+    for window in filenames.chunks(window_size) {
+        let loaded: Vec<BatchResult> = window
             .par_iter()
             .map(|metadata_path| batch_data(metadata_path, &settings))
             .collect::<miette::Result<_>>()?;
-        for (batch, edges) in loaded {
-            if let Some(edges) = &edges {
+        for result in loaded {
+            if let Some(edges) = &result.edges {
                 edge_totals.add(edges);
             }
-            fold.add(batch)?;
+            (aliased, outside) = (result.aliased, result.outside);
+            if !result.scopes.is_empty() {
+                add_to_scope_folds(
+                    &mut scope_folds,
+                    &result.total,
+                    result.scopes,
+                    order,
+                    args.chi2,
+                    policy,
+                )?;
+            }
+            fold.add(result.total)?;
         }
     }
     let total_collected_traces = fold.num_traces.last().copied().unwrap_or(0);
@@ -513,7 +685,43 @@ fn main() -> miette::Result<()> {
         .chi2_results
         .as_deref()
         .map(|results| summary::chi2_report(results, chi2_thresholds));
-    let memory_bytes = fold.hist.as_ref().map_or(0, HistAccumulator::memory_bytes);
+    let total_memory = fold.hist.as_ref().map_or(0, HistAccumulator::memory_bytes);
+    let channels_memory: usize = scope_folds
+        .iter()
+        .filter_map(|f| f.fold.hist.as_ref())
+        .map(HistAccumulator::memory_bytes)
+        .sum();
+    let memory_bytes = total_memory + channels_memory;
+    for f in &mut scope_folds {
+        f.fold.finish()?;
+    }
+    let channel_t: Vec<Array2<f64>> = scope_folds
+        .iter_mut()
+        .map(|f| f.fold.t_values.take().expect("a batch was added"))
+        .collect();
+    let channel_results: Vec<channels::ChannelResult<'_>> = scope_folds
+        .iter()
+        .zip(&channel_t)
+        .map(|(f, t)| channels::ChannelResult {
+            name: &f.name,
+            handles: f.handles,
+            t_values: t,
+            chi2: f.fold.chi2_results.as_deref(),
+        })
+        .collect();
+    let ranking = channels::rank_channels(&channel_results);
+    let channels_summary = args
+        .per_scope
+        .as_ref()
+        .map(|scope| summary::ChannelsSummary {
+            scope: scope.clone(),
+            depth: args.depth as usize,
+            count: ranking.len(),
+            aliased,
+            outside,
+            memory_bytes: channels_memory,
+            top: ranking.iter().take(5).map(summary::describe_rank).collect(),
+        });
     info!(
         "{}",
         summary::render(&summary::SummaryInput {
@@ -525,6 +733,7 @@ fn main() -> miette::Result<()> {
             chi2: chi2_report,
             memory_bytes,
             edges: (edge_totals.batches > 0).then_some(edge_totals),
+            channels: channels_summary,
         })
     );
     if let Some(c) = &chi2_report
@@ -543,8 +752,27 @@ fn main() -> miette::Result<()> {
     if let Some(results) = &fold.chi2_results {
         write_chi2_npz(&output_dir.join("chi2.npz"), results)?;
     }
+    if !channel_results.is_empty() {
+        channels::write_channel_files(&output_dir, &channel_results)?;
+    }
 
     if args.plot {
+        if let Some(top) = ranking.first() {
+            let dir = output_dir.join("top_channel");
+            create_output_dir(&dir)?;
+            info!(
+                "Plotting the t-values of the best channel {} into {}",
+                top.name,
+                dir.display()
+            );
+            plot_t_traces(
+                channel_t[top.index].view(),
+                Some(T_THRESHOLD),
+                false,
+                &dir,
+                args.show_plots,
+            )?;
+        }
         plot_t_traces(
             t_values.view(),
             Some(T_THRESHOLD),

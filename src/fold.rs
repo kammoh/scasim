@@ -57,6 +57,8 @@ pub struct Fold {
     /// What to do with a batch whose traces have another length than those of the first batch.
     /// See [`LengthPolicy`].
     pub policy: LengthPolicy,
+    /// True if the fold computes the results and the curves after every batch.
+    curves: bool,
     pub hist: Option<HistAccumulator>,
     /// The number of samples per trace, set by the first batch.
     pub samples: usize,
@@ -76,6 +78,7 @@ impl Fold {
             order,
             chi2,
             policy: LengthPolicy::Pad,
+            curves: true,
             hist: None,
             samples: 0,
             max_t: vec![vec![0.0]; order],
@@ -86,7 +89,17 @@ impl Fold {
         }
     }
 
-    /// Adds one batch and records the results so far.
+    /// A fold that only collects the batches. It has no curves, so it does less work for each
+    /// batch. Call [`Fold::finish`] to get `t_values` and `chi2_results`.
+    pub fn without_curves(order: usize, chi2: bool) -> Self {
+        Fold {
+            curves: false,
+            ..Fold::new(order, chi2)
+        }
+    }
+
+    /// Adds one batch and records the results so far (the curves of the maxima, and the
+    /// t-values and chi-squared results of all batches so far).
     pub fn add(&mut self, batch: Loaded) -> miette::Result<()> {
         let Loaded {
             metadata,
@@ -179,18 +192,41 @@ impl Fold {
             ));
         }
 
+        if self.curves {
+            self.compute(true)?;
+        }
+        Ok(())
+    }
+
+    /// Computes the results of all batches added so far. Call it once after the last batch if
+    /// the fold was made with [`Fold::without_curves`]. A fold with curves has them already.
+    pub fn finish(&mut self) -> miette::Result<()> {
+        if !self.curves && self.hist.is_some() {
+            self.compute(false)?;
+        }
+        Ok(())
+    }
+
+    /// Computes the t-values and the chi-squared results from the accumulator. With `record`,
+    /// it also appends the maxima to the curves.
+    fn compute(&mut self, record: bool) -> miette::Result<()> {
+        let hist = self.hist.as_ref().expect("a batch was added");
         let t_values = hist
             .t_values(0, 1, self.order)
             .into_diagnostic()
             .wrap_err("cannot compute the t-values")?;
-        for (max_t, t_row) in self.max_t.iter_mut().zip(t_values.rows()) {
-            max_t.push(max_abs_finite(t_row.iter().copied()));
+        if record {
+            for (max_t, t_row) in self.max_t.iter_mut().zip(t_values.rows()) {
+                max_t.push(max_abs_finite(t_row.iter().copied()));
+            }
         }
         self.t_values = Some(t_values);
         if self.chi2 {
             let results = chi2_results(hist)?;
-            self.max_chi2
-                .push(crate::stats::summarize(&results, CONVENTIONAL).max_neg_log10_p);
+            if record {
+                self.max_chi2
+                    .push(crate::stats::summarize(&results, CONVENTIONAL).max_neg_log10_p);
+            }
             self.chi2_results = Some(results);
         }
         Ok(())
@@ -283,6 +319,33 @@ mod tests {
         let message = fold.add(loaded(5)).unwrap_err().to_string();
         assert!(message.contains("5 samples per trace"), "{message}");
         assert!(message.contains("first batch has 3"), "{message}");
+    }
+
+    #[test]
+    fn a_fold_without_curves_gives_the_same_final_results() {
+        let mut full = Fold::new(2, true);
+        let mut lean = Fold::without_curves(2, true);
+        for samples in [3, 3, 3] {
+            full.add(loaded(samples)).unwrap();
+            lean.add(loaded(samples)).unwrap();
+        }
+        assert!(lean.t_values.is_none() && lean.chi2_results.is_none());
+        lean.finish().unwrap();
+        let bits = |f: &Fold| -> Vec<u64> {
+            f.t_values
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|t| t.to_bits())
+                .collect()
+        };
+        assert_eq!(bits(&lean), bits(&full));
+        assert!(bits(&lean).len() > 1);
+        assert_eq!(lean.chi2_results, full.chi2_results);
+        assert_eq!(lean.num_traces, full.num_traces);
+        // Finishing a fold with curves, or an empty fold, does nothing.
+        full.finish().unwrap();
+        Fold::without_curves(1, false).finish().unwrap();
     }
 
     #[test]

@@ -265,6 +265,9 @@ pub enum Rule {
     Signal(String),
     /// Every signal inside an instance of this module (definition name).
     Module(String),
+    /// Every signal that has one of these exact paths. Code makes this rule, for example to
+    /// select the signals of a generated channel. It has no text form.
+    Paths(std::collections::HashSet<String>),
 }
 
 /// True if the `.`-join of some non-empty prefix of `names` equals `path`.
@@ -288,6 +291,12 @@ fn scope_names_start_with(names: &[String], path: &str) -> bool {
     false
 }
 
+/// The number of leading names of `names` whose `.`-join equals `scope`, or `None` if no leading
+/// part does. A scope name can contain a dot, so this is not simply the number of dots in `scope`.
+pub fn scope_prefix_len(names: &[String], scope: &str) -> Option<usize> {
+    (1..=names.len()).find(|&n| names[..n].join(".") == scope)
+}
+
 impl Rule {
     /// Parses `kind:value`, where kind is `scope`, `signal`, `regex`, or `module`.
     pub fn parse(spec: &str) -> Result<Rule, SelectionError> {
@@ -309,6 +318,7 @@ impl Rule {
             Rule::Scope(s) => scope_names_start_with(&p.scope_names, s),
             Rule::Signal(s) => p.path == *s,
             Rule::Module(m) => p.modules.iter().any(|c| c == m),
+            Rule::Paths(paths) => paths.contains(&p.path),
         }
     }
 }
@@ -356,6 +366,19 @@ impl Selection {
     /// Selects every signal.
     pub fn all() -> Self {
         Self::default()
+    }
+
+    /// Selects exactly the signals that have one of the given paths.
+    pub fn from_paths(paths: impl IntoIterator<Item = String>) -> Self {
+        let paths: std::collections::HashSet<String> = paths.into_iter().collect();
+        let text = format!("+paths:{} signals", paths.len());
+        Selection {
+            rules: vec![SelectionRule {
+                action: Action::Include,
+                rule: Rule::Paths(paths),
+                text,
+            }],
+        }
     }
 
     /// Parses rules of the form `+kind:value` (include) or `-kind:value` (exclude). The kinds

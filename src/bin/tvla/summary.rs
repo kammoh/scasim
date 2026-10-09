@@ -1,6 +1,7 @@
 //! The end-of-run summary of `tvla`: counts and maxima of the t-values and of the chi-squared
 //! results. The functions here only compute and format. They do not log.
 
+use crate::channels::RankRow;
 use ndarray::ArrayView2;
 use scasim::batch::EdgeReport;
 use scasim::stats::TestResult;
@@ -119,6 +120,38 @@ impl EdgeTotals {
     }
 }
 
+/// The per-scope channels (`--per-scope`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChannelsSummary {
+    pub scope: String,
+    pub depth: usize,
+    pub count: usize,
+    /// Signals with several names, and selected signals outside the scope.
+    pub aliased: usize,
+    pub outside: usize,
+    /// The bytes of the accumulators of the channels.
+    pub memory_bytes: usize,
+    /// The best channels, one text for each.
+    pub top: Vec<String>,
+}
+
+/// One line of the best channels: rank, name, and the largest |t|.
+pub fn describe_rank(row: &RankRow) -> String {
+    if row.infinite > 0 {
+        return format!(
+            "{}. {} {} infinite |t| (a class has no variance)",
+            row.rank, row.name, row.infinite
+        );
+    }
+    match row.best() {
+        Some((d, t, sample)) => format!(
+            "{}. {} |t| {t:.3} (d={d}, sample {sample})",
+            row.rank, row.name
+        ),
+        None => format!("{}. {} no finite t-value", row.rank, row.name),
+    }
+}
+
 /// The inputs of the summary text.
 pub struct SummaryInput<'a> {
     pub t_values: ArrayView2<'a, f64>,
@@ -131,6 +164,8 @@ pub struct SummaryInput<'a> {
     pub memory_bytes: usize,
     /// Present in edges mode.
     pub edges: Option<EdgeTotals>,
+    /// Present with `--per-scope`.
+    pub channels: Option<ChannelsSummary>,
 }
 
 fn mib(bytes: usize) -> f64 {
@@ -220,6 +255,19 @@ pub fn render(input: &SummaryInput<'_>) -> String {
             100.0 * e.outside_fraction()
         ));
     }
+    if let Some(c) = &input.channels {
+        lines.push(format!(
+            "  channels: {} below {} (depth {}); {} signals with several names; {} selected \
+             signals outside the scope; accumulators of the channels: {:.2} MiB",
+            c.count,
+            c.scope,
+            c.depth,
+            c.aliased,
+            c.outside,
+            mib(c.memory_bytes)
+        ));
+        lines.push(format!("  best channels by max |t|: {}", c.top.join("; ")));
+    }
     lines.push(format!(
         "  accumulator memory: {:.2} MiB",
         mib(input.memory_bytes)
@@ -271,6 +319,7 @@ mod tests {
             chi2: None,
             memory_bytes: 3 << 20,
             edges: None,
+            channels: None,
         });
         assert_eq!(text.matches("d=1: max |t| 1.000 at sample 0").count(), 1);
         assert_eq!(text.matches("d=2: max |t| 7.000 at sample 1").count(), 1);
@@ -316,6 +365,7 @@ mod tests {
             chi2: Some(c),
             memory_bytes: 0,
             edges: None,
+            channels: None,
         });
         assert!(text.contains("max -log10(p) 6.000 at sample 1 (dof 3, 2 bins merged)"));
         assert!(text.contains("1 p-values failed"));
@@ -341,12 +391,62 @@ mod tests {
             chi2: None,
             memory_bytes: 0,
             edges: Some(edges),
+            channels: None,
         });
         assert!(
             text.contains("20 bins in 2 batches; toggles: 90 inside the bins + 6 before"),
             "{text}"
         );
         assert!(text.contains("= 100 in total; 10.00% outside"), "{text}");
+    }
+
+    #[test]
+    fn the_summary_lists_the_best_channels() {
+        let row = |rank, name: &str, orders: Vec<(f64, usize)>| RankRow {
+            index: 0,
+            rank,
+            name: name.into(),
+            handles: 1,
+            orders,
+            infinite: 0,
+            chi2: None,
+        };
+        let top = vec![
+            describe_rank(&row(1, "tb.a", vec![(2.0, 1), (12.5, 4)])),
+            describe_rank(&row(2, "tb.b", vec![(f64::NAN, 0)])),
+            describe_rank(&RankRow {
+                infinite: 3,
+                ..row(3, "tb.c", vec![(1.0, 0)])
+            }),
+        ];
+        assert_eq!(top[2], "3. tb.c 3 infinite |t| (a class has no variance)");
+        assert_eq!(top[0], "1. tb.a |t| 12.500 (d=2, sample 4)");
+        assert_eq!(top[1], "2. tb.b no finite t-value");
+        let t = array![[1.0]];
+        let text = render(&SummaryInput {
+            t_values: t.view(),
+            conventional: 4.5,
+            alpha: 1e-5,
+            bonferroni: 4.4,
+            family: 1,
+            chi2: None,
+            memory_bytes: 0,
+            edges: None,
+            channels: Some(ChannelsSummary {
+                scope: "tb.dut".into(),
+                depth: 1,
+                count: 2,
+                aliased: 3,
+                outside: 4,
+                memory_bytes: 2 << 20,
+                top,
+            }),
+        });
+        assert!(text.contains("channels: 2 below tb.dut (depth 1); 3 signals with several names; 4 selected signals outside the scope; accumulators of the channels: 2.00 MiB"), "{text}");
+        assert!(
+            text.contains("best channels by max |t|: 1. tb.a |t| 12.500 (d=2, sample 4); 2. tb.b"),
+            "{text}"
+        );
     }
 
     #[test]

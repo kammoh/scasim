@@ -89,3 +89,26 @@ cargo run --release --bin tvla -- --meta-list path_to_meta_list \
 With `--clock` or with a policy other than `pad`, `traces.npz` is neither read nor written.
 
 `tvla` logs the number of clock edges, the statistics of the clock periods, and where the toggles are: inside the bins, before the first edge, and after the last edge. The three counts add up to all toggles of the selection. It warns if the segments start at different places in the clock period.
+
+## Ranking the leakage by scope
+
+To see which part of a design leaks, give a scope to `--per-scope`:
+
+```bash
+cargo run --release --bin tvla -- --meta-list path_to_meta_list \
+    --include scope:TOP.dut --clock TOP.dut.clk --per-scope TOP.dut --depth 1
+```
+
+`tvla` makes one channel for each scope exactly `--depth` levels below the scope (default 1) that holds selected signals. A signal in a deeper scope belongs to its ancestor at that depth. A channel with the name of the scope itself holds the signals directly in it. The selection rules apply first. All channels use the same sampling and the same segments, and `tvla` reads the waveform once.
+
+A signal with several names (aliases) belongs to one channel only: the channel of its name with the deepest scope in the given scope. If several names are equally deep, the smallest name decides. `tvla` reports the number of such signals. A selected signal with no name in the scope is in no channel.
+
+The outputs for the whole selection do not change. In `--ttest-output-dir`, `--per-scope` adds:
+
+- `channels.tsv`: one row for each channel, ranked by the largest |t| over all orders. A channel with an infinite |t| (a class has no variance, a deterministic leak) comes first. The columns are the rank, the channel, the number of signals, the number of samples with an infinite |t|, the largest finite |t| of each order with its sample, and, with `--chi2`, the largest -log10(p) with its sample;
+- `channels.txt`: the channel names, one per line;
+- `t_values_channels.npz`: the array `t_<i>` (shape `(d, samples)`) for the channel on line `i` of `channels.txt`, counted from 0;
+- `chi2_channels.npz`, with `--chi2`: the array `chi2_<i>` of -log10(p) for each sample;
+- the t-value plots of the best channel only, in `top_channel/`.
+
+With `--per-scope`, `traces.npz` is neither read nor written, and `tvla` reads one batch at a time. The accumulators need memory for every channel. The summary shows it.
