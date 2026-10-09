@@ -161,6 +161,8 @@ fn a_channel_that_selects_nothing_is_an_error() {
     ));
 }
 
+/// The memory guard refuses the run before `wellen` loads any signal. The test of the allocator
+/// in `tests/memory_guard.rs` shows that the load does not happen.
 #[test]
 fn the_memory_guard_fails_before_loading_signals() {
     let (_d, path) = temp_vcd(&small_fixture());
@@ -171,4 +173,49 @@ fn the_memory_guard_fails_before_loading_signals() {
         Err(PowerError::Memory { what, .. }) if what.starts_with("the result")
     ));
     assert_eq!(Totals::default().toggles, 0);
+
+    // One bin: the result needs 8 + 3 slots * 32 = 104 bytes, and it fits. The placement of the
+    // 6 time points needs 24 bytes. The largest signal needs at most 6 time points * 40 bytes
+    // (4 bytes for the time index of a change, and 36 bytes for the value of 70 bits): 240
+    // bytes. The sum, 368 bytes, does not fit.
+    let bins = Bins::new(vec![0], None).unwrap();
+    p.memory_limit = 110;
+    assert!(matches!(
+        activity_reference_binned(&path, &p, &bins),
+        Err(PowerError::Memory { what, needed: 368, limit: 110 })
+            if what.starts_with("the largest signal that wellen loads")
+                && what.ends_with("(3 signals, 6 time points)")
+    ));
+    p.memory_limit = 368;
+    assert!(activity_reference_binned(&path, &p, &bins).is_ok());
+    p.memory_limit = 367;
+    assert!(activity_reference_binned(&path, &p, &bins).is_err());
+}
+
+/// If the bounds of all signals together are more than the limit, the reference path loads the
+/// signals in batches, and the result does not change.
+#[test]
+fn signals_that_do_not_fit_together_load_in_batches() {
+    let fx = small_fixture();
+    let (_d, path) = temp_vcd(&fx);
+    let expected = expected_activity(&fx, &[("all", vec![0, 1, 2])], true, UnknownPolicy::Half);
+    let mut p = plan_all(true, UnknownPolicy::Half);
+    // The bounds of the three signals are 36, 42, and 240 bytes, and 318 bytes together. The
+    // result with the identity bins needs 352 bytes, and the placement 24 bytes.
+    for (limit, batches) in [
+        (352 + 24 + 318, "one batch"),
+        (352 + 24 + 240, "two batches"),
+    ] {
+        p.memory_limit = limit;
+        assert_eq!(
+            activity_reference(&path, &p).unwrap(),
+            expected,
+            "{batches}"
+        );
+    }
+    p.memory_limit = 352 + 24 + 239;
+    assert!(matches!(
+        activity_reference(&path, &p),
+        Err(PowerError::Memory { needed: 616, .. })
+    ));
 }

@@ -2,6 +2,8 @@
 //! `docs/superpowers/specs/2026-10-08-fast-power-design.md`.
 
 use crate::hierarchy::{HierarchyIndex, Selection, SelectionError};
+use itertools::Itertools;
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -100,8 +102,9 @@ impl Bins {
     /// (a section boundary) gives one bin. Fails if the time table decreases.
     pub fn identity(time_table: &[u64]) -> Result<Bins, PowerError> {
         check_time_table(time_table)?;
-        let mut starts = time_table.to_vec();
-        starts.dedup();
+        // The exact capacity: a copy of the whole time table would be larger if times repeat.
+        let mut starts = Vec::with_capacity(count_distinct(time_table));
+        starts.extend(time_table.iter().copied().dedup());
         Bins::new(starts, None)
     }
 
@@ -132,6 +135,36 @@ impl Bins {
     }
 }
 
+/// The number of distinct values in a list that does not decrease.
+pub(crate) fn count_distinct(sorted: &[u64]) -> usize {
+    match sorted.len() {
+        0 => 0,
+        _ => 1 + sorted.windows(2).filter(|w| w[0] != w[1]).count(),
+    }
+}
+
+/// The bins of a run, and the bytes that the run holds in memory from its start to its end (the
+/// result, and the bin starts if the run makes them). `given` are bins that the caller gives. If
+/// there are none, the bins are one per distinct time of the time table. The memory check comes
+/// before the allocation of those bins.
+pub(crate) fn run_bins<'a>(
+    plan: &PowerPlan,
+    time_table: &[u64],
+    given: Option<&'a Bins>,
+) -> Result<(Cow<'a, Bins>, u64), PowerError> {
+    check_time_table(time_table)?;
+    match given {
+        Some(bins) => {
+            let held = plan.check_run_memory(bins.len(), false)?;
+            Ok((Cow::Borrowed(bins), held))
+        }
+        None => {
+            let held = plan.check_run_memory(count_distinct(time_table), true)?;
+            Ok((Cow::Owned(Bins::identity(time_table)?), held))
+        }
+    }
+}
+
 /// Fails if a time table decreases. Equal neighbors are valid.
 pub(crate) fn check_time_table(time_table: &[u64]) -> Result<(), PowerError> {
     match time_table.windows(2).find(|w| w[0] > w[1]) {
@@ -158,6 +191,25 @@ pub struct PowerPlan {
     pub full_stats: bool,
     pub unknown: UnknownPolicy,
     /// Upper limit for the memory of the result and of the decode buffers, in bytes.
+    ///
+    /// Before each allocation that grows with the number of time points, bins, or channels, the
+    /// run adds up the memory that it holds at that point. It fails with
+    /// [`PowerError::Memory`] if the sum is more than the limit. The sum counts:
+    ///
+    /// - the result: the bin starts, and `bins + 2` slots per channel and statistic (the two
+    ///   extra slots are for the changes before the first bin and after the end);
+    /// - the starts of identity bins (a run with given bins does not make them);
+    /// - the placement of the time points of one section: 4 bytes for each time point;
+    /// - the decode buffers of one section: one set of slots per channel for each parallel part
+    ///   (at most `2 * threads` parts) in the fast path;
+    /// - the signals that `wellen` loads in the reference path. This is an upper bound. The
+    ///   reference path loads the signals in batches, and counts the signals of one batch.
+    ///
+    /// It does not count what the readers allocate before the run can check anything: the time
+    /// table of the file, the compressed data of a section and its decoded time table (the fork
+    /// of `fst-reader` does not tell the size before it reads), the hierarchy, the `wellen`
+    /// body, and the last values of the signals. It does not count the fixed size of the
+    /// structures either. An estimate that overflows counts as too large.
     pub memory_limit: u64,
 }
 
@@ -165,6 +217,8 @@ pub struct PowerPlan {
 pub(crate) struct ResolvedPlan {
     /// For every handle index, the indices of the channels that select it.
     pub handle_channels: Vec<Vec<usize>>,
+    /// The handle indices that at least one channel selects, in increasing order.
+    pub selected: Vec<usize>,
     pub info: RunInfo,
 }
 
@@ -214,75 +268,202 @@ impl PowerPlan {
             .filter_map(|p| p.path.split('.').next())
             .map(str::to_string)
             .collect();
+        let info = RunInfo {
+            selected_handles: selected.len(),
+            top_scopes: top_scopes.into_iter().collect(),
+            unmatched_rules,
+        };
         Ok(ResolvedPlan {
             handle_channels,
-            info: RunInfo {
-                selected_handles: selected.len(),
-                top_scopes: top_scopes.into_iter().collect(),
-                unmatched_rules,
-            },
+            selected,
+            info,
         })
     }
 
-    /// Bytes that one channel needs for one bin: 8 for the toggles, or 32 with full statistics.
-    fn bytes_per_channel_and_bin(&self) -> u64 {
-        if self.full_stats { 32 } else { 8 }
-    }
-
-    /// Bytes needed for the result with `bins` bins: 8 bytes per bin for the time, plus the
-    /// statistics of every channel.
+    /// Bytes needed for the result with `bins` bins: 8 bytes per bin for the time, plus
+    /// `bins + 2` slots for every channel (the bins, and the slots before the first bin and after
+    /// the end). A slot is 8 bytes for the toggles, or 32 bytes with full statistics. Returns
+    /// `u64::MAX` if the number does not fit in 64 bits.
     pub fn result_bytes(&self, bins: usize) -> u64 {
-        let per_bin = 8 + self.channels.len() as u64 * self.bytes_per_channel_and_bin();
-        (bins as u64).saturating_mul(per_bin)
+        estimate_result_bytes(self.channels.len(), self.full_stats, bins).unwrap_or(u64::MAX)
     }
 
-    /// Bytes needed for the decode buffers of a section that uses `section_bins` bins, with
+    /// Bytes needed for the decode buffers of a section that uses `section_bins` slots, with
     /// `threads` rayon threads. The fast path runs up to `2 * threads` parts at the same time.
-    /// Each part has its own buffers for all channels.
+    /// Each part has its own buffers for all channels. Returns `u64::MAX` if the number does not
+    /// fit in 64 bits.
     pub fn section_bytes(&self, section_bins: usize, threads: usize) -> u64 {
-        let parts = 2 * threads as u64;
-        parts
-            .saturating_mul(self.channels.len() as u64)
-            .saturating_mul(section_bins as u64)
-            .saturating_mul(self.bytes_per_channel_and_bin())
+        self.buffer_bytes(section_bins, threads.saturating_mul(2))
+            .unwrap_or(u64::MAX)
+    }
+
+    fn buffer_bytes(&self, slots: usize, parts: usize) -> Option<u64> {
+        estimate_buffer_bytes(self.channels.len(), self.full_stats, slots, parts)
     }
 
     /// Fails if the result for `bins` bins is larger than the memory limit.
     pub fn check_result_memory(&self, bins: usize) -> Result<(), PowerError> {
-        self.check(
-            self.result_bytes(bins),
-            format!("the result ({bins} bins, {} channels)", self.channels.len()),
-        )
+        self.check_run_memory(bins, false).map(drop)
     }
 
-    /// Fails if the decode buffers of a section that uses `section_bins` bins (with the slots
-    /// before the first bin and after the end) are larger than the memory limit.
+    /// Fails if the result for `bins` bins, and the bin starts if `own_starts`, are larger than
+    /// the memory limit. Returns the bytes that they need.
+    pub(crate) fn check_run_memory(
+        &self,
+        bins: usize,
+        own_starts: bool,
+    ) -> Result<u64, PowerError> {
+        let what = format!(
+            "the result{} ({bins} bins, {} channels)",
+            if own_starts {
+                " and the bin starts"
+            } else {
+                ""
+            },
+            self.channels.len()
+        );
+        let starts = if own_starts {
+            estimate_time_bytes(bins)
+        } else {
+            Some(0)
+        };
+        let terms = [
+            estimate_result_bytes(self.channels.len(), self.full_stats, bins),
+            starts,
+        ];
+        self.check_sum(&terms, what)
+    }
+
+    /// Fails if the decode buffers of a section that uses `section_bins` slots (with the slots
+    /// before the first bin and after the end) are larger than the memory limit. Counts the
+    /// buffers of `2 * threads` parts, and nothing else.
     pub fn check_section_memory(
         &self,
         section_bins: usize,
         threads: usize,
     ) -> Result<(), PowerError> {
-        self.check(
-            self.section_bytes(section_bins, threads),
-            format!(
-                "the decode buffers of one section ({section_bins} bins, {} channels, \
-                 {} parallel parts)",
-                self.channels.len(),
-                2 * threads
-            ),
+        let parts = threads.saturating_mul(2);
+        let terms = [self.buffer_bytes(section_bins, parts)];
+        self.check_sum(&terms, self.decode_what(section_bins, parts))
+            .map(drop)
+    }
+
+    /// Fails if the placement of a section with `time_points` time points, together with the
+    /// `held` bytes of the run, is larger than the memory limit. Call it before the placement.
+    pub(crate) fn check_placement_memory(
+        &self,
+        held: u64,
+        time_points: usize,
+    ) -> Result<(), PowerError> {
+        let terms = [Some(held), estimate_placement_bytes(time_points)];
+        let what = format!("the placement of one section ({time_points} time points)");
+        self.check_sum(&terms, what).map(drop)
+    }
+
+    /// Fails if the placement and the decode buffers of a section, together with the `held` bytes
+    /// of the run, are larger than the memory limit. The buffers have `slots` slots for each of
+    /// `parts` parts. Call it before the buffers.
+    pub(crate) fn check_decode_memory(
+        &self,
+        held: u64,
+        time_points: usize,
+        slots: usize,
+        parts: usize,
+    ) -> Result<(), PowerError> {
+        let terms = [
+            Some(held),
+            estimate_placement_bytes(time_points),
+            self.buffer_bytes(slots, parts),
+        ];
+        self.check_sum(&terms, self.decode_what(slots, parts))
+            .map(drop)
+    }
+
+    /// Fails if the placement of the time points and the largest signal that `wellen` loads
+    /// (`largest` bytes, `None` if the estimate overflows), together with the `held` bytes of the
+    /// run, are larger than the memory limit. Call it before the signals load. Returns the bytes
+    /// that are left for the signals of one batch.
+    pub(crate) fn check_load_memory(
+        &self,
+        held: u64,
+        signals: usize,
+        time_points: usize,
+        largest: Option<u64>,
+    ) -> Result<u64, PowerError> {
+        let placement = estimate_placement_bytes(time_points);
+        let terms = [Some(held), placement, largest];
+        let what = format!(
+            "the largest signal that wellen loads, with the result and the placement \
+             ({signals} signals, {time_points} time points)"
+        );
+        self.check_sum(&terms, what)?;
+        // The sum of the first two terms is at most the limit, because the whole sum is.
+        Ok(self.memory_limit - held - placement.unwrap_or(0))
+    }
+
+    fn decode_what(&self, slots: usize, parts: usize) -> String {
+        format!(
+            "the decode buffers of one section ({slots} slots, {} channels, {parts} parallel parts)",
+            self.channels.len(),
         )
     }
 
-    fn check(&self, needed: u64, what: String) -> Result<(), PowerError> {
-        if needed > self.memory_limit {
-            return Err(PowerError::Memory {
+    /// Fails if the sum of `terms` is more than the memory limit. A `None` term or a sum that
+    /// overflows is too large. Returns the sum.
+    fn check_sum(&self, terms: &[Option<u64>], what: String) -> Result<u64, PowerError> {
+        let sum = terms
+            .iter()
+            .try_fold(0u64, |sum, term| sum.checked_add((*term)?));
+        match sum {
+            Some(needed) if needed <= self.memory_limit => Ok(needed),
+            _ => Err(PowerError::Memory {
                 what,
-                needed,
+                needed: sum.unwrap_or(u64::MAX),
                 limit: self.memory_limit,
-            });
+            }),
         }
-        Ok(())
     }
+}
+
+/// Bytes of a list of `count` times (bin starts): 8 each. `None` if it overflows.
+fn estimate_time_bytes(count: usize) -> Option<u64> {
+    u64::try_from(count).ok()?.checked_mul(8)
+}
+
+/// Bytes that the placement of a section needs: one `u32` for each time point.
+fn estimate_placement_bytes(time_points: usize) -> Option<u64> {
+    u64::try_from(time_points).ok()?.checked_mul(4)
+}
+
+/// Bytes of one slot of one channel: 8 for the toggles, or 32 with full statistics.
+fn slot_bytes(full_stats: bool) -> u64 {
+    if full_stats { 32 } else { 8 }
+}
+
+/// Bytes of the result: the bin starts, and `bins + 2` slots for each of `channels` channels.
+/// `None` if it overflows.
+fn estimate_result_bytes(channels: usize, full_stats: bool, bins: usize) -> Option<u64> {
+    let slots = u64::try_from(bins).ok()?.checked_add(2)?;
+    let stats = u64::try_from(channels)
+        .ok()?
+        .checked_mul(slot_bytes(full_stats))?
+        .checked_mul(slots)?;
+    estimate_time_bytes(bins)?.checked_add(stats)
+}
+
+/// Bytes of the decode buffers: `slots` slots for each of `channels` channels, for each of `parts`
+/// parts. `None` if it overflows.
+fn estimate_buffer_bytes(
+    channels: usize,
+    full_stats: bool,
+    slots: usize,
+    parts: usize,
+) -> Option<u64> {
+    u64::try_from(parts)
+        .ok()?
+        .checked_mul(u64::try_from(channels).ok()?)?
+        .checked_mul(slot_bytes(full_stats))?
+        .checked_mul(u64::try_from(slots).ok()?)
 }
 
 /// Rise, fall, and Hamming-weight statistics per bin of one channel.
@@ -480,22 +661,71 @@ mod tests {
     #[test]
     fn memory_formulas() {
         let mut plan = PowerPlan::toggles(Selection::all());
-        // 8 bytes for the time and 8 bytes for the toggles of the one channel.
-        assert_eq!(plan.result_bytes(1000), 1000 * (8 + 8));
-        // 2 * 10 parts, 1 channel, 50 bins, 8 bytes.
+        // 8 bytes for the time of each bin, and 8 bytes for each of the 1000 + 2 slots of the one
+        // channel (the bins, the slot before the first bin, and the slot after the end).
+        assert_eq!(plan.result_bytes(1000), 1000 * 8 + 1002 * 8);
+        // 2 * 10 parts, 1 channel, 50 slots, 8 bytes.
         assert_eq!(plan.section_bytes(50, 10), 20 * 50 * 8);
         plan.full_stats = true;
         plan.channels.push(plan.channels[0].clone());
-        assert_eq!(plan.result_bytes(1000), 1000 * (8 + 2 * 32));
+        assert_eq!(plan.result_bytes(1000), 1000 * 8 + 2 * 1002 * 32);
         assert_eq!(plan.section_bytes(50, 10), 20 * 2 * 50 * 32);
+    }
+
+    #[test]
+    fn the_run_adds_up_what_it_holds() {
+        let mut plan = PowerPlan::toggles(Selection::all());
+        plan.memory_limit = 10_000;
+        // The result of 100 bins: 800 + 102 * 8 = 1616 bytes. Identity bins add 800 bytes.
+        assert_eq!(plan.check_run_memory(100, false).unwrap(), 1616);
+        assert_eq!(plan.check_run_memory(100, true).unwrap(), 2416);
+        // The placement needs 4 bytes for each time point: 1616 + 4 * 2000 = 9616 bytes.
+        assert!(plan.check_placement_memory(1616, 2000).is_ok());
+        let err = plan.check_placement_memory(1616, 2200).unwrap_err();
+        assert!(
+            matches!(&err, PowerError::Memory { what, needed: 10_416, limit: 10_000 } if what.starts_with("the placement")),
+            "{err}"
+        );
+        // Placement, and 3 parts with 10 slots of 8 bytes: 1616 + 400 + 240 = 2256 bytes.
+        assert!(plan.check_decode_memory(1616, 100, 10, 3).is_ok());
+        plan.memory_limit = 2255;
+        let err = plan.check_decode_memory(1616, 100, 10, 3).unwrap_err();
+        assert!(
+            matches!(&err, PowerError::Memory { what, needed: 2256, .. } if what.starts_with("the decode buffers")),
+            "{err}"
+        );
+        // The same buffers alone are 240 bytes.
+        assert!(plan.check_section_memory(10, 1).is_ok());
+        // The reference path: the placement (400 bytes) and the largest signal (5000 bytes) add up
+        // to 7016 bytes with the result. What is left is the budget of one batch.
+        plan.memory_limit = 7016;
+        assert_eq!(
+            plan.check_load_memory(1616, 5, 100, Some(5000)).unwrap(),
+            5000
+        );
+        plan.memory_limit = 9000;
+        assert_eq!(
+            plan.check_load_memory(1616, 5, 100, Some(5000)).unwrap(),
+            6984
+        );
+        plan.memory_limit = 7015;
+        let err = plan
+            .check_load_memory(1616, 5, 100, Some(5000))
+            .unwrap_err();
+        assert!(
+            matches!(&err, PowerError::Memory { what, needed: 7016, .. } if what.starts_with("the largest signal that wellen loads")),
+            "{err}"
+        );
+        assert!(plan.check_load_memory(1616, 5, 100, None).is_err());
     }
 
     #[test]
     fn memory_errors_name_what_was_too_large() {
         let mut plan = PowerPlan::toggles(Selection::all());
         plan.memory_limit = 1000;
-        assert!(plan.check_result_memory(62).is_ok());
-        let err = plan.check_result_memory(63).unwrap_err();
+        // 16 bytes for each bin, and 16 for the two extra slots.
+        assert!(plan.check_result_memory(61).is_ok());
+        let err = plan.check_result_memory(62).unwrap_err();
         assert!(
             matches!(&err, PowerError::Memory { what, needed: 1008, limit: 1000 } if what.starts_with("the result")),
             "{err}"
@@ -506,6 +736,56 @@ mod tests {
             matches!(&err, PowerError::Memory { what, .. } if what.starts_with("the decode buffers")),
             "{err}"
         );
+    }
+
+    #[test]
+    fn identity_bins_have_the_exact_capacity() {
+        let bins = Bins::identity(&[0, 10, 10, 20, 20, 20, 30]).unwrap();
+        assert_eq!(bins.starts.capacity(), 4);
+        assert_eq!(count_distinct(&[]), 0);
+        assert_eq!(count_distinct(&[5]), 1);
+        assert_eq!(count_distinct(&[5, 5, 5]), 1);
+        assert_eq!(count_distinct(&[5, 6, 6, 9]), 3);
+    }
+
+    #[test]
+    fn the_estimate_functions_report_an_overflow_as_none() {
+        assert_eq!(estimate_result_bytes(2, true, 10), Some(80 + 2 * 12 * 32));
+        assert_eq!(estimate_result_bytes(usize::MAX / 2, true, 1000), None);
+        assert_eq!(estimate_result_bytes(1, false, usize::MAX), None);
+        assert_eq!(estimate_result_bytes(1, false, usize::MAX - 1), None);
+        assert_eq!(estimate_result_bytes(usize::MAX / 2, false, 0), None);
+        assert_eq!(estimate_buffer_bytes(3, false, 5, 2), Some(3 * 5 * 2 * 8));
+        assert_eq!(estimate_buffer_bytes(usize::MAX / 2, true, 10, 4), None);
+        assert_eq!(estimate_buffer_bytes(2, true, usize::MAX, 2), None);
+        assert_eq!(estimate_buffer_bytes(2, true, 2, usize::MAX), None);
+        assert_eq!(estimate_placement_bytes(usize::MAX), None);
+        assert_eq!(estimate_time_bytes(usize::MAX / 4), None);
+    }
+
+    #[test]
+    fn estimates_that_overflow_count_as_too_large() {
+        // Even the largest limit does not accept an estimate that does not fit in 64 bits.
+        let mut plan = PowerPlan::toggles(Selection::all());
+        plan.memory_limit = u64::MAX;
+        for result in [
+            plan.check_section_memory(10, usize::MAX),
+            plan.check_section_memory(usize::MAX, 1),
+            plan.check_result_memory(usize::MAX),
+        ] {
+            assert!(
+                matches!(
+                    &result,
+                    Err(PowerError::Memory {
+                        needed: u64::MAX,
+                        ..
+                    })
+                ),
+                "{result:?}"
+            );
+        }
+        assert_eq!(plan.result_bytes(usize::MAX), u64::MAX);
+        assert_eq!(plan.section_bytes(usize::MAX, usize::MAX), u64::MAX);
     }
 
     #[test]

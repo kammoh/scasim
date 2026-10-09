@@ -688,23 +688,112 @@ fn binned_results_do_not_depend_on_the_sections() {
 fn the_memory_guard_names_what_is_too_large() {
     let (_d, path) = temp_fst(&small_fixture());
     let mut plan = plan_all(true, UnknownPolicy::Half);
-    // The result needs 6 bins * (8 + 32) = 240 bytes.
+    // The identity bins need 6 * 8 = 48 bytes. The result needs 6 * 8 = 48 bytes for the times
+    // and (6 bins + 2 slots) * 32 = 256 bytes for the statistics: 352 bytes in all.
     plan.memory_limit = 10;
     for result in [activity_fst(&path, &plan), activity_reference(&path, &plan)] {
         assert!(matches!(
             result,
-            Err(PowerError::Memory { what, needed: 240, limit: 10 }) if what.starts_with("the result")
+            Err(PowerError::Memory { what, needed: 352, limit: 10 }) if what.starts_with("the result")
         ));
     }
-    // The result fits, but the decode buffers of a section do not: at least 2 parts * 5 slots
-    // * 32 bytes = 320 bytes.
-    plan.memory_limit = 300;
+    // The result fits. The reference path needs 24 bytes for the placement of the 6 time points,
+    // and 6 time points * 53 bytes for the loaded signals (4 bytes for the time index of a
+    // change, and 2, 3, and 36 bytes for the values of the 1, 4, and 70 bits): 694 bytes in
+    // all, and it fits.
+    plan.memory_limit = 700;
     assert!(activity_reference(&path, &plan).is_ok());
-    let err = activity_fst(&path, &plan).unwrap_err();
+    // The fast path needs 20 bytes for the placement of the 5 time points of the section, and
+    // 5 slots * 32 bytes for each part. A part holds at least one of the 3 signals, so there are
+    // at most 3 parts. With 4 threads, there are 3 parts: 352 + 20 + 480 = 852 bytes.
+    let err = with_threads(4, || activity_fst(&path, &plan)).unwrap_err();
     assert!(
-        matches!(&err, PowerError::Memory { what, limit: 300, .. } if what.starts_with("the decode buffers")),
+        matches!(&err, PowerError::Memory { what, limit: 700, needed: 852 } if what.starts_with("the decode buffers")),
         "{err}"
     );
+    // With 1 thread, there are 2 parts: 352 + 20 + 320 = 692 bytes.
+    assert!(with_threads(1, || activity_fst(&path, &plan)).is_ok());
+    plan.memory_limit = 692;
+    assert!(with_threads(1, || activity_fst(&path, &plan)).is_ok());
+    plan.memory_limit = 691;
+    assert!(matches!(
+        with_threads(1, || activity_fst(&path, &plan)),
+        Err(PowerError::Memory { needed: 692, .. })
+    ));
+}
+
+#[test]
+fn the_result_estimate_counts_the_slots_before_and_after_the_bins() {
+    let (_d, path) = temp_fst(&small_fixture());
+    let bins = Bins::new(vec![0], None).unwrap();
+    let mut plan = plan_all(true, UnknownPolicy::Half);
+    // 8 bytes for the start of the one bin, and 3 slots (before, the bin, after) of 32 bytes.
+    plan.memory_limit = 64;
+    for result in [
+        activity_fst_binned(&path, &plan, &bins),
+        activity_reference_binned(&path, &plan, &bins),
+    ] {
+        assert!(
+            matches!(
+                &result,
+                Err(PowerError::Memory { what, needed: 104, limit: 64 }) if what.starts_with("the result")
+            ),
+            "{result:?}"
+        );
+    }
+}
+
+// ---- Balanced parallel decode ----
+
+/// 1000 one-bit signals. A few of them change at each of 100 times.
+fn many_signals_fixture() -> Fixture {
+    let mut fx = Fixture::flat(&[1; 1000]);
+    let mut state = [false; 1000];
+    let mut seed = 12345u64;
+    fx.steps = (1..=100u64)
+        .map(|step| {
+            let mut changes = Vec::new();
+            for _ in 0..40 {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let signal = (seed >> 33) as usize % 1000;
+                if changes.iter().all(|(s, _)| *s != signal) {
+                    state[signal] = !state[signal];
+                    changes.push((signal, if state[signal] { "1" } else { "0" }.to_string()));
+                }
+            }
+            (step * 10, changes)
+        })
+        .collect();
+    fx
+}
+
+/// A selection of 8 neighboring handles. The decode used to cut the whole handle range into
+/// parts, so that these handles fell into one part. The result must not depend on the cut.
+#[test]
+fn a_narrow_selection_gives_the_same_result_for_any_thread_count() {
+    let fx = many_signals_fixture();
+    let (_d, path) = temp_fst(&fx);
+    let rules: Vec<String> = (500..508).map(|i| format!("+signal:tb.s{i}")).collect();
+    let rule_refs: Vec<&str> = rules.iter().map(String::as_str).collect();
+    let p = plan(&[("narrow", &rule_refs)], true, UnknownPolicy::Half);
+    let expected = expected_activity(
+        &fx,
+        &[("narrow", (500..508).collect::<Vec<_>>())],
+        true,
+        UnknownPolicy::Half,
+    );
+    assert!(expected.channels[0].toggles.iter().sum::<u64>() > 0);
+    let one = with_threads(1, || activity_fst(&path, &p).unwrap());
+    assert_eq!(one, expected);
+    for threads in [2, 8] {
+        assert_eq!(
+            with_threads(threads, || activity_fst(&path, &p).unwrap()),
+            one,
+            "{threads} threads"
+        );
+    }
 }
 
 // ---- Property test ----

@@ -13,6 +13,9 @@ const IGNORED: u32 = u32::MAX;
 ///
 /// The fast path decodes one section at a time. It allocates buffers only for the slots that the
 /// section uses. A section of a long run can have millions of time points, but only a few bins.
+///
+/// The placement needs 4 bytes for each time point (`PowerPlan::check_placement_memory` counts
+/// them). It makes no other array that grows with the number of time points.
 pub(crate) struct Placement {
     /// The global slot that local slot 0 stands for.
     pub first_slot: usize,
@@ -25,26 +28,35 @@ pub(crate) struct Placement {
 impl Placement {
     /// Places each time of `times` (not decreasing). Times after `last_time` are ignored.
     pub fn new(times: &[u64], bins: &Bins, last_time: Option<u64>) -> Placement {
-        let global: Vec<Option<usize>> = times
+        // First the global slots. `Bins::new` limits the number of bins, so that every slot is
+        // less than `IGNORED`.
+        let mut local: Vec<u32> = times
             .iter()
             .map(|&t| {
-                let cut = last_time.is_some_and(|last| t > last);
-                (!cut).then(|| bins.slot_of(t))
+                if last_time.is_some_and(|last| t > last) {
+                    IGNORED
+                } else {
+                    u32::try_from(bins.slot_of(t)).expect("Bins::new limits the number of bins")
+                }
             })
             .collect();
-        let used = global.iter().flatten();
-        let (first_slot, end_slot) = match (used.clone().min(), used.max()) {
-            (Some(&min), Some(&max)) => (min, max + 1),
-            _ => (0, 0),
-        };
-        let local = global
+        let (min, max) = local
             .iter()
-            .map(|slot| {
-                slot.map_or(IGNORED, |s| {
-                    u32::try_from(s - first_slot).expect("Bins::new limits the number of bins")
-                })
-            })
-            .collect();
+            .filter(|&&slot| slot != IGNORED)
+            .fold((IGNORED, 0), |(min, max), &slot| {
+                (min.min(slot), max.max(slot))
+            });
+        // If no time point is used, `min` is still `IGNORED` and greater than `max`.
+        let (first_slot, end_slot) = if min <= max {
+            (min as usize, max as usize + 1)
+        } else {
+            (0, 0)
+        };
+        // Then, in place, the slots relative to the first one.
+        let first = first_slot as u32;
+        for slot in local.iter_mut().filter(|slot| **slot != IGNORED) {
+            *slot -= first;
+        }
         Placement {
             first_slot,
             slot_count: end_slot - first_slot,
@@ -235,6 +247,43 @@ mod tests {
         let none = Placement::new(&[30, 40], &bins, Some(20));
         assert_eq!(none.slot_count, 0);
         assert_eq!(none.local_slot(0), None);
+    }
+
+    /// Compares the placement with a direct computation: the slot of each time, and the range of
+    /// the slots that are used. Times are in any order, and some bins, ends, and cuts are random.
+    #[test]
+    fn placement_equals_a_direct_computation() {
+        let mut seed = 1u64;
+        let mut next = |bound: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % bound
+        };
+        for _ in 0..300 {
+            let mut starts: Vec<u64> = (0..next(8)).map(|_| next(100)).collect();
+            starts.sort();
+            starts.dedup();
+            let end = (next(2) == 0).then(|| starts.last().map_or(0, |last| last + 1) + next(50));
+            let bins = Bins::new(starts, end).unwrap();
+            let times: Vec<u64> = (0..next(30)).map(|_| next(200)).collect();
+            let last_time = (next(2) == 0).then(|| next(200));
+            let placement = Placement::new(&times, &bins, last_time);
+
+            let direct: Vec<Option<usize>> = times
+                .iter()
+                .map(|&t| (!last_time.is_some_and(|last| t > last)).then(|| bins.slot_of(t)))
+                .collect();
+            let used: Vec<usize> = direct.iter().flatten().copied().collect();
+            let range = match (used.iter().min(), used.iter().max()) {
+                (Some(&min), Some(&max)) => (min, max + 1 - min),
+                _ => (0, 0),
+            };
+            assert_eq!((placement.first_slot, placement.slot_count), range);
+            for (i, slot) in direct.iter().enumerate() {
+                assert_eq!(placement.global_slot(i), *slot, "time point {i}");
+            }
+        }
     }
 
     #[test]
