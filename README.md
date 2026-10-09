@@ -31,16 +31,16 @@ cargo run --release --bin tvla -- -d 2 --num-threads 4 --show --ttest-output-dir
 
 ## Selecting signals
 
-By default, `tvla` counts the switching activity of all signals in the waveform. To measure only a part of the design, select signals with rules. Give a rule with `--include` or `--exclude`. Both options can repeat. Each value has the form `KIND:VALUE`, where `KIND` is one of these:
+By default, `tvla` counts the switching activity of all selectable signals in the waveform. Events, strings, reals, and zero-width variables are not selectable. To measure only a part of the design, select signals with rules. Give a rule with `--include` or `--exclude`. Both options can repeat. Each value has the form `KIND:VALUE`, where `KIND` is one of these:
 
-- `scope:PATH` selects the scope `PATH` and every signal below it.
+- `scope:PATH` selects the scope `PATH` and every signal below it. `PATH` is the names of some leading scopes of a signal, joined by dots. A scope name can contain a dot (a Verilog escaped identifier, for example `a.b`). Then `scope:a` does not select that scope. `scope:a.b` selects both a scope named `a.b` and a scope `b` inside `a`, because the text cannot tell them apart.
 - `signal:PATH` selects one signal.
 - `regex:PATTERN` selects every signal whose full path matches the regular expression (Rust syntax). The pattern must match the whole path.
 - `module:NAME` selects every signal inside an instance of the module `NAME`. Almost no simulator writes module names to its waveform file. If the file has none, a `module:` rule fails with an error message.
 
 A path is the names of the scopes from the top of the hierarchy, then the signal name, joined by dots. For example: `TOP.dut.u_rng.state`. A trailing bit range such as `[31:0]` is not part of the name, but an array index such as `mem[3]` is. Use `--list-signals` to see the exact paths. Quote a value that has characters like `$` or `*`, for example `--include 'scope:$rootio'`. A signal that has several names (aliases) matches a rule if one of its names matches.
 
-The rules apply in the order on the command line. Both options share this order. The last rule that matches a signal decides whether the signal is selected. The first rule sets the starting state. If it is an `--include`, no signal is selected before it. If it is an `--exclude`, all signals are selected before it. Without rules, all signals are selected.
+The rules apply in the order on the command line. Both options share this order. The last rule that matches a signal decides whether the signal is selected. The first rule sets the starting state. If it is an `--include`, no signal is selected before it. If it is an `--exclude`, all signals are selected before it. Without rules, all selectable signals are selected.
 
 Two examples:
 
@@ -54,8 +54,10 @@ cargo run --release --bin tvla -- --meta-list path_to_meta_list \
     --exclude scope:TOP.dut.u_rng --include signal:TOP.dut.u_rng.state
 ```
 
-To check a selection before a long run, add `--list-signals`. The command prints one line for each selectable signal of the first waveform: the handle number, `yes` or `no` (selected or not), and the names of the signal. Then it exits. It also prints a warning for each rule that matches no signal. Such a rule is probably a typo. A normal run prints the same warning. If no signal is selected, `tvla` stops with an error.
+To check a selection before a long run, add `--list-signals`. The command prints one line for each selectable signal of the first waveform: the handle number, `yes` or `no` (selected or not), and the names of the signal. Then it exits. It also prints a warning for each rule that matches no signal. Such a rule is probably a typo. A normal run prints the same warning. A normal run stops with an error if no signal is selected. The message lists the rules that match no signal.
 
 If the selected signals lie in more than one top-level scope, `tvla` prints a note. For example, a Verilator dump has the scope `$rootio` next to the design scope. It holds the top-level ports of the design.
 
-`tvla` stores the power traces of a batch in `traces.npz` next to the metadata file. These traces are for the selection of all signals. When you give rules, `tvla` neither reads nor writes `traces.npz`.
+`tvla` stores the power traces of a batch in `traces.npz` next to the metadata file. These traces are for the selection of all selectable signals. When you give rules, `tvla` neither reads nor writes `traces.npz`. `tvla` reuses `traces.npz` only if it is newer than the waveform and newer than the metadata file, or if the waveform no longer exists. It stops with an error if the file is damaged, for example if its trace indices are not `0..n`. Delete the file or use `--use-existing=false` then.
+
+If the metadata has a `clock_period`, `tvla` keeps only the time points that are multiples of it. The activity between these time points is dropped. `tvla` warns if this sampling keeps less than half of the toggles of the selected signals.

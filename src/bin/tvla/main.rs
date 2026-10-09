@@ -72,7 +72,8 @@ struct Args {
     /// Select signals by rule (repeatable): scope:PATH, signal:PATH, regex:PATTERN, or
     /// module:NAME. The rules of --include and --exclude apply in the order on the command line.
     /// The last rule that matches a signal decides. A signal with several names (aliases)
-    /// matches a rule if one of its names matches. Without any rule, all signals are selected.
+    /// matches a rule if one of its names matches. Without any rule, all selectable signals are
+    /// selected.
     /// If the first rule is an --include, no signal is selected before it. If the first rule is
     /// an --exclude, all signals are. With rules, `traces.npz` files are neither read nor
     /// written.
