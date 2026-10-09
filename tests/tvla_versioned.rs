@@ -20,7 +20,9 @@ impl Batch {
                 let t = 10 + i * 20 + j * 10;
                 waveform.push_str(&format!(
                     "#{t}\n1!\nb{:04b} \"\n#{}\n0!\n",
-                    (i * 3 + j + u64::from(label)) % 16,
+                    // The values depend on the batch id, so batches a and b hold different data
+                    // (two byte-identical legacy batches are one batch to a merge).
+                    (i * 3 + j + u64::from(label) + u64::from(id.as_bytes()[0])) % 16,
                     t + 5
                 ));
             }

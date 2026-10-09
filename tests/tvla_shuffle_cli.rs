@@ -133,9 +133,15 @@ fn all_channels_see_the_same_shuffled_labels() {
     );
     assert!(output.status.success(), "{}", stderr(&output));
     let tsv = std::fs::read_to_string(out.join("channels.tsv")).unwrap();
+    // Read the columns by name: the layout has more columns than the |t| values.
+    let header: Vec<&str> = tsv.lines().next().unwrap().split('\t').collect();
+    let column = |name: &str| header.iter().position(|h| *h == name).unwrap();
+    let t_columns = [column("max_abs_t_d1"), column("max_abs_t_d2")];
+    let infinite = column("infinite_t");
     for row in tsv.lines().skip(1) {
         let cells: Vec<&str> = row.split('\t').collect();
-        for index in [3, 5] {
+        assert_eq!(cells[infinite], "0", "{row}");
+        for index in t_columns {
             assert!(cells[index].parse::<f64>().unwrap() < 4.5, "{row}");
         }
     }
@@ -181,4 +187,27 @@ fn the_labels_of_a_cached_batch_are_shuffled_too() {
         log.contains("labels were shuffled with the seed 3"),
         "{log}"
     );
+}
+
+#[test]
+fn the_shuffle_does_not_depend_on_where_the_batch_is_stored() {
+    // The permutation comes from the batch's content, not its path. A copy of the batch in
+    // another directory gives the same shuffled results, run after run.
+    let batch = write_leak_batch(&LeakSpec::default());
+    let copy = tempfile::tempdir().unwrap();
+    for entry in std::fs::read_dir(batch.dir.path()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), copy.path().join(entry.file_name())).unwrap();
+        }
+    }
+    let copy_meta = copy.path().join(batch.meta.file_name().unwrap());
+    let run = |meta: &Path, out: &Path| {
+        let output = tvla(meta, out, &["--shuffle-labels", "5"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        bits(&t_values(out))
+    };
+    let a = run(&batch.meta, &batch.dir.path().join("a"));
+    let b = run(&copy_meta, &copy.path().join("b"));
+    assert_eq!(a, b);
 }

@@ -297,12 +297,15 @@ pub fn read(path: &Path) -> miette::Result<Cache> {
 #[derive(Default)]
 pub struct MergeState {
     pub cache: Option<Cache>,
-    seen: BTreeSet<String>,
+    /// (batch id, waveform content hash) of every merged batch. Two legacy batches can have the
+    /// same metadata content but different waveforms; only the same pair is a duplicate.
+    seen: BTreeSet<(String, [u8; 32])>,
 }
 impl MergeState {
     pub fn add(&mut self, other: Cache) -> miette::Result<()> {
         other.validate()?;
-        if self.seen.contains(&other.batch_id) {
+        let identity = (other.batch_id.clone(), other.key.batch.waveform_sha256);
+        if self.seen.contains(&identity) {
             return Err(miette!("duplicate batch id {}", other.batch_id));
         }
         if let Some(mine) = self.cache.as_ref() {
@@ -387,9 +390,9 @@ impl MergeState {
             }
             next.validate()?;
             self.cache = Some(next);
-            self.seen.insert(other.batch_id);
+            self.seen.insert(identity);
         } else {
-            self.seen.insert(other.batch_id.clone());
+            self.seen.insert(identity);
             self.cache = Some(other);
         }
         Ok(())

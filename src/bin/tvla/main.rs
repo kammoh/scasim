@@ -385,14 +385,17 @@ fn cache_is_fresh(cache: &Path, waveform: &Path, metadata: &Path) -> bool {
 /// Reads the traces and labels of one batch from the cache or computes them from the waveform.
 /// Also returns the edge report of the batch, if it was computed in edges mode.
 fn batch_data(
-    _batch_index: usize,
+    occurrence: usize,
     metadata_path: &Path,
     settings: &BatchSettings<'_>,
 ) -> miette::Result<BatchResult> {
     let mut result = load_batch(metadata_path, settings)?;
     if let Some(seed) = settings.shuffle_seed {
         // Stable batch identity makes separate --stats-out jobs match a normal run.
-        let id = batch_id(&result.meta, metadata_path);
+        let mut id = batch_id(&result.meta, metadata_path);
+        if occurrence > 0 {
+            id.push_str(&format!("#{occurrence}"));
+        }
         let hash = cache::digest(id.as_bytes());
         let identity = u64::from_le_bytes(hash[..8].try_into().expect("eight bytes")) as usize;
         let groups = batch_groups(&result.meta, result.total.labels.len());
@@ -653,18 +656,36 @@ fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Res
     })
 }
 
+/// The identity of a batch: the v1 batch id, or, for legacy metadata, a hash of the metadata
+/// file's content. It does not depend on where the batch is stored, so a moved or copied batch
+/// keeps its identity (and its label shuffle).
 fn batch_id(meta: &scasim::batch::BatchMeta, path: &Path) -> String {
     meta.v1
         .as_ref()
         .map(|v| v.batch.id.clone())
         .unwrap_or_else(|| {
-            format!(
-                "legacy:{}",
-                path.canonicalize()
-                    .unwrap_or_else(|_| path.to_path_buf())
-                    .display()
-            )
+            let bytes = std::fs::read(path).unwrap_or_default();
+            let hash = cache::digest(&bytes);
+            let hex: String = hash[..16].iter().map(|b| format!("{b:02x}")).collect();
+            format!("legacy:{hex}")
         })
+}
+
+/// For each metadata file in list order, how many earlier files in the list have the same
+/// content. A batch listed twice then gets its own label shuffle each time, and the numbers
+/// depend only on the list, not on how the run is split into windows.
+fn occurrences(filenames: &[PathBuf]) -> Vec<usize> {
+    let mut seen: BTreeMap<[u8; 32], usize> = BTreeMap::new();
+    filenames
+        .iter()
+        .map(|path| {
+            let hash = cache::digest(&std::fs::read(path).unwrap_or_default());
+            let count = seen.entry(hash).or_insert(0);
+            let n = *count;
+            *count += 1;
+            n
+        })
+        .collect()
 }
 fn batch_groups(meta: &scasim::batch::BatchMeta, rows: usize) -> Vec<u64> {
     meta.v1
@@ -1058,12 +1079,15 @@ fn main() -> miette::Result<()> {
             }
         }
     } else {
+        let occurrence = occurrences(&filenames);
         for (window_number, window) in filenames.chunks(window_size).enumerate() {
             let first_index = window_number * window_size;
             let loaded: Vec<BatchResult> = window
                 .par_iter()
                 .enumerate()
-                .map(|(i, metadata_path)| batch_data(first_index + i, metadata_path, &settings))
+                .map(|(i, metadata_path)| {
+                    batch_data(occurrence[first_index + i], metadata_path, &settings)
+                })
                 .collect::<miette::Result<_>>()?;
             for mut result in loaded {
                 let (labels, groups) = batch_names(&result.meta);
