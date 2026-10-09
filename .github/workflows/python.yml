@@ -1,0 +1,28 @@
+name: Python
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Install packages
+      run: pip install -e "python/cocotbext-stream[test]" -e "python/scasim-tvla[cocotb,test]"
+    - name: Test scasim-tvla
+      working-directory: python/scasim-tvla
+      run: python -m pytest -q
+    - name: Test cocotbext-stream
+      working-directory: python/cocotbext-stream
+      run: python -m pytest -q
