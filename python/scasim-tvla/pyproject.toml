@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scasim-tvla"
+version = "0.1.0"
+description = "Turn cocotb testbenches into TVLA leakage-assessment harnesses for scasim"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+cocotb = ["cocotb>=2.1"]
+test = ["pytest>=7"]
+
+[project.scripts]
+scasim-tvla = "scasim_tvla.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
