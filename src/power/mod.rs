@@ -289,12 +289,12 @@ impl PowerPlan {
         let selected: Vec<usize> = (0..handle_channels.len())
             .filter(|&h| !handle_channels[h].is_empty())
             .collect();
-        // The first component of a path is the name of its top-level scope.
+        // The first scope name of a path is its top-level scope. A variable outside every scope
+        // has none.
         let top_scopes: BTreeSet<String> = selected
             .iter()
             .flat_map(|&h| &index.paths[h])
-            .filter_map(|p| p.path.split('.').next())
-            .map(str::to_string)
+            .filter_map(|p| p.scope_names.first().cloned())
             .collect();
         let info = RunInfo {
             selected_handles: selected.len(),
@@ -838,6 +838,7 @@ mod tests {
         let path = |p: &str, scope: &str| SignalPath {
             path: p.into(),
             scope: scope.into(),
+            scope_names: scope.split('.').map(String::from).collect(),
             modules: vec![],
             is_alias: false,
         };
@@ -857,6 +858,33 @@ mod tests {
         // Handle 0 is also visible as `other.a`.
         assert_eq!(resolved.info.top_scopes, vec!["other", "tb"]);
         assert_eq!(resolved.info.unmatched_rules, vec!["+scope:nowhere"]);
+    }
+
+    #[test]
+    fn top_scopes_are_the_first_scope_names_and_skip_variables_without_a_scope() {
+        use crate::hierarchy::SignalPath;
+        let path = |p: &str, names: &[&str]| SignalPath {
+            path: p.into(),
+            scope: names.join("."),
+            scope_names: names.iter().map(|n| n.to_string()).collect(),
+            modules: vec![],
+            is_alias: false,
+        };
+        let index = HierarchyIndex {
+            paths: vec![
+                // A variable outside every scope.
+                vec![path("v", &[])],
+                // The scope name `a.b` contains a dot.
+                vec![path("a.b.x", &["a.b"])],
+                vec![path("c.d.y", &["c", "d"])],
+            ],
+            has_module_names: false,
+        };
+        let resolved = PowerPlan::toggles(Selection::all())
+            .resolve(&index)
+            .unwrap();
+        assert_eq!(resolved.info.selected_handles, 3);
+        assert_eq!(resolved.info.top_scopes, vec!["a.b", "c"]);
     }
 
     #[test]

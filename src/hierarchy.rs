@@ -10,6 +10,10 @@ pub struct SignalPath {
     pub path: String,
     /// The scope part of `path` (everything before the variable name), without a trailing `.`.
     pub scope: String,
+    /// The names of the enclosing scopes, outermost first. A name can contain `.` (a Verilog
+    /// escaped identifier), so `scope` alone cannot tell it from two nested scopes. `scope:`
+    /// rules use these names. The list is empty for a variable outside every scope.
+    pub scope_names: Vec<String>,
     /// Module (component) names of the enclosing scopes, outermost first. An empty string means
     /// that the file has no module name for that scope.
     pub modules: Vec<String>,
@@ -69,6 +73,7 @@ struct ScopeStack {
 }
 
 struct OpenScope {
+    name: String,
     module: String,
     /// Names of all open scopes up to and including this one, joined by `.`.
     path: String,
@@ -81,6 +86,7 @@ impl ScopeStack {
             None => name.to_string(),
         };
         self.entries.push(OpenScope {
+            name: name.to_string(),
             module: module.to_string(),
             path,
         });
@@ -93,6 +99,10 @@ impl ScopeStack {
     /// Path of the innermost open scope, or an empty string at the top level.
     fn path(&self) -> &str {
         self.entries.last().map_or("", |e| e.path.as_str())
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.entries.iter().map(|e| e.name.clone()).collect()
     }
 
     fn modules(&self) -> Vec<String> {
@@ -116,6 +126,7 @@ impl HierarchyIndex {
         self.paths[handle].push(SignalPath {
             path,
             scope,
+            scope_names: scopes.names(),
             modules: scopes.modules(),
             is_alias,
         });
@@ -242,12 +253,39 @@ pub enum SelectionError {
 pub enum Rule {
     /// A regular expression that must match the whole path.
     Regex(Regex),
-    /// A scope (exact scope path) and everything below it.
+    /// A scope and everything below it. The text matches a signal if it equals the names of
+    /// some leading scopes of the signal, joined by `.`.
+    ///
+    /// A scope name can contain a dot (a Verilog escaped identifier), and the text cannot tell
+    /// that name from two nested scopes. So `scope:a.b` selects the signals in a scope named
+    /// `a.b` and the signals in the scope `b` inside `a`. `scope:a` selects the scope `a` and
+    /// everything below it, but not a scope named `a.b`.
     Scope(String),
     /// One exact signal path.
     Signal(String),
     /// Every signal inside an instance of this module (definition name).
     Module(String),
+}
+
+/// True if the `.`-join of some non-empty prefix of `names` equals `path`.
+fn scope_names_start_with(names: &[String], path: &str) -> bool {
+    let mut rest = path;
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            match rest.strip_prefix('.') {
+                Some(after_dot) => rest = after_dot,
+                None => return false,
+            }
+        }
+        match rest.strip_prefix(name.as_str()) {
+            Some(after_name) => rest = after_name,
+            None => return false,
+        }
+        if rest.is_empty() {
+            return true;
+        }
+    }
+    false
 }
 
 impl Rule {
@@ -268,11 +306,7 @@ impl Rule {
     fn matches(&self, p: &SignalPath) -> bool {
         match self {
             Rule::Regex(r) => r.is_match(&p.path),
-            Rule::Scope(s) => {
-                p.scope == *s
-                    || (p.scope.starts_with(s.as_str())
-                        && p.scope.as_bytes().get(s.len()) == Some(&b'.'))
-            }
+            Rule::Scope(s) => scope_names_start_with(&p.scope_names, s),
             Rule::Signal(s) => p.path == *s,
             Rule::Module(m) => p.modules.iter().any(|c| c == m),
         }
@@ -397,6 +431,11 @@ mod tests {
         SignalPath {
             path: path.into(),
             scope: scope.into(),
+            scope_names: if scope.is_empty() {
+                vec![]
+            } else {
+                scope.split('.').map(String::from).collect()
+            },
             modules: modules.iter().map(|m| m.to_string()).collect(),
             is_alias: false,
         }
@@ -528,6 +567,51 @@ mod tests {
             vec!["-signal:tb.nothing", "+regex:zzz.*"]
         );
         assert_eq!(r.selected, vec![true, true, true, true, false]);
+    }
+
+    /// Three handles: `x` in the literal scope `a.b` (an escaped identifier), `y` in the scope
+    /// `b` inside `a`, and `v` in `a`.
+    fn dotted_design() -> HierarchyIndex {
+        let named = |path: &str, names: &[&str]| SignalPath {
+            path: path.into(),
+            scope: names.join("."),
+            scope_names: names.iter().map(|n| n.to_string()).collect(),
+            modules: vec![String::new(); names.len()],
+            is_alias: false,
+        };
+        HierarchyIndex {
+            paths: vec![
+                vec![named("a.b.x", &["a.b"])],
+                vec![named("a.b.y", &["a", "b"])],
+                vec![named("a.v", &["a"])],
+            ],
+            has_module_names: false,
+        }
+    }
+
+    fn select_dotted(rules: &[&str]) -> Vec<bool> {
+        Selection::parse(rules)
+            .unwrap()
+            .resolve(&dotted_design())
+            .unwrap()
+            .selected
+    }
+
+    #[test]
+    fn a_scope_rule_does_not_split_a_scope_name_that_contains_a_dot() {
+        // `a` is the outer scope of `y` and `v`. It is not a prefix of the scope `a.b`.
+        assert_eq!(select_dotted(&["+scope:a"]), [false, true, true]);
+        // The text `a.b` names both the literal scope and the scope `b` inside `a`.
+        assert_eq!(select_dotted(&["+scope:a.b"]), [true, true, false]);
+        assert_eq!(select_dotted(&["+scope:a.b.x"]), [false; 3]);
+        assert_eq!(select_dotted(&["+scope:a."]), [false; 3]);
+        assert_eq!(select_dotted(&["+scope:"]), [false; 3]);
+    }
+
+    #[test]
+    fn signal_and_regex_rules_compare_the_joined_path() {
+        assert_eq!(select_dotted(&["+signal:a.b.x"]), [true, false, false]);
+        assert_eq!(select_dotted(&["+regex:a\\.b\\..*"]), [true, true, false]);
     }
 
     #[test]

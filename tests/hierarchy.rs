@@ -144,6 +144,76 @@ fn fst_index_skips_events_strings_and_reals() {
     );
 }
 
+/// An FST file with a scope named `a.b` (an escaped identifier) next to the scope `a` that
+/// contains the scope `b`. Handle 0 is `x` in the scope `a.b`, handle 1 is `v` in `a`, and handle
+/// 2 is `y` in `a` then `b`. A variable `top` outside every scope is handle 3.
+fn dotted_scope_file(dir: &Path) -> std::path::PathBuf {
+    use fst_writer::*;
+    let path = dir.join("dotted.fst");
+    let info = FstInfo {
+        start_time: 0,
+        timescale_exponent: -12,
+        version: "test".into(),
+        date: "2026-10-08".into(),
+        file_type: FstFileType::Verilog,
+    };
+    let mut header = open_fst(&path, &info).unwrap();
+    let var = |header: &mut FstHeaderWriter<_>, name: &str| {
+        header
+            .var(
+                name,
+                FstSignalType::bit_vec(1),
+                FstVarType::Wire,
+                FstVarDirection::Implicit,
+                None,
+            )
+            .unwrap();
+    };
+    header.scope("a.b", "", FstScopeType::Module).unwrap();
+    var(&mut header, "x");
+    header.up_scope().unwrap();
+    header.scope("a", "", FstScopeType::Module).unwrap();
+    var(&mut header, "v");
+    header.scope("b", "", FstScopeType::Module).unwrap();
+    var(&mut header, "y");
+    header.up_scope().unwrap();
+    header.up_scope().unwrap();
+    var(&mut header, "top");
+    let mut body = header.finish().unwrap();
+    body.time_change(0).unwrap();
+    body.finish().unwrap();
+    path
+}
+
+#[test]
+fn a_dotted_scope_name_stays_whole_and_scope_rules_respect_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dotted_scope_file(dir.path());
+    let fst = fst_index(&path);
+    let wellen = wellen_index(&path);
+    for index in [&fst, &wellen] {
+        let names = |h: usize| index.paths[h][0].scope_names.clone();
+        assert_eq!(names(0), ["a.b"]);
+        assert_eq!(names(1), ["a"]);
+        assert_eq!(names(2), ["a", "b"]);
+        assert!(names(3).is_empty());
+        assert_eq!(sorted_paths(index, 0), ["a.b.x"]);
+        assert_eq!(sorted_paths(index, 3), ["top"]);
+        // `scope:a` does not select the signals of the scope `a.b`.
+        assert_eq!(select(index, &["+scope:a"]), [false, true, true, false]);
+        // The text `a.b` names the literal scope and the nested scope.
+        assert_eq!(select(index, &["+scope:a.b"]), [true, false, true, false]);
+        assert_eq!(select(index, &["-scope:a.b"]), [false, true, false, true]);
+        assert_eq!(
+            select(index, &["+signal:a.b.x"]),
+            [true, false, false, false]
+        );
+    }
+    for h in 0..4 {
+        assert_eq!(fst.paths[h], wellen.paths[h]);
+    }
+}
+
 #[test]
 fn selection_on_a_real_file() {
     let (_dir, path) = temp_fst(&fixture());
