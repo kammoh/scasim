@@ -132,6 +132,20 @@ impl Rng {
         }
     }
 
+    /// A stream for one leak, from the seed, the batch, the trace, the signal, and the cycle. It
+    /// is separate from the noise stream, so the number of draws of a leak (which depends on the
+    /// class) cannot shift the noise.
+    fn for_leak(seed: u64, batch: usize, trace: usize, sig: usize, cycle: u64) -> Rng {
+        let key = [batch as u64, trace as u64, sig as u64, cycle]
+            .into_iter()
+            .fold(mix(seed ^ 0x1EA4_5EED), |key, part| mix(key ^ part) ^ part);
+        Rng {
+            inner: SplitMix64(key),
+            buffer: 0,
+            left: 0,
+        }
+    }
+
     fn next16(&mut self) -> u32 {
         if self.left == 0 {
             self.buffer = self.inner.next();
@@ -226,6 +240,7 @@ fn leak_mask(kind: LeakKind, strength: f64, class: u16, width: u32, rng: &mut Rn
 fn segment_events(
     spec: &SynthSpec,
     layout: &Layout,
+    (batch, trace): (usize, usize),
     base: u64,
     class: u16,
     rng: &mut Rng,
@@ -255,9 +270,16 @@ fn segment_events(
                             k == 0 && (l.scope, l.register, l.cycle as u64) == (scope, reg, cycle)
                         })
                     });
+                    // The noise is always drawn, so the noise stream does not depend on the
+                    // leaks. The leak replaces the noise mask and draws from its own stream.
+                    let noise = noise_mask(rng, spec.width, spec.density);
                     let mask = match leak {
-                        Some(l) => leak_mask(l.kind, l.strength, class, spec.width, rng),
-                        None => noise_mask(rng, spec.width, spec.density),
+                        Some(l) => {
+                            let mut own =
+                                Rng::for_leak(spec.seed, batch, trace, register.sig, cycle);
+                            leak_mask(l.kind, l.strength, class, spec.width, &mut own)
+                        }
+                        None => noise,
                     };
                     if mask != 0 {
                         events.push(Event {
@@ -374,7 +396,15 @@ fn write_batch(
         classes[class as usize] += 1;
         events.clear();
         let base = start + trace as u64 * length;
-        segment_events(spec, layout, base, class, &mut rng, &mut events);
+        segment_events(
+            spec,
+            layout,
+            (batch, trace),
+            base,
+            class,
+            &mut rng,
+            &mut events,
+        );
         peak_events = peak_events.max(events.len());
         state.apply(&mut events, sink)?;
     }
@@ -564,6 +594,15 @@ mod tests {
         assert!((a.0 - 4.0).abs() < 0.02 && (b.0 - 4.0).abs() < 0.05);
         assert!(
             (a.1 - 2.0 / 3.0).abs() < 0.03 && (b.1 - 6.0).abs() < 0.15,
+            "{a:?} {b:?}"
+        );
+        // The smallest valid strength, 2: the variances are 2/3 and 8/3.
+        let (a, b) = (
+            moments(LeakKind::Variance, 2.0, 0),
+            moments(LeakKind::Variance, 2.0, 1),
+        );
+        assert!(
+            (a.1 - 2.0 / 3.0).abs() < 0.03 && (b.1 - 8.0 / 3.0).abs() < 0.08,
             "{a:?} {b:?}"
         );
         // Mean: the means differ by the strength.

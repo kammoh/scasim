@@ -589,3 +589,103 @@ fn invalid_specs_are_rejected() {
         );
     }
 }
+
+#[test]
+fn strengths_that_plant_no_difference_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let with = |kind, strength| SynthSpec {
+        leaks: vec![leak(kind, strength)],
+        ..spec()
+    };
+    // The strength 1 (or anything that rounds to 1) gives class 1 the distribution of class 0.
+    for (kind, strength) in [
+        (LeakKind::Variance, 1.0),
+        (LeakKind::Variance, 1.4),
+        (LeakKind::Mean, 0.0),
+        (LeakKind::Deterministic, 0.0),
+        (LeakKind::Deterministic, 0.4),
+    ] {
+        assert!(
+            with(kind, strength).validate().is_err(),
+            "{kind:?} {strength}"
+        );
+    }
+    // The smallest valid strengths.
+    for (kind, strength) in [
+        (LeakKind::Variance, 2.0),
+        (LeakKind::Variance, 1.5),
+        (LeakKind::Mean, 0.01),
+        (LeakKind::Deterministic, 1.0),
+    ] {
+        assert!(
+            generate(&with(kind, strength), &dir.path().join("ok")).is_ok(),
+            "{kind:?} {strength}"
+        );
+    }
+}
+
+/// The value changes of each signal of a VCD file (the signals of the generator use one
+/// character as identifier): `signal index -> [(time, value)]`.
+fn vcd_changes(path: &Path) -> std::collections::BTreeMap<usize, Vec<(u64, String)>> {
+    let text = std::fs::read_to_string(path).unwrap();
+    let body = text.split("$enddefinitions $end").nth(1).unwrap();
+    let mut changes = std::collections::BTreeMap::<usize, Vec<(u64, String)>>::new();
+    let mut time = 0;
+    for line in body.lines() {
+        if let Some(t) = line.strip_prefix('#') {
+            time = t.parse().unwrap();
+        } else if let Some(vector) = line.strip_prefix('b') {
+            let (value, id) = vector.split_once(' ').unwrap();
+            let sig = usize::from(id.as_bytes()[0] - b'!');
+            changes.entry(sig).or_default().push((time, value.into()));
+        } else if line.len() == 2 && !line.starts_with('$') {
+            let sig = usize::from(line.as_bytes()[1] - b'!');
+            changes
+                .entry(sig)
+                .or_default()
+                .push((time, line[..1].into()));
+        }
+    }
+    changes
+}
+
+#[test]
+fn the_noise_of_the_other_registers_does_not_depend_on_the_leak_or_the_labels() {
+    // The leak draws its random numbers from its own stream, and the noise of the leaking
+    // register is drawn and replaced. So no draw count depends on the class, and every other
+    // signal has the same value changes with and without a leak, for every kind and strength.
+    let dir = tempfile::tempdir().unwrap();
+    let plain = SynthSpec {
+        registers: 2,
+        traces: 200,
+        format: Format::Vcd,
+        glitch: Some(Glitch { delta: 3, bits: 1 }),
+        ..spec()
+    };
+    let reference = generate(&plain, &dir.path().join("plain")).unwrap();
+    let reference = vcd_changes(&reference.waves[0]);
+    // Signals: tb.clk, tb.t0, then tb.dut.s<scope>.r<register>.
+    let leaked = 2 + plain.registers;
+    let leaks = [
+        (LeakKind::Mean, 0.5),
+        (LeakKind::Mean, 1.0),
+        (LeakKind::Variance, 2.0),
+        (LeakKind::Equal3, 0.0),
+        (LeakKind::Deterministic, 1.0),
+    ];
+    for (i, (kind, strength)) in leaks.into_iter().enumerate() {
+        let spec = SynthSpec {
+            leaks: vec![leak(kind, strength)],
+            ..plain.clone()
+        };
+        let data = generate(&spec, &dir.path().join(format!("leak{i}"))).unwrap();
+        let changes = vcd_changes(&data.waves[0]);
+        assert!(!changes[&leaked].is_empty());
+        for (sig, list) in &reference {
+            // The leaking register itself differs (the planted cycle, and the values after it).
+            if *sig != leaked {
+                assert_eq!(&changes[sig], list, "{kind:?} {strength}: signal {sig}");
+            }
+        }
+    }
+}

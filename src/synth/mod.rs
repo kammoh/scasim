@@ -67,14 +67,16 @@ pub struct Glitch {
 /// in this cycle by:
 ///
 /// - `Mean`: `T = m + u` in class 0 and `T = m + u + x` in class 1, where `x` is `strength`
-///   rounded down plus 1 with the probability of the fraction. Order 1 finds it.
-/// - `Variance`: `T = m + u` in class 0 and `T = m + a * u` in class 1, with `a = round(strength)`.
-///   The means are equal. Order 2 finds it, order 1 does not.
+///   rounded down plus 1 with the probability of the fraction. Order 1 finds it. The strength
+///   must be above 0.
+/// - `Variance`: `T = m + u` in class 0 and `T = m + a * u` in class 1, with `a = round(strength)`
+///   and `a >= 2` (with `a = 1` the classes would be equal). The means are equal. Order 2 finds
+///   it, order 1 does not.
 /// - `Equal3`: class 0: `T` is 2 or 6, each with probability 1/2. Class 1: `T` is 0 with 1/8,
 ///   4 with 3/4, and 8 with 1/8. The mean, variance, and skewness are equal, the fourth moment
 ///   is not. Order 4 and the chi-squared test find it. `strength` is not used. Needs `width >= 8`.
 /// - `Deterministic`: `T = m` in class 0 and `T = m + round(strength)` in class 1, without any
-///   randomness. The t-statistic is infinite.
+///   randomness. `round(strength)` must be at least 1. The t-statistic is infinite.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeakKind {
     Mean,
@@ -359,13 +361,17 @@ impl SynthSpec {
         let (width, m) = (i64::from(self.width), i64::from(self.width / 2));
         let s = leak.strength;
         let fits = match leak.kind {
-            LeakKind::Mean => m >= 1 && m + 1 + s.ceil() as i64 <= width,
+            LeakKind::Mean => s > 0.0 && m >= 1 && m + 1 + s.ceil() as i64 <= width,
+            // With a = 1 both classes have the same distribution.
             LeakKind::Variance => {
                 let a = s.round() as i64;
-                a >= 1 && m >= a && m + a <= width
+                a >= 2 && m >= a && m + a <= width
             }
             LeakKind::Equal3 => width >= 8,
-            LeakKind::Deterministic => m + s.round() as i64 <= width,
+            LeakKind::Deterministic => {
+                let d = s.round() as i64;
+                d >= 1 && m + d <= width
+            }
         };
         if !fits {
             return invalid(format!(
