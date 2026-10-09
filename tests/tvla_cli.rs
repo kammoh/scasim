@@ -34,15 +34,38 @@ fn cached_traces() -> Array2<f32> {
     Array2::from_shape_vec((4, 2), vec![10., 20., 30., 40., 50., 60., 70., 90.]).unwrap()
 }
 
+/// The format of the waveform file of a batch.
+#[derive(Clone, Copy, Debug)]
+enum Format {
+    Vcd,
+    Fst,
+}
+
+const FORMATS: [Format; 2] = [Format::Vcd, Format::Fst];
+
+impl Format {
+    fn file_name(self) -> &'static str {
+        match self {
+            Format::Vcd => "tvla.vcd",
+            Format::Fst => "tvla.fst",
+        }
+    }
+}
+
 /// A temporary batch directory.
 struct Batch {
     dir: tempfile::TempDir,
 }
 
 impl Batch {
-    /// Writes `tvla.vcd` (older than any file that `new_cache` writes) and `meta.json`. The
-    /// signals are `tb.s0`, `tb.s1`, and `aux.a`. Only `tb.s0` and `tb.s1` toggle.
+    /// A batch with a VCD waveform. See `new_in`.
     fn new(toggles: [u32; 8], clock_period: Option<u64>) -> Batch {
+        Batch::new_in(Format::Vcd, toggles, clock_period)
+    }
+
+    /// Writes the waveform (older than any file that `write_cache` writes) and `meta.json`. The
+    /// signals are `tb.s0`, `tb.s1`, and `aux.a`. Only `tb.s0` and `tb.s1` toggle.
+    fn new_in(format: Format, toggles: [u32; 8], clock_period: Option<u64>) -> Batch {
         let dir = tempfile::tempdir().unwrap();
         let mut fx = Fixture::flat(&[4, 1, 1]);
         fx.signals[2].scope = "aux".into();
@@ -56,13 +79,19 @@ impl Batch {
             }
             fx.steps.push((10 * (step as u64 + 1), changes));
         }
-        let vcd = dir.path().join("tvla.vcd");
-        write_vcd(&vcd, &fx);
-        set_modified(&vcd, hours_ago(1));
+        let waveform = dir.path().join(format.file_name());
+        match format {
+            Format::Vcd => write_vcd(&waveform, &fx),
+            Format::Fst => write_fst(&waveform, &fx),
+        }
+        set_modified(&waveform, hours_ago(1));
         let clock = clock_period.map_or(String::new(), |c| format!(r#""clock_period": {c}, "#));
         std::fs::write(
             dir.path().join("meta.json"),
-            format!(r#"{{"trace_filename": "tvla.vcd", {clock}"markers": {MARKERS}}}"#),
+            format!(
+                r#"{{"trace_filename": "{}", {clock}"markers": {MARKERS}}}"#,
+                format.file_name()
+            ),
         )
         .unwrap();
         Batch { dir }
@@ -106,10 +135,11 @@ impl Batch {
         (traces, npz.by_name("labels").unwrap())
     }
 
-    /// Runs `tvla` with `args` after the fixed arguments.
-    fn run(&self, args: &[&str]) -> Output {
+    /// Runs `tvla` with `args` after the fixed arguments. Returns the output of a run that
+    /// fails as well.
+    fn run_any(&self, args: &[&str]) -> Output {
         let out = self.dir.path().join("out");
-        let output = Command::new(env!("CARGO_BIN_EXE_tvla"))
+        Command::new(env!("CARGO_BIN_EXE_tvla"))
             .env_remove("RUST_LOG")
             .arg("--meta-json")
             .arg(self.meta())
@@ -118,7 +148,12 @@ impl Batch {
             .args(["--plot=false", "-d", "1"])
             .args(args)
             .output()
-            .unwrap();
+            .unwrap()
+    }
+
+    /// Runs `tvla` with `args` after the fixed arguments. The run must succeed.
+    fn run(&self, args: &[&str]) -> Output {
+        let output = self.run_any(args);
         assert!(output.status.success(), "{}", text(&output.stderr));
         output
     }
@@ -196,89 +231,101 @@ fn the_expected_traces_differ_so_that_the_tests_can_tell_the_sources_apart() {
 
 #[test]
 fn rules_neither_read_nor_overwrite_a_fresh_traces_npz() {
-    let batch = Batch::new(TOGGLES, None);
-    batch.write_cache(true);
-    let before = std::fs::read(batch.npz()).unwrap();
-    // `--exclude` after `--include`: the order decides, so `tb.s1` stays out of the selection.
-    let output = batch.run(&["--include", "scope:tb", "--exclude", "signal:tb.s1"]);
-    let stdout = text(&output.stdout);
-    assert!(stdout.contains("Computing power traces from"), "{stdout}");
-    assert!(!stdout.contains("Using existing"), "{stdout}");
-    assert_eq!(std::fs::read(batch.npz()).unwrap(), before, "traces.npz");
-    assert_close(&batch.t_values(), &welch_t(&s0_traces(), &LABELS));
-    let stderr = text(&output.stderr);
-    assert!(stderr.contains("1 signals selected"), "{stderr}");
-    assert!(!stderr.contains("WARN"), "{stderr}");
-    assert!(!stderr.contains("top-level scopes"), "{stderr}");
+    for format in FORMATS {
+        let batch = Batch::new_in(format, TOGGLES, None);
+        batch.write_cache(true);
+        let before = std::fs::read(batch.npz()).unwrap();
+        // `--exclude` after `--include`: the order decides, so `tb.s1` stays out of the selection.
+        let output = batch.run(&["--include", "scope:tb", "--exclude", "signal:tb.s1"]);
+        let stdout = text(&output.stdout);
+        assert!(stdout.contains("Computing power traces from"), "{stdout}");
+        assert!(!stdout.contains("Using existing"), "{stdout}");
+        assert_eq!(std::fs::read(batch.npz()).unwrap(), before, "traces.npz");
+        assert_close(&batch.t_values(), &welch_t(&s0_traces(), &LABELS));
+        let stderr = text(&output.stderr);
+        assert!(stderr.contains("1 signals selected"), "{stderr}");
+        assert!(!stderr.contains("WARN"), "{stderr}");
+        assert!(!stderr.contains("top-level scopes"), "{stderr}");
+    }
 }
 
 #[test]
 fn rules_do_not_overwrite_a_stale_traces_npz() {
-    let batch = Batch::new(TOGGLES, None);
-    batch.write_cache(false);
-    let before = std::fs::read(batch.npz()).unwrap();
-    let output = batch.run(&["--include", "scope:tb", "--exclude", "signal:tb.s1"]);
-    assert!(!text(&output.stdout).contains("Saving traces"));
-    assert_eq!(std::fs::read(batch.npz()).unwrap(), before, "traces.npz");
-    assert_close(&batch.t_values(), &welch_t(&s0_traces(), &LABELS));
+    for format in FORMATS {
+        let batch = Batch::new_in(format, TOGGLES, None);
+        batch.write_cache(false);
+        let before = std::fs::read(batch.npz()).unwrap();
+        let output = batch.run(&["--include", "scope:tb", "--exclude", "signal:tb.s1"]);
+        assert!(!text(&output.stdout).contains("Saving traces"));
+        assert_eq!(std::fs::read(batch.npz()).unwrap(), before, "traces.npz");
+        assert_close(&batch.t_values(), &welch_t(&s0_traces(), &LABELS));
+    }
 }
 
 #[test]
 fn without_rules_a_fresh_traces_npz_is_used() {
-    let batch = Batch::new(TOGGLES, None);
-    batch.write_cache(true);
-    let before = std::fs::read(batch.npz()).unwrap();
-    let output = batch.run(&[]);
-    assert!(text(&output.stdout).contains("Using existing traces and labels from"));
-    assert_eq!(std::fs::read(batch.npz()).unwrap(), before, "traces.npz");
-    assert_close(&batch.t_values(), &welch_t(&cached_traces(), &LABELS));
+    for format in FORMATS {
+        let batch = Batch::new_in(format, TOGGLES, None);
+        batch.write_cache(true);
+        let before = std::fs::read(batch.npz()).unwrap();
+        let output = batch.run(&[]);
+        assert!(text(&output.stdout).contains("Using existing traces and labels from"));
+        assert_eq!(std::fs::read(batch.npz()).unwrap(), before, "traces.npz");
+        assert_close(&batch.t_values(), &welch_t(&cached_traces(), &LABELS));
+    }
 }
 
 #[test]
 fn without_rules_a_stale_traces_npz_is_replaced() {
-    let batch = Batch::new(TOGGLES, None);
-    batch.write_cache(false);
-    let output = batch.run(&[]);
-    let stdout = text(&output.stdout);
-    assert!(stdout.contains("Computing power traces from"), "{stdout}");
-    assert!(!stdout.contains("Using existing"), "{stdout}");
-    let (traces, labels) = batch.read_cache();
-    assert_eq!(traces, s0_s1_traces());
-    assert_eq!(labels.to_vec(), LABELS);
-    assert_close(&batch.t_values(), &welch_t(&s0_s1_traces(), &LABELS));
+    for format in FORMATS {
+        let batch = Batch::new_in(format, TOGGLES, None);
+        batch.write_cache(false);
+        let output = batch.run(&[]);
+        let stdout = text(&output.stdout);
+        assert!(stdout.contains("Computing power traces from"), "{stdout}");
+        assert!(!stdout.contains("Using existing"), "{stdout}");
+        let (traces, labels) = batch.read_cache();
+        assert_eq!(traces, s0_s1_traces());
+        assert_eq!(labels.to_vec(), LABELS);
+        assert_close(&batch.t_values(), &welch_t(&s0_s1_traces(), &LABELS));
+    }
 }
 
 #[test]
 fn use_existing_false_computes_the_traces_even_if_the_cache_is_fresh() {
-    let batch = Batch::new(TOGGLES, None);
-    batch.write_cache(true);
-    let output = batch.run(&["--use-existing=false"]);
-    assert!(text(&output.stdout).contains("Computing power traces from"));
-    assert_eq!(batch.read_cache().0, s0_s1_traces());
+    for format in FORMATS {
+        let batch = Batch::new_in(format, TOGGLES, None);
+        batch.write_cache(true);
+        let output = batch.run(&["--use-existing=false"]);
+        assert!(text(&output.stdout).contains("Computing power traces from"));
+        assert_eq!(batch.read_cache().0, s0_s1_traces());
+    }
 }
 
 #[test]
 fn the_run_reports_unmatched_rules_several_top_scopes_and_dropped_sampling() {
-    // Sampling at multiples of 20 keeps the time points 20, 40, 60, and 80: 7 of 23 toggles.
-    let batch = Batch::new([4, 1, 4, 2, 4, 2, 4, 2], Some(20));
-    let output = batch.run(&[
-        "--include",
-        "signal:tb.s0",
-        "--include",
-        "signal:aux.a",
-        "--exclude",
-        "signal:tb.nope",
-    ]);
-    let stderr = text(&output.stderr);
-    assert!(stderr.contains("keeps only 7 of 23 toggles"), "{stderr}");
-    assert!(
-        stderr.contains("the selection spans 2 top-level scopes: aux, tb"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("the rule -signal:tb.nope matches no signal"),
-        "{stderr}"
-    );
+    for format in FORMATS {
+        // Sampling at multiples of 20 keeps the time points 20, 40, 60, and 80: 7 of 23 toggles.
+        let batch = Batch::new_in(format, [4, 1, 4, 2, 4, 2, 4, 2], Some(20));
+        let output = batch.run(&[
+            "--include",
+            "signal:tb.s0",
+            "--include",
+            "signal:aux.a",
+            "--exclude",
+            "signal:tb.nope",
+        ]);
+        let stderr = text(&output.stderr);
+        assert!(stderr.contains("keeps only 7 of 23 toggles"), "{stderr}");
+        assert!(
+            stderr.contains("the selection spans 2 top-level scopes: aux, tb"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("the rule -signal:tb.nope matches no signal"),
+            "{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -293,25 +340,27 @@ fn sampling_that_keeps_half_of_the_toggles_gives_no_warning() {
 
 #[test]
 fn list_signals_prints_only_data_lines_on_stdout() {
-    let batch = Batch::new(TOGGLES, None);
-    let output = batch.run(&[
-        "--list-signals",
-        "--include",
-        "scope:tb",
-        "--exclude",
-        "signal:tb.s1",
-        "--exclude",
-        "signal:tb.nope",
-    ]);
-    let lines: Vec<String> = text(&output.stdout).lines().map(String::from).collect();
-    assert_eq!(lines, ["0\tyes\ttb.s0", "1\tno\ttb.s1", "2\tno\taux.a"]);
-    let stderr = text(&output.stderr);
-    assert!(
-        stderr.contains("1 of 3 selectable signals are selected"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("warning: the rule -signal:tb.nope matches no signal"),
-        "{stderr}"
-    );
+    for format in FORMATS {
+        let batch = Batch::new_in(format, TOGGLES, None);
+        let output = batch.run(&[
+            "--list-signals",
+            "--include",
+            "scope:tb",
+            "--exclude",
+            "signal:tb.s1",
+            "--exclude",
+            "signal:tb.nope",
+        ]);
+        let lines: Vec<String> = text(&output.stdout).lines().map(String::from).collect();
+        assert_eq!(lines, ["0\tyes\ttb.s0", "1\tno\ttb.s1", "2\tno\taux.a"]);
+        let stderr = text(&output.stderr);
+        assert!(
+            stderr.contains("1 of 3 selectable signals are selected"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("warning: the rule -signal:tb.nope matches no signal"),
+            "{stderr}"
+        );
+    }
 }
