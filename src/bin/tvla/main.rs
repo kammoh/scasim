@@ -2,17 +2,18 @@ use clap::{ArgGroup, ArgMatches, CommandFactory, FromArgMatches, Parser};
 use itertools::Itertools;
 use log::*;
 use miette::{IntoDiagnostic, WrapErr, miette};
-use ndarray::{Array1, Array2, s};
+use ndarray::{Array1, Array2};
 use ndarray_npz::NpzWriter;
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use scasim::batch::{
     BatchDiagnostics, batch_traces, read_batch_meta, read_trace_cache, write_trace_cache,
 };
+use scasim::fold::{Fold, Loaded, create_output_dir, read_path_list, write_t_values_npz};
 use scasim::hierarchy::{HierarchyIndex, Selection};
 use scasim::plot::*;
 use scasim::power::hierarchy_index;
 use scasim::stats::threshold::{CONVENTIONAL, bonferroni, family_size, t_bonferroni};
-use scasim::stats::{Binning, HistAccumulator, TestOptions, TestResult};
+use scasim::stats::{HistAccumulator, TestResult};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -204,47 +205,6 @@ fn cache_is_fresh(cache: &Path, waveform: &Path, metadata: &Path) -> bool {
     }
 }
 
-/// The largest |t| in a row of t-values, or NaN if no value is finite. Values that are not
-/// finite (NaN or infinite) are skipped.
-fn max_abs_finite(row: impl IntoIterator<Item = f64>) -> f64 {
-    row.into_iter()
-        .filter(|x| x.is_finite())
-        .map(f64::abs)
-        .fold(f64::NAN, f64::max)
-}
-
-/// Reads the paths of the metadata files from a meta list file. Relative paths are relative to
-/// the directory of the list file.
-fn read_meta_list(list_path: &Path) -> miette::Result<Vec<PathBuf>> {
-    let root = list_path.parent().unwrap_or(Path::new(""));
-    let text = std::fs::read_to_string(list_path)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("cannot read the meta list file {}", list_path.display()))?;
-    Ok(text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            let path = PathBuf::from(line);
-            if path.is_absolute() {
-                path
-            } else {
-                root.join(path)
-            }
-        })
-        .collect())
-}
-
-/// The traces and labels of one batch, and where they came from.
-struct Loaded {
-    /// The metadata file of the batch.
-    metadata: PathBuf,
-    /// The file that the traces were read from or computed from: `traces.npz` or the waveform.
-    source: PathBuf,
-    traces: Array2<f32>,
-    labels: Array1<u16>,
-}
-
 /// Reads the traces and labels of one batch from the cache or computes them from the waveform.
 fn batch_data(
     metadata_path: &Path,
@@ -317,148 +277,6 @@ fn batch_data(
     Ok(loaded(trace_file_path, (traces_array, labels_array)))
 }
 
-/// The chi-squared results for the classes 0 and 1. A class without traces gives results that
-/// are not valid tests, so a batch with one class only is not an error.
-fn chi2_results(hist: &HistAccumulator) -> miette::Result<Vec<TestResult>> {
-    if hist.class_count(0) == 0 || hist.class_count(1) == 0 {
-        let none = TestResult {
-            statistic: 0.0,
-            dof: 0,
-            neg_log10_p: 0.0,
-            n: 0,
-            rows: 0,
-            columns: 0,
-            merged: 0,
-            min_expected: 0.0,
-        };
-        return Ok(vec![none; hist.n_samples()]);
-    }
-    hist.test_pair(0, 1, &TestOptions::default())
-        .into_diagnostic()
-        .wrap_err("cannot compute the chi-squared test")
-}
-
-/// The state of the analysis. Batches are added one by one, in the order of the meta list.
-struct Fold {
-    order: usize,
-    chi2: bool,
-    hist: Option<HistAccumulator>,
-    /// The number of samples per trace, set by the first batch.
-    samples: usize,
-    /// Max |t| per order after each batch, starting with 0.0 for no trace.
-    max_t: Vec<Vec<f64>>,
-    /// Max -log10(p) after each batch, starting with 0.0 for no trace.
-    max_chi2: Vec<f64>,
-    /// The number of traces after each batch, starting with 0.
-    num_traces: Vec<usize>,
-    t_values: Option<Array2<f64>>,
-    chi2_results: Option<Vec<TestResult>>,
-}
-
-impl Fold {
-    fn new(order: usize, chi2: bool) -> Self {
-        Fold {
-            order,
-            chi2,
-            hist: None,
-            samples: 0,
-            max_t: vec![vec![0.0]; order],
-            max_chi2: vec![0.0],
-            num_traces: vec![0],
-            t_values: None,
-            chi2_results: None,
-        }
-    }
-
-    /// Adds one batch and records the results so far.
-    fn add(&mut self, batch: Loaded) -> miette::Result<()> {
-        let Loaded {
-            metadata,
-            source,
-            traces,
-            labels,
-        } = batch;
-        let (num_traces, cur_samples_per_trace) = traces.dim();
-        if num_traces <= 1 {
-            return Err(miette!(
-                "the batch {} has {num_traces} traces; a t-test needs at least two traces",
-                metadata.display()
-            ));
-        }
-        if labels.len() != num_traces {
-            return Err(miette!(
-                "the batch {} has {num_traces} traces but {} labels",
-                metadata.display(),
-                labels.len()
-            ));
-        }
-        if self.samples == 0 {
-            // The first batch sets the number of samples per trace.
-            self.samples = cur_samples_per_trace;
-        }
-        let traces = if self.samples == cur_samples_per_trace {
-            traces
-        } else {
-            error!(
-                "Inconsistent number of samples per trace: expected {}, found {}",
-                self.samples, cur_samples_per_trace
-            );
-            if cur_samples_per_trace > self.samples {
-                warn!(
-                    "Using the first {} samples of the longer trace",
-                    self.samples
-                );
-                traces.slice(s![.., ..self.samples]).to_owned()
-            } else {
-                warn!(
-                    "padding the traces with {cur_samples_per_trace} samples with zeros up to {}",
-                    self.samples
-                );
-                let mut t = Array2::<f32>::zeros((num_traces, self.samples));
-                for (i, row) in traces.outer_iter().enumerate() {
-                    t.slice_mut(s![i, ..row.len()]).assign(&row);
-                }
-                t
-            }
-        };
-        self.num_traces
-            .push(self.num_traces.last().copied().unwrap_or(0) + num_traces);
-
-        let samples = self.samples;
-        let hist = self
-            .hist
-            .get_or_insert_with(|| HistAccumulator::new(samples, Binning::Exact));
-        hist.update(traces.view(), labels.view())
-            .into_diagnostic()
-            .wrap_err_with(|| format!("cannot add the batch {}", metadata.display()))?;
-        if hist.rejected() > 0 {
-            return Err(miette!(
-                "the traces from {} (batch {}) have {} values that are not integers or are \
-                 2^53 or larger. The statistics need integer-valued traces",
-                source.display(),
-                metadata.display(),
-                hist.rejected()
-            ));
-        }
-
-        let t_values = hist
-            .t_values(0, 1, self.order)
-            .into_diagnostic()
-            .wrap_err("cannot compute the t-values")?;
-        for (max_t, t_row) in self.max_t.iter_mut().zip(t_values.rows()) {
-            max_t.push(max_abs_finite(t_row.iter().copied()));
-        }
-        self.t_values = Some(t_values);
-        if self.chi2 {
-            let results = chi2_results(hist)?;
-            self.max_chi2
-                .push(scasim::stats::summarize(&results, CONVENTIONAL).max_neg_log10_p);
-            self.chi2_results = Some(results);
-        }
-        Ok(())
-    }
-}
-
 fn main() -> miette::Result<()> {
     // set default log level to info
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -473,7 +291,7 @@ fn main() -> miette::Result<()> {
         .wrap_err("invalid value for --include or --exclude")?;
 
     let filenames: Vec<PathBuf> = if let Some(meta_list_path) = &args.maybe_meta_list_path {
-        read_meta_list(Path::new(meta_list_path))?
+        read_path_list(Path::new(meta_list_path))?
     } else if let Some(filename) = &args.maybe_metadata {
         vec![PathBuf::from(filename)]
     } else {
@@ -575,27 +393,8 @@ fn main() -> miette::Result<()> {
     }
 
     let output_dir = PathBuf::from(&args.ttest_output_dir);
-    if !output_dir.exists() {
-        std::fs::create_dir_all(&output_dir)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("cannot create the directory {}", output_dir.display()))?;
-    }
-
-    // Save t_values to a npz file
-    let npz_path = output_dir.join("t_values.npz");
-    info!("Saving t-test results to {}", npz_path.display());
-    let mut npz = NpzWriter::new_compressed(
-        File::create(&npz_path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("cannot create {}", npz_path.display()))?,
-    );
-    npz.add_array("t_values", &t_values)
-        .into_diagnostic()
-        .wrap_err("cannot write the t-values")?;
-    npz.finish()
-        .into_diagnostic()
-        .wrap_err("cannot write the t-values")?;
-    info!("Saved t_values to {}", npz_path.display());
+    create_output_dir(&output_dir)?;
+    write_t_values_npz(&output_dir, &t_values)?;
 
     if let Some(results) = &fold.chi2_results {
         write_chi2_npz(&output_dir.join("chi2.npz"), results)?;
@@ -769,14 +568,6 @@ mod tests {
             ]),
             ["+scope:a", "-signal:a.b", "+scope:c"]
         );
-    }
-
-    #[test]
-    fn max_abs_finite_skips_values_that_are_not_finite() {
-        assert_eq!(max_abs_finite([1.0, -3.0, 2.0]), 3.0);
-        assert_eq!(max_abs_finite([f64::NAN, -2.0, f64::INFINITY]), 2.0);
-        assert!(max_abs_finite([f64::NAN, f64::NEG_INFINITY]).is_nan());
-        assert!(max_abs_finite([]).is_nan());
     }
 
     #[test]

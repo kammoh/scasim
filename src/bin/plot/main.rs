@@ -1,13 +1,15 @@
 use clap::{Parser, Subcommand};
-use itertools::Itertools;
 use log::info;
-use ndarray::{Array1, Array2};
+use miette::{IntoDiagnostic, WrapErr, miette};
 use plotly::common::Mode;
 use plotly::{Plot, Scatter};
-use scalib::ttest;
+use scasim::batch::read_trace_cache;
+use scasim::fold::{Fold, Loaded, create_output_dir, read_path_list, write_t_values_npz};
 use scasim::plot::{plot_max_t_values, plot_t_traces};
-use std::fs::File;
 use std::path::{Path, PathBuf};
+
+/// The conventional TVLA threshold on |t|.
+const T_THRESHOLD: f64 = 4.5;
 
 #[derive(Parser, Debug)]
 #[clap(version)]
@@ -34,7 +36,7 @@ enum Commands {
     #[clap(name = "plot-traces", about = "Plot traces from a NPZ file")]
     PlotTraces {
         /// Indices of the traces to plot
-        #[arg(value_name = "INDICES", index = 1)]
+        #[arg(value_name = "INDICES", index = 1, required = true)]
         trace_indices: Vec<usize>,
 
         #[arg(value_name = "NPZ_FILE", index = 2)]
@@ -46,8 +48,8 @@ enum Commands {
     )]
     TTest {
         /// The highest order of t-test to perform
-        #[arg(short = 'd', default_value_t = 2)]
-        order: usize,
+        #[arg(short = 'd', default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..))]
+        order: u64,
 
         #[arg(long ="filenames", value_name = "NPZ_FILE", num_args = 1..)]
         maybe_filenames: Option<Vec<String>>,
@@ -80,36 +82,25 @@ fn main() -> miette::Result<()> {
             filename,
         } => {
             if trace_indices.is_empty() {
-                panic!("No trace indices provided. Please specify at least one trace index.");
+                return Err(miette!(
+                    "no trace indices provided. Please specify at least one trace index"
+                ));
             }
-
-            // Load the NPZ file using a bufferred reader
-            let file = File::open(&filename).expect("Failed to open NPZ file");
-            let reader = std::io::BufReader::new(file);
-
-            // Parse the NPZ file
-            let mut npz = ndarray_npz::NpzReader::new(reader).expect("Failed to parse NPZ file");
-            let labels: Array1<u16> = npz
-                .by_name("labels")
-                .expect("Failed to find 'labels' in NPZ file");
-            // Create a plot and add the trace
+            let (traces, labels) = read_trace_cache(Path::new(&filename))?;
             let mut plot = Plot::new();
-            for index in &trace_indices {
-                let trace_name = format!("trace_{}", index);
-                let trace_data: Array1<f32> = npz
-                    .by_name(&trace_name)
-                    .unwrap_or_else(|_| panic!("Failed to find '{}' in NPZ file", trace_name));
-
-                let label = labels
-                    .get(*index)
-                    .unwrap_or_else(|| panic!("Failed to get label for index {}", index));
-
+            for &index in &trace_indices {
+                if index >= traces.nrows() {
+                    return Err(miette!(
+                        "{filename} has {} traces, so there is no trace {index}",
+                        traces.nrows()
+                    ));
+                }
                 let scatter_trace = Scatter::new(
-                    (0..trace_data.len()).collect::<Vec<_>>(),
-                    trace_data.to_vec(),
+                    (0..traces.ncols()).collect::<Vec<_>>(),
+                    traces.row(index).to_vec(),
                 )
                 .mode(Mode::Lines)
-                .name(format!("Trace {} (Label: {})", index, label))
+                .name(format!("Trace {} (Label: {})", index, labels[index]))
                 .line(
                     plotly::common::Line::new()
                         .width(1.0)
@@ -128,153 +119,57 @@ fn main() -> miette::Result<()> {
         Commands::TTest {
             order,
             maybe_filenames,
-            maybe_npz_list_path: maybe_meta_list_path,
+            maybe_npz_list_path,
         } => {
-            assert!(order > 0, "Order must be greater than 0");
-
-            let filenames: Vec<PathBuf> = if let Some(meta_list_path) = maybe_meta_list_path {
-                let meta_root_path = PathBuf::from(&meta_list_path)
-                    .parent()
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Meta list path '{}' does not have a parent directory",
-                            meta_list_path
-                        )
-                    })
-                    .to_owned();
-                // Read the meta list file and collect filenames
-                std::fs::read_to_string(meta_list_path)
-                    .expect("Failed to read meta list file")
-                    .lines()
-                    .map(|line| {
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() {
-                            panic!("Empty line in meta list file");
-                        }
-                        let mut p = PathBuf::from(trimmed);
-                        if !p.is_absolute() {
-                            p = meta_root_path.join(p);
-                        }
-                        p
-                    })
-                    .collect_vec()
+            let order = usize::try_from(order)
+                .into_diagnostic()
+                .wrap_err("the order is too large")?;
+            let filenames: Vec<PathBuf> = if let Some(list_path) = &maybe_npz_list_path {
+                read_path_list(Path::new(list_path))?
             } else if let Some(filenames) = maybe_filenames {
-                filenames.into_iter().map(PathBuf::from).collect_vec()
+                filenames.into_iter().map(PathBuf::from).collect()
             } else {
-                panic!("No NPZ files provided. Please specify at least one NPZ file.");
+                return Err(miette!(
+                    "no NPZ files provided. Please specify --filenames or --npz-list"
+                ));
             };
-
-            let mut samples_per_trace = 0;
-            let mut max_t_values = vec![Vec::<f64>::new(); order];
-            let mut num_traces_so_far = vec![];
-
-            let mut maybe_ttacc: Option<ttest::Ttest> = None;
-
             if filenames.is_empty() {
-                panic!("No NPZ files provided. Please specify at least one NPZ file.");
+                return Err(miette!("no NPZ files provided. The list has no files"));
             }
 
-            let mut total_num_traces = 0;
-
-            let t_values = filenames
-                .iter()
-                .fold(None, |_, filename| {
-                    // Load the NPZ file using a bufferred reader
-                    let file = File::open(filename).expect("Failed to open NPZ file");
-                    let reader = std::io::BufReader::new(file);
-
-                    // Parse the NPZ file
-                    info!("Processing file: {}", filename.display());
-                    let mut npz_reader =
-                        ndarray_npz::NpzReader::new(reader).expect("Failed to parse NPZ file");
-                    let labels: Array1<u16> = npz_reader
-                        .by_name("labels")
-                        .expect("Failed to find 'labels' in NPZ file");
-
-                    let traces: Vec<Array1<f32>> = npz_reader
-                        .names()
-                        .expect("Failed to get names from NPZ file")
-                        .iter()
-                        .filter(|&name| name.starts_with("trace_"))
-                        .map(|name| {
-                            npz_reader
-                                .by_name(name.as_str())
-                                .unwrap_or_else(|_| panic!("Failed to find '{}' in NPZ file", name))
-                        })
-                        .collect();
-                    let num_traces = traces.len();
-
-                    total_num_traces += num_traces;
-
-                    let traces_array: Array2<f32> = Array2::from_shape_vec(
-                        (num_traces, traces[0].len()),
-                        traces.into_iter().flatten().collect(),
-                    )
-                    .expect("Failed to create traces array");
-
-                    num_traces_so_far.push(
-                        num_traces_so_far
-                            .last()
-                            .map_or(num_traces, |&last| last + num_traces),
-                    );
-
-                    if samples_per_trace == 0 {
-                        // Initialize samples_per_trace with the length of the first trace
-                        samples_per_trace = traces_array.shape()[1];
-                    } else if samples_per_trace != traces_array.shape()[1] {
-                        panic!(
-                            "Inconsistent number of samples per trace: expected {}, found {}",
-                            samples_per_trace,
-                            traces_array.shape()[1]
-                        );
-                    }
-
-                    if maybe_ttacc.is_none() {
-                        maybe_ttacc = Some(ttest::Ttest::new(samples_per_trace, order));
-                    }
-
-                    if let Some(ref mut ttacc) = maybe_ttacc {
-                        ttacc.update(traces_array.view(), labels.view());
-
-                        let t_values = ttacc.get_ttest();
-                        max_t_values
-                            .iter_mut()
-                            .zip(t_values.rows())
-                            .for_each(|(max_t, t_row)| {
-                                max_t.push(
-                                    t_row
-                                        .iter()
-                                        .filter_map(|&x| x.is_finite().then_some(x.abs()))
-                                        .max_by(|a, b| a.partial_cmp(b).unwrap())
-                                        .expect("Failed to find max t-value in current row"),
-                                );
-                            });
-                        Some(t_values)
-                    } else {
-                        panic!("Ttest accumulator is not initialized");
-                    }
-                })
-                .expect("Failed to compute t-test values");
-
+            // The chi-squared test is not part of this subcommand.
+            let mut fold = Fold::new(order, false);
+            for filename in &filenames {
+                info!("Processing file: {}", filename.display());
+                let (traces, labels) = read_trace_cache(filename)?;
+                fold.add(Loaded {
+                    metadata: filename.clone(),
+                    source: filename.clone(),
+                    traces,
+                    labels,
+                })?;
+            }
+            let t_values = fold
+                .t_values
+                .take()
+                .ok_or_else(|| miette!("there is no batch to analyze"))?;
+            let total_num_traces = fold.num_traces.last().copied().unwrap_or(0);
             log::info!("Total number of traces: {}", total_num_traces);
 
-            let t_threshold = Some(4.5);
+            create_output_dir(output_dir)?;
+            write_t_values_npz(output_dir, &t_values)?;
 
             plot_t_traces(
                 t_values.view(),
-                t_threshold,
+                Some(T_THRESHOLD),
                 false, // abs_values
                 output_dir,
                 args.show_plots,
             )?;
-
-            assert!(max_t_values.len() == order);
-            assert!(num_traces_so_far.len() == max_t_values[0].len());
-
             plot_max_t_values(
-                &max_t_values,
-                &num_traces_so_far,
-                t_threshold,
+                &fold.max_t,
+                &fold.num_traces,
+                Some(T_THRESHOLD),
                 output_dir,
                 args.show_plots,
             )?;
