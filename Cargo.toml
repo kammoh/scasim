@@ -8,7 +8,8 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 itertools = "0.15.0"
 wellen = "0.25.6"
 fst-reader = "0.17"
-# must match the ndarray version of scalib (pinned to 0.16 by its nshare dependency)
+# Stays at 0.16: `ndarray-npz` 0.4 (and `ndarray-npy` 0.9) depend on ndarray 0.16. Two ndarray
+# versions would make the array types of the two crates differ.
 ndarray = { version = "0.16.1", features = ["approx", "rayon", "serde"] }
 ndarray-npz = "0.4.2"
 # Only `plotly_embed_js`. The features for static export (`static_export_*`, `plotly_image`)
@@ -26,7 +27,6 @@ plotters = { version = "0.3.7", default-features = false, features = [
 # Direct dependency only to enable `bitmap_encoder` of the SVG backend, which embeds a
 # raster image (for the heatmap of plan A2c). It is the crate that `plotters` uses.
 plotters-svg = { version = "0.3.7", features = ["bitmap_encoder"] }
-scalib = { path = "deps/SCALib/src/scalib_ext/scalib" }
 flate2 = "1.1.10"
 serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
 miette = { version = "7.6.0", features = ["fancy"] }
@@ -40,8 +40,6 @@ serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
 approx = "0.5.1"
-ndarray-rand = "0.15.0"
-ndarray-stats = "0.6.0"
 fst-writer = "0.3.1"
 proptest = "1"
 tempfile = "3"

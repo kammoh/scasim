@@ -580,6 +580,21 @@ fn no_static_export_or_system_font_crates_are_in_the_dependency_tree() {
     }
 }
 
+/// SCALib was removed. Its crates (and the C++ build of `geigen`) must not come back.
+#[test]
+fn scalib_and_the_crates_it_needed_are_not_in_the_dependency_tree() {
+    let Some(all) = cargo_tree(["-p", "scasim", "-e=normal"]) else {
+        println!("cannot run cargo: skipped");
+        return;
+    };
+    for forbidden in ["scalib", "geigen", "nshare", "plotly_static", "fantoccini"] {
+        assert!(
+            !all.contains(forbidden),
+            "the dependency tree of scasim has {forbidden:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // static images (plotters)
 // ---------------------------------------------------------------------------------------
