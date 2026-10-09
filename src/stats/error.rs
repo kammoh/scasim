@@ -35,6 +35,9 @@ pub enum StatsError {
     /// A test asked for a class that has no data in the accumulator.
     #[error("class label {0} is not in the accumulator")]
     UnknownLabel(u16),
+    /// A test lists the same class label twice.
+    #[error("class label {0} is listed twice")]
+    DuplicateLabel(u16),
     /// Two accumulators cannot be merged.
     #[error("incompatible accumulators: {0}")]
     Incompatible(String),

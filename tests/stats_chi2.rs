@@ -5,12 +5,16 @@
 //! * mpmath for `-log10(p)` of the chi-squared survival function (`pvalue_mpmath.json`), and
 //!   `statrs` as a linear-domain comparison.
 //! * SciPy `norm.isf` for the inverse normal (`norm_isf.json`).
+//! * The histogram accumulator against the table test, bit for bit.
 //!
 //! The fixtures are in `tests/fixtures/stats/`. Their generators are in `scripts/fixtures/`.
 
+use ndarray::{Array1, Array2};
 use scasim::stats::special::{chi2_ln_sf, ln_gamma, neg_log10_chi2_sf, normal_isf};
 use scasim::stats::threshold::t_bonferroni;
-use scasim::stats::{Statistic, TestOptions, TestResult, Workspace, test_table};
+use scasim::stats::{
+    Binning, HistAccumulator, Statistic, TestOptions, TestResult, Workspace, test_table,
+};
 use serde_json::Value;
 use statrs::distribution::{ChiSquared, ContinuousCDF};
 
@@ -157,6 +161,67 @@ fn g_matches_mpmath_and_scipy() {
     assert!(worst_mp < 1.0e-13);
     assert!(vs_scipy.stat_abs_scaled < 2.0e-9);
     assert!(vs_scipy.nlp_rel < 1.0e-8);
+}
+
+/// Builds an accumulator with one sample from a table: row `i` is class `i`, column `j` is
+/// value `j`, and each cell becomes that many traces.
+fn accumulator_from(table: &[Vec<u32>], max_dense: usize) -> HistAccumulator {
+    let mut values = Vec::new();
+    let mut labels = Vec::new();
+    for (i, row) in table.iter().enumerate() {
+        for (j, &n) in row.iter().enumerate() {
+            for _ in 0..n {
+                values.push(j as u16);
+                labels.push(i as u16);
+            }
+        }
+    }
+    let traces = Array2::from_shape_vec((values.len(), 1), values).unwrap();
+    let mut acc = HistAccumulator::with_max_dense_bins(1, Binning::Exact, max_dense);
+    acc.update(traces.view(), Array1::from(labels).view())
+        .unwrap();
+    acc
+}
+
+#[test]
+fn accumulator_end_to_end_is_bit_identical_to_the_table_test() {
+    let cases = load_cases();
+    let mut checked = 0;
+    for case in &cases {
+        let total: u64 = case.table.iter().flatten().map(|&c| u64::from(c)).sum();
+        if total > 120_000 {
+            continue;
+        }
+        for max_dense in [4096, 0] {
+            let acc = accumulator_from(&case.table, max_dense);
+            for statistic in [Statistic::Pearson, Statistic::G] {
+                let opts = TestOptions {
+                    statistic,
+                    min_expected: 0.0,
+                };
+                let got = acc.test_all(&opts).unwrap()[0];
+                let want = run(&case.table, statistic);
+                // Rows that are all zero never appear in the accumulator, so the row set is the
+                // same after dropping. The statistic must not change by a single bit.
+                assert_eq!(
+                    got.statistic.to_bits(),
+                    want.statistic.to_bits(),
+                    "{}",
+                    case.name
+                );
+                assert_eq!(got.dof, want.dof, "{}", case.name);
+                assert_eq!(
+                    got.neg_log10_p.to_bits(),
+                    want.neg_log10_p.to_bits(),
+                    "{}",
+                    case.name
+                );
+            }
+        }
+        checked += 1;
+    }
+    eprintln!("{checked} tables checked through the accumulator (dense and sparse)");
+    assert!(checked > 100);
 }
 
 #[test]
