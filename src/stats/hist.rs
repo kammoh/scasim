@@ -196,7 +196,7 @@ impl SampleHist {
 
     /// Moves the class rows to their new slots. `old_to_new[i]` is the new slot of the old slot
     /// `i`, and `new_slots` is the new number of slots. The new slots that no old slot maps to
-    /// are empty.
+    /// are empty. The size of a new dense layout is checked before it is allocated.
     fn relabel(&mut self, old_to_new: &[u16], new_slots: usize) {
         let keeps_order = old_to_new
             .iter()
@@ -205,6 +205,13 @@ impl SampleHist {
         if keeps_order {
             self.ensure_slots(new_slots);
             return;
+        }
+        // Check the size of the new layout before any allocation. A dense histogram that would
+        // need too many counters becomes sparse first, and its slots are then re-keyed.
+        if let Self::Dense(d) = self
+            && new_slots.saturating_mul(d.width) > MAX_DENSE_COUNTERS
+        {
+            self.make_sparse();
         }
         match self {
             Self::Dense(d) => {
@@ -1415,5 +1422,73 @@ mod tests {
             acc.test_all(&opts),
             Err(StatsError::InvalidState(_))
         ));
+    }
+
+    /// Fix round 2, item 1. A valid dense histogram has one class and a window of 2^20 bins
+    /// (4 MiB). Adding labels that sort before it moves its row, and `relabel` must not
+    /// allocate `new_slots * width` counters (here 258 * 2^20, above `MAX_DENSE_COUNTERS`). The
+    /// sample becomes sparse first. The review used 65,536 labels (256 GiB).
+    #[test]
+    fn relabel_does_not_allocate_too_many_counters() {
+        let wide = MAX_DENSE_BINS_LIMIT as i64 - 1;
+        let first = |label: u16| {
+            let mut acc =
+                HistAccumulator::with_max_dense_bins(1, Binning::Exact, MAX_DENSE_BINS_LIMIT);
+            let traces = Array2::from_shape_vec((2, 1), vec![0_i64, wide]).unwrap();
+            acc.update(traces.view(), Array1::from(vec![label, label]).view())
+                .unwrap();
+            assert!(!acc.is_sparse(0), "a 2^20 window with one class is dense");
+            acc
+        };
+        let classes = MAX_DENSE_COUNTERS / MAX_DENSE_BINS_LIMIT + 2; // 258 slots in total
+        let low_labels: Vec<u16> = (0..classes as u16 - 1).collect();
+        let check = |acc: &HistAccumulator| {
+            assert!(
+                acc.is_sparse(0),
+                "258 * 2^20 counters must not be allocated"
+            );
+            assert!(
+                acc.memory_bytes() < 64 << 20,
+                "{} bytes",
+                acc.memory_bytes()
+            );
+            assert_eq!(acc.labels().len(), classes);
+            assert_eq!(acc.histogram(0, 65535), vec![(0, 1), (wide, 1)]);
+            assert_eq!(acc.class_count(65535), 2);
+            for &l in &low_labels {
+                assert_eq!(acc.histogram(0, l), vec![(5, 1)], "label {l}");
+            }
+            acc.validate().unwrap();
+        };
+        // Merge: the labels of `other` all sort before label 65535.
+        let mut other =
+            HistAccumulator::with_max_dense_bins(1, Binning::Exact, MAX_DENSE_BINS_LIMIT);
+        let five = Array2::from_elem((low_labels.len(), 1), 5_i64);
+        other
+            .update(five.view(), Array1::from(low_labels.clone()).view())
+            .unwrap();
+        let mut merged = first(65535);
+        merged.merge(&other).unwrap();
+        check(&merged);
+        // Update with the same labels.
+        let mut updated = first(65535);
+        updated
+            .update(five.view(), Array1::from(low_labels.clone()).view())
+            .unwrap();
+        check(&updated);
+    }
+
+    /// The slot arithmetic cannot overflow `usize`, even with a corrupt width on 32-bit targets.
+    #[test]
+    fn relabel_uses_saturating_arithmetic() {
+        let mut h = SampleHist::Dense(Dense {
+            base: 0,
+            width: usize::MAX / 2,
+            slots: 1,
+            counts: Vec::new(),
+        });
+        // Not a valid state; `relabel` must switch to sparse and not allocate or wrap.
+        h.relabel(&[1], 2);
+        assert!(matches!(h, SampleHist::Sparse(_)));
     }
 }
