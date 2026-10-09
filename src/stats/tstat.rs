@@ -4,12 +4,14 @@
 //! ePrint 2015/207, Section 4 and Appendix A. The central sums use Pébay's
 //! parallel moment formulas, SAND2008-6212.
 //!
-//! The accumulator stores raw central sums through order `2d` in `f64`. For a positive-
-//! variance class, each needed `CS_p` must be finite and each `CM_p = CS_p / n` must be finite
-//! and normal. A needed `CM_p` that is zero or subnormal returns NaN. A zero-variance class
-//! keeps the zero-denominator rules below. The exact rule applies to the moments used by the
-//! requested order: `p = 2` for order 1; `p = 2, 4` for order 2; and `p = 2, k, 2k` for order
-//! `k >= 3`. In particular, the largest needed sum scales as `n * sd^(2d)` and must stay in
+//! The accumulator stores raw central sums through order `2d` in `f64`. Any needed raw,
+//! normalized, or scaled moment must be finite and either zero or normal. A subnormal moment,
+//! a negative raw `CS_2`, or a positive `CS_2` that becomes zero or subnormal after division
+//! returns NaN. Nonzero variance terms and the denominator must also be normal.
+//! A zero-variance class keeps the zero-denominator rules below. The exact rule applies to the
+//! moments used by the requested order: `p = 2` for order 1; `p = 2, 4` for order 2; and
+//! `p = 2, k, 2k` for order `k >= 3`. In particular, the largest needed sum scales as
+//! `n * sd^(2d)` and must stay in
 //! the normal `f64` range. For `d = 4`, this gives an approximate standard-deviation range of
 //! `1e-38` to `1e38` for ordinary class sizes. The scale stays at one when `2^-60 <= CM_2 <=
 //! 2^60`, which preserves the original operation order and bit pattern in the normal range.
@@ -61,10 +63,22 @@ pub fn welch_t(order: usize, a: &ClassSample<'_>, b: &ClassSample<'_>) -> f64 {
     {
         return f64::NAN;
     }
+    let moment = |s: &ClassSample<'_>, p: usize| {
+        let raw = s.cs[(p - 2) * s.cs_stride];
+        if !in_range(raw) || (p == 2 && raw < 0.0) {
+            return f64::NAN;
+        }
+        let normalized = raw / s.n as f64;
+        if !in_range(normalized) || (p == 2 && raw > 0.0 && normalized == 0.0) {
+            f64::NAN
+        } else {
+            normalized
+        }
+    };
     let (diff, va, vb) = if order <= 2 {
-        let cm2a = a.cs[0] / a.n as f64;
-        let cm2b = b.cs[0] / b.n as f64;
-        if (cm2a > 0.0 && !normal(cm2a)) || (cm2b > 0.0 && !normal(cm2b)) {
+        let cm2a = moment(a, 2);
+        let cm2b = moment(b, 2);
+        if cm2a.is_nan() || cm2b.is_nan() {
             return f64::NAN;
         }
         let exponent = scale_exponent(cm2a.max(cm2b));
@@ -73,32 +87,34 @@ pub fn welch_t(order: usize, a: &ClassSample<'_>, b: &ClassSample<'_>) -> f64 {
                 + (scale_pow2(a.offset, -exponent) - scale_pow2(b.offset, -exponent));
             let va = scale_pow2(cm2a, -2 * exponent);
             let vb = scale_pow2(cm2b, -2 * exponent);
-            if ![diff, va, vb].into_iter().all(f64::is_finite) {
+            if !diff.is_finite() || ![va, vb].into_iter().all(in_range) {
                 return f64::NAN;
             }
             (diff, va, vb)
         } else {
-            let cm4a = a.cs[2 * a.cs_stride] / a.n as f64;
-            let cm4b = b.cs[2 * b.cs_stride] / b.n as f64;
-            if (cm2a > 0.0 && !normal(cm4a)) || (cm2b > 0.0 && !normal(cm4b)) {
+            let cm4a = moment(a, 4);
+            let cm4b = moment(b, 4);
+            if cm4a.is_nan() || cm4b.is_nan() {
                 return f64::NAN;
             }
             let cm2a = scale_pow2(cm2a, -2 * exponent);
             let cm2b = scale_pow2(cm2b, -2 * exponent);
             let cm4a = scale_pow2(cm4a, -4 * exponent);
             let cm4b = scale_pow2(cm4b, -4 * exponent);
+            if ![cm2a, cm2b, cm4a, cm4b].into_iter().all(in_range) {
+                return f64::NAN;
+            }
             let diff = cm2a - cm2b;
             let va = cm4a - cm2a * cm2a;
             let vb = cm4b - cm2b * cm2b;
-            if ![diff, va, vb].into_iter().all(f64::is_finite) {
+            if !diff.is_finite() || ![va, vb].into_iter().all(in_range) {
                 return f64::NAN;
             }
             (diff, va, vb)
         }
     } else {
-        let cm = |s: &ClassSample<'_>, p: usize| s.cs[(p - 2) * s.cs_stride] / s.n as f64;
-        let (ma, va) = preprocessed(order, cm(a, 2), |p| cm(a, p));
-        let (mb, vb) = preprocessed(order, cm(b, 2), |p| cm(b, p));
+        let (ma, va) = preprocessed(order, moment(a, 2), |p| moment(a, p));
+        let (mb, vb) = preprocessed(order, moment(b, 2), |p| moment(b, p));
         (ma - mb, va, vb)
     };
     if va < 0.0 || vb < 0.0 {
@@ -108,7 +124,15 @@ pub fn welch_t(order: usize, a: &ClassSample<'_>, b: &ClassSample<'_>) -> f64 {
         return f64::NAN;
     }
     let variance = va / a.n as f64 + vb / b.n as f64;
-    if variance < 0.0 || !variance.is_finite() {
+    let va_per_n = va / a.n as f64;
+    let vb_per_n = vb / b.n as f64;
+    let denominator = variance.sqrt();
+    if variance < 0.0
+        || !in_range(va_per_n)
+        || !in_range(vb_per_n)
+        || !in_range(variance)
+        || (variance > 0.0 && !normal(denominator))
+    {
         return f64::NAN;
     }
     if variance == 0.0 {
@@ -120,7 +144,7 @@ pub fn welch_t(order: usize, a: &ClassSample<'_>, b: &ClassSample<'_>) -> f64 {
             f64::NAN
         };
     }
-    let result = diff / variance.sqrt();
+    let result = diff / denominator;
     if !result.is_finite() {
         f64::NAN
     } else {
@@ -144,11 +168,14 @@ fn preprocessed(order: usize, cm2: f64, cm: impl Fn(usize) -> f64) -> (f64, f64)
     let cm2_scaled = scaled(2);
     let cmk_raw = cm(order);
     let cm2k_raw = cm(2 * order);
-    if !normal(cmk_raw) || !normal(cm2k_raw) {
+    if !in_range(cmk_raw) || !in_range(cm2k_raw) {
         return (f64::NAN, f64::NAN);
     }
     if order == 2 {
         let cm4_scaled = scaled(4);
+        if ![cm2_scaled, cm4_scaled].into_iter().all(in_range) {
+            return (f64::NAN, f64::NAN);
+        }
         (cm2_scaled, cm4_scaled - cm2_scaled * cm2_scaled)
     } else {
         let k = order as i32;
@@ -158,7 +185,7 @@ fn preprocessed(order: usize, cm2: f64, cm: impl Fn(usize) -> f64) -> (f64, f64)
         let out_var = (cm2k - cmk * cmk) / cm2_scaled.powi(k);
         if ![cm2_scaled, cmk, cm2k, mean, out_var]
             .into_iter()
-            .all(f64::is_finite)
+            .all(in_range)
         {
             return (f64::NAN, f64::NAN);
         }
@@ -169,6 +196,11 @@ fn preprocessed(order: usize, cm2: f64, cm: impl Fn(usize) -> f64) -> (f64, f64)
 #[inline]
 fn normal(value: f64) -> bool {
     value.is_finite() && value.abs() >= f64::MIN_POSITIVE
+}
+
+#[inline]
+fn in_range(value: f64) -> bool {
+    value.is_finite() && (value == 0.0 || normal(value))
 }
 
 #[inline]
@@ -228,6 +260,39 @@ mod tests {
         assert!(welch_t(1, &a, &b).is_nan());
         let negative = [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let a = sample(5, 10.0, 0.0, &negative);
+        assert!(welch_t(1, &a, &b).is_nan());
+    }
+
+    #[test]
+    fn subnormal_scaled_order_two_moment_gives_nan() {
+        let large = 2.0f64.powi(100);
+        let small = 3.0 * 2.0f64.powi(-168);
+        let a_sums = [4.0 * large.powi(2), 0.0, 4.0 * large.powi(4)];
+        let b_sums = [2.0 * small.powi(2), 0.0, 2.0 * small.powi(4)];
+        let a = sample(4, 0.0, 0.0, &a_sums);
+        let b = sample(4, 0.0, 0.0, &b_sums);
+
+        assert!(welch_t(2, &a, &b).is_nan());
+    }
+
+    #[test]
+    fn positive_raw_variance_that_divides_to_zero_gives_nan() {
+        let raw_cs2 = 2.0f64.powi(-1074);
+        let a_sums = [raw_cs2, 0.0];
+        let b_sums = [0.0, 0.0];
+        let a = sample(3, 0.0, 1.25 * 2.0f64.powi(-537), &a_sums);
+        let b = sample(3, 0.0, 0.0, &b_sums);
+
+        assert!(welch_t(1, &a, &b).is_nan());
+    }
+
+    #[test]
+    fn negative_raw_variance_gives_nan_after_shared_scaling() {
+        let a_sums = [4.0 * 2.0f64.powi(200), 0.0];
+        let b_sums = [-4.0 * 2.0f64.powi(-1022), 0.0];
+        let a = sample(4, 1.0, 0.0, &a_sums);
+        let b = sample(4, 0.0, 0.0, &b_sums);
+
         assert!(welch_t(1, &a, &b).is_nan());
     }
 
