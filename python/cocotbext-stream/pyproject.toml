@@ -24,4 +24,3 @@ namespaces = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
-filterwarnings = ["ignore:\\(rm_rf\\) error removing"]

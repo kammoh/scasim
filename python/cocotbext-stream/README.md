@@ -3,7 +3,7 @@
 Low-overhead valid/ready stream drivers, monitors, and scoreboards for cocotb 2.1 and later.
 It replaces `cocotb-bus` based helpers such as the `cocotb_ext` package in krystals_hw.
 
-Install: `pip install -e .` (needs `cocotb>=2.1` and Python 3.10 or later). Tests: `pytest`.
+Install: `pip install -e .` (needs `cocotb>=2.1` and Python 3.10 or later). Tests: `pytest` (run `pip install -e .` first).
 The simulator tests need Verilator on `PATH`. They are skipped if Verilator or cocotb 2.1 is missing.
 
 ## Timing model
