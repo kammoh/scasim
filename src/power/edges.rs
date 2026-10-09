@@ -149,7 +149,7 @@ pub fn probe_edge_times(
 }
 
 /// The statistics of the clock periods, for the report.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EdgeSummary {
     /// The number of edges. The number of bins is one less.
     pub edges: usize,

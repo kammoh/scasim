@@ -142,6 +142,13 @@ fn main() -> miette::Result<()> {
             for filename in &filenames {
                 info!("Processing file: {}", filename.display());
                 let (traces, labels) = read_trace_cache(filename)?;
+                if traces.nrows() <= 1 {
+                    return Err(miette!(
+                        "the batch {} has {} traces; a t-test needs at least two traces",
+                        filename.display(),
+                        traces.nrows()
+                    ));
+                }
                 fold.add(Loaded {
                     metadata: filename.clone(),
                     source: filename.clone(),

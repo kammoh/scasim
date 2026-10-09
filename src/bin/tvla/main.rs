@@ -2,7 +2,7 @@ use clap::{ArgGroup, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEn
 use itertools::Itertools;
 use log::*;
 use miette::{IntoDiagnostic, WrapErr, miette};
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Axis};
 use ndarray_npz::NpzWriter;
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
@@ -21,9 +21,11 @@ use scasim::scopes::{group_by_scope, scope_plan};
 use scasim::shuffle::shuffle_labels;
 use scasim::stats::threshold::{CONVENTIONAL, bonferroni, family_size, t_bonferroni};
 use scasim::stats::{HistAccumulator, TestResult};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+mod cache;
 mod channels;
 mod summary;
 
@@ -78,9 +80,27 @@ impl From<LengthPolicyArg> for LengthPolicy {
     ArgGroup::new("meta")
         .required(true)
         .multiple(true)
-        .args(["maybe_metadata", "maybe_meta_list_path"])
+        .args(["maybe_metadata", "maybe_meta_list_path", "merge_stats"])
 ))]
 struct Args {
+    /// Evaluate this pair of labels. Caches keep every label.
+    #[arg(long, num_args=2, default_values=["0","1"])]
+    pair: Vec<u16>,
+    /// Evaluate this group.
+    #[arg(long, conflicts_with = "pool_groups")]
+    group: Option<u64>,
+    /// Pool all groups explicitly.
+    #[arg(long)]
+    pool_groups: bool,
+    /// Write a validated per-batch statistics cache. Requires one --meta-json batch.
+    #[arg(long, requires="maybe_metadata", conflicts_with_all=["maybe_meta_list_path","merge_stats"])]
+    stats_out: Option<PathBuf>,
+    /// Merge statistics caches in the given order.
+    #[arg(long, num_args=1.., conflicts_with_all=["maybe_metadata","maybe_meta_list_path","list_signals","clock","edges","offset","include","exclude","per_scope","depth","shuffle_labels"])]
+    merge_stats: Vec<PathBuf>,
+    /// Curve checkpoints: every, every:K (K > 0), or final.
+    #[arg(long, default_value = "every")]
+    curve: String,
     /// Metadata file (`meta.json` or `meta.json.gz`) of one batch.
     #[arg(long = "meta-json", value_name = "META_JSON")]
     maybe_metadata: Option<String>,
@@ -189,12 +209,12 @@ struct Args {
     )]
     depth: u64,
     /// Null run: shuffle the labels of each batch before the statistics, with a generator seeded
-    /// by SEED and the batch number. The run is reproducible and the class counts do not change.
+    /// by SEED and the stable batch id. The run is reproducible and the class counts do not change.
     /// All outputs are written as usual. Use it to see how large |t| gets without a leak.
     #[arg(long = "shuffle-labels", value_name = "SEED")]
     shuffle_labels: Option<u64>,
     /// What to do when the traces have different lengths. `pad`: pad shorter traces with zeros.
-    /// A later batch is padded or cut to the length of the first batch. `truncate`: cut traces to
+    /// Both axes grow to the longest batch. `truncate`: cut traces to
     /// the shortest trace of the batch, and to the shortest length of all batches so far. The
     /// final result does not depend on the order of the batches. `error`: any difference is an error. Default: `pad` without
     /// --clock, `error` with --clock. A policy other than `pad` turns `traces.npz` off.
@@ -318,6 +338,8 @@ struct BatchSettings<'a> {
     per_scope: Option<(String, usize)>,
     /// The seed of the shuffle of the labels (`--shuffle-labels`).
     shuffle_seed: Option<u64>,
+    stats_common: Option<cache::CommonKey>,
+    stats_out: Option<PathBuf>,
 }
 
 /// The traces of one per-scope channel in one batch.
@@ -329,6 +351,9 @@ struct ScopeTraces {
 
 /// One batch: the traces of the whole selection, and the per-scope channels (if asked).
 struct BatchResult {
+    meta: scasim::batch::BatchMeta,
+    identities: Vec<cache::ChannelIdentity>,
+    key: Option<cache::CacheKey>,
     total: Loaded,
     scopes: Vec<ScopeTraces>,
     edges: Option<EdgeReport>,
@@ -359,13 +384,39 @@ fn cache_is_fresh(cache: &Path, waveform: &Path, metadata: &Path) -> bool {
 /// Reads the traces and labels of one batch from the cache or computes them from the waveform.
 /// Also returns the edge report of the batch, if it was computed in edges mode.
 fn batch_data(
-    batch_index: usize,
+    _batch_index: usize,
     metadata_path: &Path,
     settings: &BatchSettings<'_>,
 ) -> miette::Result<BatchResult> {
     let mut result = load_batch(metadata_path, settings)?;
     if let Some(seed) = settings.shuffle_seed {
-        shuffle_labels(&mut result.total.labels, seed, batch_index);
+        // Stable batch identity makes separate --stats-out jobs match a normal run.
+        let id = batch_id(&result.meta, metadata_path);
+        let hash = cache::digest(id.as_bytes());
+        let identity = u64::from_le_bytes(hash[..8].try_into().expect("eight bytes")) as usize;
+        let groups = batch_groups(&result.meta, result.total.labels.len());
+        for group in groups.iter().copied().collect::<BTreeSet<_>>() {
+            let rows: Vec<usize> = groups
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| **g == group)
+                .map(|(i, _)| i)
+                .collect();
+            let mut labels = result.total.labels.select(Axis(0), &rows);
+            shuffle_labels(&mut labels, seed, identity);
+            for (i, l) in rows.into_iter().zip(labels) {
+                result.total.labels[i] = l;
+            }
+        }
+    }
+    if let Some(path) = &settings.stats_out {
+        let mut cache = batch_cache(&result)?;
+        for channel in &mut cache.channels {
+            for h in channel.groups.values_mut() {
+                h.compact();
+            }
+        }
+        cache.write(path)?;
     }
     Ok(result)
 }
@@ -379,6 +430,16 @@ fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Res
         ));
     }
     let meta = read_batch_meta(metadata_path)?;
+    let key = settings
+        .stats_common
+        .as_ref()
+        .map(|common| {
+            cache::BatchKey::new(&meta).map(|batch| cache::CacheKey {
+                common: common.clone(),
+                batch,
+            })
+        })
+        .transpose()?;
     let trace_file_path = meta.trace_path.clone();
     let parent_folder_path = metadata_path.parent().unwrap_or(Path::new("."));
     let npz_path = parent_folder_path.join("traces.npz");
@@ -391,6 +452,7 @@ fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Res
 
     if settings.use_existing
         && settings.cache_allowed
+        && meta.v1.is_none()
         && npz_path.exists()
         && cache_is_fresh(&npz_path, &trace_file_path, metadata_path)
     {
@@ -400,6 +462,9 @@ fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Res
         );
         let data = read_trace_cache(&npz_path)?;
         return Ok(BatchResult {
+            meta,
+            identities: Vec::new(),
+            key,
             total: loaded(npz_path, data),
             scopes: Vec::new(),
             edges: None,
@@ -408,6 +473,13 @@ fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Res
         });
     }
 
+    if meta.v1.is_none() && meta.markers.len() <= 1 {
+        return Err(miette!(
+            "the batch {} has {} traces; a t-test needs at least two traces",
+            metadata_path.display(),
+            meta.markers.len()
+        ));
+    }
     println!(
         "Computing power traces from {}...",
         trace_file_path.display()
@@ -453,7 +525,60 @@ fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Res
             scope_plan(settings.selection.clone(), &groups)
         }
     };
+    let identities = if settings.stats_out.is_some() {
+        let index = hierarchy_index(&trace_file_path).into_diagnostic()?;
+        plan.channels
+            .iter()
+            .enumerate()
+            .map(|(channel_index, channel)| {
+                let selected = channel
+                    .selection
+                    .resolve(&index)
+                    .into_diagnostic()?
+                    .selected;
+                let handles: Vec<_> = selected
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| **s)
+                    .map(|(h, _)| {
+                        let mut paths: Vec<_> =
+                            index.paths[h].iter().map(|p| p.path.clone()).collect();
+                        paths.sort();
+                        (h, paths)
+                    })
+                    .collect();
+                Ok(cache::ChannelIdentity {
+                    name: if channel_index == 0 {
+                        "total".into()
+                    } else {
+                        channel.name.clone()
+                    },
+                    handles: handles.len(),
+                    handles_hash: cache::digest(&serde_json::to_vec(&handles).into_diagnostic()?),
+                })
+            })
+            .collect::<miette::Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     let output = compute_batch(&meta, &plan, &settings.sampling, settings.policy)?;
+    if let Some(key) = &key {
+        let stat = std::fs::metadata(&trace_file_path).into_diagnostic()?;
+        let mtime = stat
+            .modified()
+            .into_diagnostic()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .into_diagnostic()?;
+        if stat.len() != key.batch.waveform_size
+            || mtime.as_secs() != key.batch.waveform_mtime_seconds
+            || mtime.subsec_nanos() != key.batch.waveform_mtime_nanos
+        {
+            return Err(miette!(
+                "{} changed during analysis",
+                trace_file_path.display()
+            ));
+        }
+    }
     let diagnostics = output.diagnostics;
     let labels_array = output.labels;
     let mut channel_traces = output.channels.into_iter();
@@ -486,7 +611,7 @@ fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Res
     );
     report_selection(&trace_file_path.display().to_string(), &diagnostics);
 
-    if settings.cache_allowed {
+    if settings.cache_allowed && meta.v1.is_none() {
         println!("Saving traces and labels to NPZ file...");
         let start_time = std::time::Instant::now();
         write_trace_cache(&npz_path, &traces_array, &labels_array)?;
@@ -497,11 +622,125 @@ fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Res
         );
     }
     Ok(BatchResult {
+        meta,
+        identities,
+        key,
         total: loaded(trace_file_path, (traces_array, labels_array)),
         scopes,
         edges: diagnostics.edges,
         aliased,
         outside,
+    })
+}
+
+fn batch_id(meta: &scasim::batch::BatchMeta, path: &Path) -> String {
+    meta.v1
+        .as_ref()
+        .map(|v| v.batch.id.clone())
+        .unwrap_or_else(|| {
+            format!(
+                "legacy:{}",
+                path.canonicalize()
+                    .unwrap_or_else(|_| path.to_path_buf())
+                    .display()
+            )
+        })
+}
+fn batch_groups(meta: &scasim::batch::BatchMeta, rows: usize) -> Vec<u64> {
+    meta.v1
+        .as_ref()
+        .map(|v| v.segments.iter().map(|s| s.group).collect())
+        .unwrap_or_else(|| vec![0; rows])
+}
+fn batch_names(meta: &scasim::batch::BatchMeta) -> (BTreeMap<u16, String>, BTreeMap<u64, String>) {
+    if let Some(v) = &meta.v1 {
+        (v.labels.clone(), v.groups.clone())
+    } else {
+        (
+            meta.markers
+                .iter()
+                .map(|m| {
+                    (
+                        m.2,
+                        match m.2 {
+                            0 => "fixed".into(),
+                            1 => "random".into(),
+                            n => n.to_string(),
+                        },
+                    )
+                })
+                .collect(),
+            BTreeMap::from([(0, "default".into())]),
+        )
+    }
+}
+fn merge_names<K: Ord + std::fmt::Display>(
+    dest: &mut BTreeMap<K, String>,
+    source: BTreeMap<K, String>,
+    kind: &str,
+) -> miette::Result<()> {
+    for (id, name) in source {
+        if dest.get(&id).is_some_and(|n| n != &name) {
+            return Err(miette!("{kind} {id} has different names"));
+        }
+        dest.insert(id, name);
+    }
+    Ok(())
+}
+fn batch_cache(result: &BatchResult) -> miette::Result<cache::Cache> {
+    let (labels, groups) = batch_names(&result.meta);
+    let group_ids = batch_groups(&result.meta, result.total.labels.len());
+    let mut counts: BTreeMap<u64, BTreeMap<u16, u64>> = BTreeMap::new();
+    for (&group, &label) in group_ids.iter().zip(&result.total.labels) {
+        *counts.entry(group).or_default().entry(label).or_default() += 1;
+    }
+    let matrices =
+        std::iter::once(&result.total.traces).chain(result.scopes.iter().map(|s| &s.traces));
+    let channels = matrices
+        .zip(&result.identities)
+        .map(|(traces, identity)| {
+            let mut groups = BTreeMap::new();
+            for group in counts.keys() {
+                let rows: Vec<usize> = group_ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, g)| *g == group)
+                    .map(|(i, _)| i)
+                    .collect();
+                let mut hist = HistAccumulator::new(traces.ncols(), scasim::stats::Binning::Exact);
+                hist.update(
+                    traces.select(Axis(0), &rows).view(),
+                    result.total.labels.select(Axis(0), &rows).view(),
+                )
+                .into_diagnostic()?;
+                groups.insert(*group, hist);
+            }
+            Ok(cache::Channel {
+                identity: identity.clone(),
+                groups,
+            })
+        })
+        .collect::<miette::Result<Vec<_>>>()?;
+    Ok(cache::Cache {
+        key: result.key.clone().expect("statistics output has a key"),
+        batch_id: batch_id(&result.meta, &result.total.metadata),
+        axis: cache::SampleAxis {
+            relative_to_segment: true,
+            length: result.total.traces.ncols(),
+        },
+        counts,
+        labels,
+        groups,
+        channels,
+        extensions: result
+            .meta
+            .v1
+            .as_ref()
+            .map(|v| v.extensions.to_string())
+            .unwrap_or_else(|| "{}".into()),
+        edges: result.edges.clone(),
+        aliased: result.aliased,
+        outside: result.outside,
     })
 }
 
@@ -521,11 +760,13 @@ fn add_to_scope_folds(
     order: usize,
     chi2: bool,
     policy: LengthPolicy,
+    pair: [u16; 2],
 ) -> miette::Result<()> {
     if folds.is_empty() {
         folds.extend(scopes.iter().map(|s| {
             let mut fold = Fold::without_curves(order, chi2);
             fold.policy = policy;
+            fold.pair = pair;
             ScopeFold {
                 name: s.name.clone(),
                 handles: s.handles,
@@ -563,13 +804,20 @@ fn main() -> miette::Result<()> {
         .init();
 
     let matches = Args::command().get_matches();
-    let args = Args::from_arg_matches(&matches).into_diagnostic()?;
+    let mut args = Args::from_arg_matches(&matches).into_diagnostic()?;
     let rules = ordered_rules(&matches);
     let selection = Selection::parse(&rules)
         .into_diagnostic()
         .wrap_err("invalid value for --include or --exclude")?;
 
-    let filenames: Vec<PathBuf> = if let Some(meta_list_path) = &args.maybe_meta_list_path {
+    let pair = [args.pair[0], args.pair[1]];
+    if pair[0] == pair[1] {
+        return Err(miette!("--pair needs two different labels"));
+    }
+    let merging = !args.merge_stats.is_empty();
+    let filenames: Vec<PathBuf> = if merging {
+        Vec::new()
+    } else if let Some(meta_list_path) = &args.maybe_meta_list_path {
         read_path_list(Path::new(meta_list_path))?
     } else if let Some(filename) = &args.maybe_metadata {
         vec![PathBuf::from(filename)]
@@ -577,7 +825,7 @@ fn main() -> miette::Result<()> {
         // `clap` requires one of the two options.
         unreachable!("clap requires --meta-json or --meta-list");
     };
-    if filenames.is_empty() {
+    if filenames.is_empty() && !merging {
         return Err(miette!(
             "the meta list file {} has no metadata files",
             args.maybe_meta_list_path.as_deref().unwrap_or_default()
@@ -602,14 +850,20 @@ fn main() -> miette::Result<()> {
         }),
         None => Sampling::Legacy,
     };
-    let policy = args
+    let mut policy = args
         .length_policy
         .map(LengthPolicy::from)
         .unwrap_or(match sampling {
             Sampling::Legacy => LengthPolicy::Pad,
             Sampling::Edges(_) => LengthPolicy::Error,
         });
-    let mut fold = Fold::new(order, args.chi2);
+    let mut fold = if args.curve == "final" {
+        Fold::without_curves(order, args.chi2)
+    } else {
+        Fold::new(order, args.chi2)
+    };
+    fold.set_curve(&args.curve)?;
+    fold.pair = pair;
     fold.policy = policy;
 
     // `traces.npz` holds the traces of the default selection (all signals), sampled at the
@@ -621,12 +875,34 @@ fn main() -> miette::Result<()> {
         && args.clock.is_none()
         && args.per_scope.is_none()
         && policy == LengthPolicy::Pad;
+    let stats_common = cache::CommonKey {
+        settings: cache::Settings {
+            sampling: if args.clock.is_some() {
+                "edges"
+            } else {
+                "legacy"
+            }
+            .into(),
+            clock: args.clock.clone(),
+            edges: format!("{:?}", args.edges).to_lowercase(),
+            offset: args.offset,
+            rules: rules.clone(),
+            per_scope: args.per_scope.clone(),
+            depth: args.depth as usize,
+            policy,
+            shuffle_seed: args.shuffle_labels,
+            unknown: "half".into(),
+        },
+        ..cache::CommonKey::default()
+    };
     let settings = BatchSettings {
         selection: &selection,
         sampling,
         policy,
         use_existing: args.use_existing,
-        cache_allowed,
+        cache_allowed: cache_allowed && args.stats_out.is_none(),
+        stats_common: args.stats_out.as_ref().map(|_| stats_common.clone()),
+        stats_out: args.stats_out.clone(),
         per_scope: args
             .per_scope
             .clone()
@@ -664,31 +940,129 @@ fn main() -> miette::Result<()> {
     };
     let mut scope_folds: Vec<ScopeFold> = Vec::new();
     let (mut aliased, mut outside) = (0, 0);
-    for (window_number, window) in filenames.chunks(window_size).enumerate() {
-        let first_index = window_number * window_size;
-        let loaded: Vec<BatchResult> = window
-            .par_iter()
-            .enumerate()
-            .map(|(i, metadata_path)| batch_data(first_index + i, metadata_path, &settings))
-            .collect::<miette::Result<_>>()?;
-        for result in loaded {
-            if let Some(edges) = &result.edges {
+    let mut group_names = BTreeMap::new();
+    let mut label_names = BTreeMap::new();
+    if merging {
+        let mut state = cache::MergeState::default();
+        for (batch_index, path) in args.merge_stats.iter().enumerate() {
+            let cache = cache::read(path)?;
+            if batch_index == 0 {
+                let cached = &cache.key.common.settings;
+                if args
+                    .length_policy
+                    .is_some_and(|p| LengthPolicy::from(p) != cached.policy)
+                {
+                    return Err(miette!("--length-policy differs from the cache key"));
+                }
+                policy = cached.policy;
+                fold.policy = policy;
+                args.per_scope = cached.per_scope.clone();
+                args.depth = cached.depth as u64;
+                args.shuffle_labels = cached.shuffle_seed;
+            }
+            state.add(cache.clone())?;
+            let all = state.cache.as_ref().expect("a cache was added");
+            if args.group.is_none() && !args.pool_groups && all.groups.len() > 1 {
+                return Err(miette!(
+                    "more than one group exists; use --group G or --pool-groups"
+                ));
+            }
+            group_names = all.groups.clone();
+            if let Some(edges) = &cache.edges {
                 edge_totals.add(edges);
             }
-            (aliased, outside) = (result.aliased, result.outside);
-            if !result.scopes.is_empty() {
-                add_to_scope_folds(
-                    &mut scope_folds,
-                    &result.total,
-                    result.scopes,
-                    order,
-                    args.chi2,
-                    policy,
-                )?;
+            (aliased, outside) = (cache.aliased, cache.outside);
+            let total = cache
+                .channels
+                .iter()
+                .position(|c| c.identity.name == "total")
+                .expect("cache validation requires total");
+            fold.add_histogram(cache.selected(total, args.group, args.pool_groups)?)?;
+            if scope_folds.is_empty() {
+                for channel in cache.channels.iter().filter(|c| c.identity.name != "total") {
+                    let mut fold = Fold::without_curves(order, args.chi2);
+                    fold.policy = policy;
+                    fold.pair = pair;
+                    scope_folds.push(ScopeFold {
+                        name: channel.identity.name.clone(),
+                        handles: channel.identity.handles,
+                        fold,
+                    });
+                }
             }
-            fold.add(result.total)?;
+            for f in &mut scope_folds {
+                let index = cache
+                    .channels
+                    .iter()
+                    .position(|c| c.identity.name == f.name)
+                    .expect("channel identities were checked");
+                f.fold
+                    .add_histogram(cache.selected(index, args.group, args.pool_groups)?)?;
+            }
+        }
+    } else {
+        for (window_number, window) in filenames.chunks(window_size).enumerate() {
+            let first_index = window_number * window_size;
+            let loaded: Vec<BatchResult> = window
+                .par_iter()
+                .enumerate()
+                .map(|(i, metadata_path)| batch_data(first_index + i, metadata_path, &settings))
+                .collect::<miette::Result<_>>()?;
+            for mut result in loaded {
+                let (labels, groups) = batch_names(&result.meta);
+                merge_names(&mut label_names, labels, "label")?;
+                merge_names(&mut group_names, groups, "group")?;
+                if args.group.is_none() && !args.pool_groups && group_names.len() > 1 {
+                    return Err(miette!(
+                        "more than one group exists; use --group G or --pool-groups"
+                    ));
+                }
+                let group = args.group.or_else(|| {
+                    (!args.pool_groups)
+                        .then(|| group_names.keys().next().copied())
+                        .flatten()
+                });
+                if let Some(group) = group {
+                    let groups = batch_groups(&result.meta, result.total.labels.len());
+                    let rows: Vec<usize> = groups
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, g)| **g == group)
+                        .map(|(i, _)| i)
+                        .collect();
+                    if rows.len() != result.total.labels.len() {
+                        result.total.traces = result.total.traces.select(Axis(0), &rows);
+                        result.total.labels = result.total.labels.select(Axis(0), &rows);
+                        for scope in &mut result.scopes {
+                            scope.traces = scope.traces.select(Axis(0), &rows);
+                        }
+                    }
+                }
+                if let Some(edges) = &result.edges {
+                    edge_totals.add(edges);
+                }
+                (aliased, outside) = (result.aliased, result.outside);
+                if !result.scopes.is_empty() {
+                    add_to_scope_folds(
+                        &mut scope_folds,
+                        &result.total,
+                        result.scopes,
+                        order,
+                        args.chi2,
+                        policy,
+                        pair,
+                    )?;
+                }
+                fold.add(result.total)?;
+            }
         }
     }
+    if let Some(group) = args.group
+        && !group_names.contains_key(&group)
+    {
+        return Err(miette!("group {group} does not exist"));
+    }
+    fold.finish()?;
     if edge_totals.batches > 1
         && edge_totals.offsets_differ()
         && let Some((min, max)) = edge_totals.offset_range()
@@ -708,7 +1082,7 @@ fn main() -> miette::Result<()> {
     if t_values.iter().any(|t| !t.is_finite()) {
         warn!(
             "some t-values are not finite (for example, a sample is constant or a class has too \
-             few traces). The maximum |t| ignores them and is NaN if no t-value is finite"
+             few traces). Infinite maxima are kept; undefined values are counted separately"
         );
     }
 
@@ -787,6 +1161,7 @@ fn main() -> miette::Result<()> {
     let output_dir = PathBuf::from(&args.ttest_output_dir);
     create_output_dir(&output_dir)?;
     write_t_values_npz(&output_dir, &t_values)?;
+    write_curves(&output_dir, &fold)?;
 
     if let Some(results) = &fold.chi2_results {
         write_chi2_npz(&output_dir.join("chi2.npz"), results)?;
@@ -820,19 +1195,21 @@ fn main() -> miette::Result<()> {
             args.show_plots,
         )?;
 
-        plot_max_t_values(
-            &fold.max_t,
-            &fold.num_traces,
-            Some(T_THRESHOLD),
-            &output_dir,
-            args.show_plots,
-        )?;
+        if fold.max_t.first().is_some_and(|row| row.len() > 1) {
+            plot_max_t_values(
+                &fold.max_t,
+                &fold.curve_traces,
+                Some(T_THRESHOLD),
+                &output_dir,
+                args.show_plots,
+            )?;
+        }
 
         if let Some(results) = &fold.chi2_results {
             plot_chi2(
                 results,
                 &fold.max_chi2,
-                &fold.num_traces,
+                &fold.curve_traces,
                 chi2_thresholds[1],
                 &output_dir,
                 args.show_plots,
@@ -841,6 +1218,36 @@ fn main() -> miette::Result<()> {
     }
 
     Ok(())
+}
+
+/// Saves descriptive checkpoints, including infinite maxima and undefined counts.
+fn write_curves(dir: &Path, fold: &Fold) -> miette::Result<()> {
+    if fold.curve_traces.len() <= 1 {
+        return Ok(());
+    }
+    let mut text =
+        String::from("# Descriptive repeated looks. This curve is not an inference.\ntraces");
+    for order in 1..=fold.order {
+        text.push_str(&format!("\tmax_abs_t_d{order}\tundefined_d{order}"));
+    }
+    if fold.chi2 {
+        text.push_str("\tmax_chi2");
+    }
+    text.push('\n');
+    for (i, count) in fold.curve_traces.iter().enumerate() {
+        text.push_str(&count.to_string());
+        for order in 0..fold.order {
+            text.push_str(&format!(
+                "\t{}\t{}",
+                fold.max_t[order][i], fold.undefined_t[order][i]
+            ));
+        }
+        if fold.chi2 {
+            text.push_str(&format!("\t{}", fold.max_chi2[i]));
+        }
+        text.push('\n');
+    }
+    std::fs::write(dir.join("curves.tsv"), text).into_diagnostic()
 }
 
 /// Writes the chi-squared results of all samples to a compressed `.npz` file.
@@ -925,6 +1332,9 @@ fn plot_chi2(
         output_dir,
         show,
     )?;
+    if num_traces.len() <= 1 {
+        return Ok(());
+    }
     let x: Vec<f64> = num_traces.iter().map(|&n| n as f64).collect();
     let opts = LineOptions {
         y_label: "max(-log10(p))".into(),

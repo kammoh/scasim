@@ -1,4 +1,4 @@
-//! One simulation batch: legacy metadata, power trace, and traces cut at the markers.
+//! One simulation batch: versioned or legacy metadata, activity, and segment traces.
 
 use crate::hierarchy::Selection;
 use crate::power::edges::{EdgeKind, EdgeSummary, edge_bins, probe_edge_times, summarize_edges};
@@ -10,16 +10,18 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// Metadata of one batch in the legacy format written by the cocotb testbenches.
+/// Metadata of one batch. Segment times use waveform ticks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchMeta {
+    /// Version 1 fields, including names, groups, seeds, and extensions.
+    pub v1: Option<crate::metadata::MetadataV1>,
     /// Waveform file, resolved relative to the metadata file.
     pub trace_path: PathBuf,
     /// If present, only time points at multiples of the clock period are kept (legacy sampling).
     /// It is greater than zero. `read_batch_meta` rejects a zero.
     pub clock_period: Option<u64>,
     /// One marker per trace: start time, end time (exclusive), and class label (0 = fixed input,
-    /// 1 = random input).
+    /// 1 = random input by convention).
     pub markers: Vec<(u64, u64, u16)>,
 }
 
@@ -39,6 +41,32 @@ pub fn read_batch_meta(meta_path: &Path) -> miette::Result<BatchMeta> {
     let json: serde_json::Value = serde_json::from_slice(&text)
         .into_diagnostic()
         .wrap_err_with(|| format!("{} is not valid JSON", meta_path.display()))?;
+    if json.get("scasim_meta").and_then(|v| v.as_u64()) == Some(1) {
+        let v1: crate::metadata::MetadataV1 = serde_json::from_value(json)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("{}: invalid version 1 metadata", meta_path.display()))?;
+        v1.validate(meta_path)?;
+        let dir = meta_path.parent().unwrap_or(Path::new("."));
+        let (trace_path, markers) = if let Some(waveform) = &v1.waveform {
+            let trace_path = dir.join(waveform);
+            let unit = crate::metadata::waveform_time_unit(&trace_path).wrap_err_with(|| {
+                format!(
+                    "{}: cannot read the waveform time unit",
+                    meta_path.display()
+                )
+            })?;
+            let markers = v1.markers(meta_path, &unit)?;
+            (trace_path, markers)
+        } else {
+            (PathBuf::new(), Vec::new())
+        };
+        return Ok(BatchMeta {
+            v1: Some(v1),
+            trace_path,
+            clock_period: None,
+            markers,
+        });
+    }
     let trace_filename = json
         .get("trace_filename")
         .and_then(|v| v.as_str())
@@ -77,18 +105,12 @@ pub fn read_batch_meta(meta_path: &Path) -> miette::Result<BatchMeta> {
                     meta_path.display()
                 )
             })?;
-            if label > 1 {
-                return Err(miette!(
-                    "{}: the label of the marker {marker} must be 0 or 1 (0 = fixed input, \
-                     1 = random input)",
-                    meta_path.display()
-                ));
-            }
             Ok((n(0)?, n(1)?, label))
         })
         .collect::<miette::Result<Vec<_>>>()?;
     let dir = meta_path.parent().unwrap_or(Path::new("."));
     Ok(BatchMeta {
+        v1: None,
         trace_path: dir.join(trace_filename),
         clock_period,
         markers,
@@ -99,7 +121,7 @@ pub fn read_batch_meta(meta_path: &Path) -> miette::Result<BatchMeta> {
 ///
 /// The file has the arrays `trace_<i>` and `labels`. The indices `i` must be exactly `0..n`, in
 /// any order in the archive. The traces have the same length, and `labels` has `n` entries,
-/// each 0 or 1.
+/// each a u16 label.
 /// Any other file is an error, and the message names the file.
 pub fn read_trace_cache(path: &Path) -> miette::Result<(Array2<f32>, Array1<u16>)> {
     let name = path.display();
@@ -113,13 +135,6 @@ pub fn read_trace_cache(path: &Path) -> miette::Result<(Array2<f32>, Array1<u16>
         .by_name("labels")
         .into_diagnostic()
         .wrap_err_with(|| format!("cannot read the array `labels` in {name}"))?;
-    if let Some(bad) = labels.iter().position(|&l| l > 1) {
-        return Err(miette!(
-            "{name}: trace {bad} has the label {}, but a label must be 0 or 1 (0 = fixed input, \
-             1 = random input). Delete the file or use --use-existing=false",
-            labels[bad]
-        ));
-    }
     let names = npz
         .names()
         .into_diagnostic()
@@ -230,12 +245,11 @@ fn marker_ranges(trace: &PowerTrace, markers: &[(u64, u64, u16)]) -> Vec<(usize,
 /// What to do when the segments (traces) do not all have the same length.
 ///
 /// The policy applies at two levels. Inside a batch, it decides how the segments become the rows
-/// of one array. Between batches, it decides how a batch fits the length of the first batch,
+/// of one array. Between batches, it decides how the sample axes are normalized,
 /// which sets the number of samples of the accumulator.
 ///
 /// - `Pad`: inside a batch, shorter traces are padded with zeros to the longest trace. Between
-///   batches, a shorter batch is padded with zeros and a longer batch is cut to the length of
-///   the first batch. This is the behavior of `tvla` before the policy existed.
+///   batches, both axes grow to the longest batch. Missing samples have zero-bin counts.
 /// - `Truncate`: inside a batch, all traces are cut to the shortest trace. Between batches, a
 ///   longer batch is cut to the shortest length so far. A shorter batch shortens the accumulator
 ///   (it drops the trailing samples). So the final result is the same in every order of the
@@ -243,7 +257,7 @@ fn marker_ranges(trace: &PowerTrace, markers: &[(u64, u64, u16)]) -> Vec<(usize,
 ///   maxima (max |t| versus traces) keeps the points recorded before a shortening.
 /// - `Error`: any difference in length, inside a batch or between batches, is an error.
 ///   Inside a batch, the message has the histogram of the lengths for each class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum LengthPolicy {
     #[default]
     Pad,
@@ -368,7 +382,7 @@ fn toggles_in_markers(trace: &PowerTrace, markers: &[(u64, u64, u16)]) -> u64 {
 }
 
 /// How the activity splits at the clock edges (edges mode), for the report.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EdgeReport {
     /// The number of edges, and the statistics of the periods.
     pub summary: EdgeSummary,
@@ -509,6 +523,11 @@ pub fn compute_batch(
     sampling: &Sampling,
     policy: LengthPolicy,
 ) -> miette::Result<BatchOutput> {
+    if meta.trace_path.as_os_str().is_empty() {
+        return Err(miette!(
+            "no waveform was kept; use --merge-stats with the batch cache"
+        ));
+    }
     let wrap = |e: crate::power::PowerError| {
         Err::<(), _>(e)
             .into_diagnostic()
@@ -517,6 +536,11 @@ pub fn compute_batch(
     };
     match sampling {
         Sampling::Legacy => {
+            if meta.v1.is_some() {
+                return Err(miette!(
+                    "version 1 metadata has no clock_period; use --clock PATH"
+                ));
+            }
             let mut activity = activity(&meta.trace_path, plan).map_err(wrap)?;
             let info = std::mem::take(&mut activity.info);
             let times = activity.times;
@@ -824,6 +848,7 @@ mod tests {
 
     fn meta(clock_period: Option<u64>, markers: Vec<(u64, u64, u16)>) -> BatchMeta {
         BatchMeta {
+            v1: None,
             trace_path: PathBuf::from("unused"),
             clock_period,
             markers,
@@ -956,6 +981,7 @@ mod tests {
         let path = dir.path().join("w.vcd");
         std::fs::write(&path, vcd).unwrap();
         let m = BatchMeta {
+            v1: None,
             trace_path: path,
             clock_period: Some(10),
             markers: vec![(0, 10, 0), (10, 15, 1)],

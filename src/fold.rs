@@ -4,9 +4,9 @@
 use crate::batch::LengthPolicy;
 use crate::stats::threshold::CONVENTIONAL;
 use crate::stats::{Binning, HistAccumulator, TestOptions, TestResult};
-use log::{error, warn};
+
 use miette::{IntoDiagnostic, WrapErr, miette};
-use ndarray::{Array1, Array2, s};
+use ndarray::{Array1, Array2};
 use ndarray_npz::NpzWriter;
 use std::path::{Path, PathBuf};
 
@@ -15,6 +15,14 @@ use std::path::{Path, PathBuf};
 pub fn max_abs_finite(row: impl IntoIterator<Item = f64>) -> f64 {
     row.into_iter()
         .filter(|x| x.is_finite())
+        .map(f64::abs)
+        .fold(f64::NAN, f64::max)
+}
+
+/// The largest |t|, including infinity. Only undefined values are skipped.
+pub fn max_abs_defined(row: impl IntoIterator<Item = f64>) -> f64 {
+    row.into_iter()
+        .filter(|x| !x.is_nan())
         .map(f64::abs)
         .fold(f64::NAN, f64::max)
 }
@@ -32,7 +40,11 @@ pub struct Loaded {
 /// The chi-squared results for the classes 0 and 1. A class without traces gives results that
 /// are not valid tests, so a batch with one class only is not an error.
 pub fn chi2_results(hist: &HistAccumulator) -> miette::Result<Vec<TestResult>> {
-    if hist.class_count(0) == 0 || hist.class_count(1) == 0 {
+    chi2_pair_results(hist, [0, 1])
+}
+
+fn chi2_pair_results(hist: &HistAccumulator, pair: [u16; 2]) -> miette::Result<Vec<TestResult>> {
+    if hist.class_count(pair[0]) == 0 || hist.class_count(pair[1]) == 0 {
         let none = TestResult {
             statistic: 0.0,
             dof: 0,
@@ -45,9 +57,49 @@ pub fn chi2_results(hist: &HistAccumulator) -> miette::Result<Vec<TestResult>> {
         };
         return Ok(vec![none; hist.n_samples()]);
     }
-    hist.test_pair(0, 1, &TestOptions::default())
+    hist.test_pair(pair[0], pair[1], &TestOptions::default())
         .into_diagnostic()
         .wrap_err("cannot compute the chi-squared test")
+}
+
+// Consumers borrow the same histogram. The pipeline updates it once per batch.
+struct AnalysisPlan {
+    pair: [u16; 2],
+    order: usize,
+}
+trait AnalysisConsumer {
+    type Report;
+    fn init(plan: AnalysisPlan) -> Self;
+    fn update(&self, hist: &mut HistAccumulator, batch: &Loaded) -> miette::Result<()> {
+        hist.update(batch.traces.view(), batch.labels.view())
+            .into_diagnostic()?;
+        Ok(())
+    }
+    fn merge(&self, hist: &mut HistAccumulator, other: &HistAccumulator) -> miette::Result<()> {
+        hist.merge(other).into_diagnostic()
+    }
+    fn finalize(&self, hist: &HistAccumulator) -> miette::Result<Self::Report>;
+}
+struct Tvla(AnalysisPlan);
+struct ChiSquared(AnalysisPlan);
+impl AnalysisConsumer for Tvla {
+    type Report = Array2<f64>;
+    fn init(plan: AnalysisPlan) -> Self {
+        Self(plan)
+    }
+    fn finalize(&self, hist: &HistAccumulator) -> miette::Result<Self::Report> {
+        hist.t_values(self.0.pair[0], self.0.pair[1], self.0.order)
+            .into_diagnostic()
+    }
+}
+impl AnalysisConsumer for ChiSquared {
+    type Report = Vec<TestResult>;
+    fn init(plan: AnalysisPlan) -> Self {
+        Self(plan)
+    }
+    fn finalize(&self, hist: &HistAccumulator) -> miette::Result<Self::Report> {
+        chi2_pair_results(hist, self.0.pair)
+    }
 }
 
 /// The state of the analysis. Batches are added one by one, in the order of the meta list.
@@ -59,14 +111,21 @@ pub struct Fold {
     pub policy: LengthPolicy,
     /// True if the fold computes the results and the curves after every batch.
     curves: bool,
+    curve_every: usize,
+    batches: usize,
+    pub pair: [u16; 2],
+    /// Trace counts at curve checkpoints. They include only the selected pair.
+    pub curve_traces: Vec<usize>,
+    /// Undefined t-values per order at each checkpoint.
+    pub undefined_t: Vec<Vec<usize>>,
     pub hist: Option<HistAccumulator>,
-    /// The number of samples per trace, set by the first batch.
+    /// The current normalized number of samples per trace.
     pub samples: usize,
     /// Max |t| per order after each batch, starting with 0.0 for no trace.
     pub max_t: Vec<Vec<f64>>,
     /// Max -log10(p) after each batch, starting with 0.0 for no trace.
     pub max_chi2: Vec<f64>,
-    /// The number of traces after each batch, starting with 0.
+    /// The number of traces of the selected pair after each batch, starting with 0.
     pub num_traces: Vec<usize>,
     pub t_values: Option<Array2<f64>>,
     pub chi2_results: Option<Vec<TestResult>>,
@@ -79,6 +138,11 @@ impl Fold {
             chi2,
             policy: LengthPolicy::Pad,
             curves: true,
+            curve_every: 1,
+            batches: 0,
+            pair: [0, 1],
+            curve_traces: vec![0],
+            undefined_t: vec![vec![0]; order],
             hist: None,
             samples: 0,
             max_t: vec![vec![0.0]; order],
@@ -98,114 +162,112 @@ impl Fold {
         }
     }
 
-    /// Adds one batch and records the results so far (the curves of the maxima, and the
-    /// t-values and chi-squared results of all batches so far).
-    pub fn add(&mut self, batch: Loaded) -> miette::Result<()> {
-        let Loaded {
-            metadata,
-            source,
-            traces,
-            labels,
-        } = batch;
-        let (num_traces, cur_samples_per_trace) = traces.dim();
-        if num_traces <= 1 {
-            return Err(miette!(
-                "the batch {} has {num_traces} traces; a t-test needs at least two traces",
-                metadata.display()
-            ));
-        }
-        if labels.len() != num_traces {
-            return Err(miette!(
-                "the batch {} has {num_traces} traces but {} labels",
-                metadata.display(),
-                labels.len()
-            ));
-        }
-        if self.samples == 0 {
-            // The first batch sets the number of samples per trace.
-            self.samples = cur_samples_per_trace;
-        }
-        let traces = if self.samples == cur_samples_per_trace {
-            traces
-        } else {
-            match self.policy {
-                LengthPolicy::Error => {
-                    return Err(miette!(
-                        "the batch {} has {cur_samples_per_trace} samples per trace, but the first \
-                         batch has {}. Use --length-policy pad or truncate to accept this",
-                        metadata.display(),
-                        self.samples
-                    ));
-                }
-                LengthPolicy::Truncate if cur_samples_per_trace < self.samples => {
-                    // A shorter batch shortens the accumulator: the final result is the same
-                    // as if every batch had been cut to the shortest length from the start.
-                    // The maxima recorded before this batch stay as they were.
-                    if let Some(hist) = self.hist.as_mut() {
-                        hist.truncate_samples(cur_samples_per_trace)
-                            .into_diagnostic()
-                            .wrap_err("cannot shorten the accumulator")?;
-                    }
-                    self.samples = cur_samples_per_trace;
-                    traces
-                }
-                LengthPolicy::Truncate => traces.slice(s![.., ..self.samples]).to_owned(),
-                LengthPolicy::Pad => {
-                    error!(
-                        "Inconsistent number of samples per trace: expected {}, found {}",
-                        self.samples, cur_samples_per_trace
-                    );
-                    if cur_samples_per_trace > self.samples {
-                        warn!(
-                            "Using the first {} samples of the longer trace",
-                            self.samples
-                        );
-                        traces.slice(s![.., ..self.samples]).to_owned()
-                    } else {
-                        warn!(
-                            "padding the traces with {cur_samples_per_trace} samples with zeros up to {}",
-                            self.samples
-                        );
-                        let mut t = Array2::<f32>::zeros((num_traces, self.samples));
-                        for (i, row) in traces.outer_iter().enumerate() {
-                            t.slice_mut(s![i, ..row.len()]).assign(&row);
-                        }
-                        t
-                    }
-                }
+    /// Sets the curve checkpoints: every batch, every K batches, or final results only.
+    pub fn set_curve(&mut self, value: &str) -> miette::Result<()> {
+        match value {
+            "final" => self.curves = false,
+            "every" => {
+                self.curves = true;
+                self.curve_every = 1;
             }
-        };
-        self.num_traces
-            .push(self.num_traces.last().copied().unwrap_or(0) + num_traces);
+            _ => {
+                let k = value
+                    .strip_prefix("every:")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|&k| k > 0)
+                    .ok_or_else(|| miette!("--curve must be every, every:K (K > 0), or final"))?;
+                self.curves = true;
+                self.curve_every = k;
+            }
+        }
+        Ok(())
+    }
 
-        let samples = self.samples;
-        let hist = self
-            .hist
-            .get_or_insert_with(|| HistAccumulator::new(samples, Binning::Exact));
-        hist.update(traces.view(), labels.view())
-            .into_diagnostic()
-            .wrap_err_with(|| format!("cannot add the batch {}", metadata.display()))?;
+    /// Adds one batch to the shared histogram.
+    pub fn add(&mut self, batch: Loaded) -> miette::Result<()> {
+        if batch.labels.len() != batch.traces.nrows() {
+            return Err(miette!(
+                "{}: traces and labels differ in length",
+                batch.metadata.display()
+            ));
+        }
+        let mut hist = HistAccumulator::new(batch.traces.ncols(), Binning::Exact);
+        let consumer = Tvla::init(AnalysisPlan {
+            pair: self.pair,
+            order: self.order,
+        });
+        consumer
+            .update(&mut hist, &batch)
+            .wrap_err_with(|| format!("cannot add the batch {}", batch.metadata.display()))?;
         if hist.rejected() > 0 {
             return Err(miette!(
-                "the traces from {} (batch {}) have {} values that are not integers or are \
-                 2^53 or larger. The statistics need integer-valued traces",
-                source.display(),
-                metadata.display(),
+                "the traces from {} (batch {}) have {} values that are not integers or are 2^53 or larger. The statistics need integer-valued traces",
+                batch.source.display(),
+                batch.metadata.display(),
                 hist.rejected()
             ));
         }
+        self.add_histogram(hist)
+            .map_err(|e| miette!("cannot add the batch {}: {e}", batch.metadata.display()))
+    }
 
-        if self.curves {
+    /// Adds a validated batch histogram. Normal runs and cache merges share this path.
+    pub fn add_histogram(&mut self, mut other: HistAccumulator) -> miette::Result<()> {
+        other.validate().into_diagnostic()?;
+        if other.rejected() != 0 {
+            return Err(miette!("the histogram has rejected values"));
+        }
+        if let Some(hist) = self.hist.as_mut() {
+            let next = other.n_samples();
+            let current = hist.n_samples();
+            if current != next {
+                match self.policy {
+                    LengthPolicy::Error => {
+                        return Err(miette!(
+                            "the batch has {next} samples per trace, but the first batch has {current}. Use --length-policy pad or truncate to accept this"
+                        ));
+                    }
+                    LengthPolicy::Truncate => {
+                        let n = current.min(next);
+                        hist.truncate_samples(n).into_diagnostic()?;
+                        other.truncate_samples(n).into_diagnostic()?;
+                    }
+                    LengthPolicy::Pad => {
+                        let n = current.max(next);
+                        hist.pad_samples(n).into_diagnostic()?;
+                        other.pad_samples(n).into_diagnostic()?;
+                    }
+                }
+            }
+            Tvla::init(AnalysisPlan {
+                pair: self.pair,
+                order: self.order,
+            })
+            .merge(hist, &other)?;
+        } else {
+            self.hist = Some(other);
+        }
+        let hist = self.hist.as_ref().expect("the histogram was set");
+        self.samples = hist.n_samples();
+        let count = hist
+            .class_count(self.pair[0])
+            .checked_add(hist.class_count(self.pair[1]))
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| miette!("trace count overflow"))?;
+        self.num_traces.push(count);
+        self.batches += 1;
+        self.t_values = None;
+        self.chi2_results = None;
+        if self.curves && self.batches.is_multiple_of(self.curve_every) {
             self.compute(true)?;
         }
         Ok(())
     }
 
-    /// Computes the results of all batches added so far. Call it once after the last batch if
-    /// the fold was made with [`Fold::without_curves`]. A fold with curves has them already.
+    /// Computes final results and records the last checkpoint if it is due.
     pub fn finish(&mut self) -> miette::Result<()> {
-        if !self.curves && self.hist.is_some() {
-            self.compute(false)?;
+        if self.hist.is_some() && self.t_values.is_none() {
+            self.compute(self.curves)?;
         }
         Ok(())
     }
@@ -214,18 +276,31 @@ impl Fold {
     /// it also appends the maxima to the curves.
     fn compute(&mut self, record: bool) -> miette::Result<()> {
         let hist = self.hist.as_ref().expect("a batch was added");
-        let t_values = hist
-            .t_values(0, 1, self.order)
-            .into_diagnostic()
-            .wrap_err("cannot compute the t-values")?;
+        let t_values = Tvla::init(AnalysisPlan {
+            pair: self.pair,
+            order: self.order,
+        })
+        .finalize(hist)
+        .wrap_err("cannot compute the t-values")?;
         if record {
             for (max_t, t_row) in self.max_t.iter_mut().zip(t_values.rows()) {
-                max_t.push(max_abs_finite(t_row.iter().copied()));
+                max_t.push(max_abs_defined(t_row.iter().copied()));
+            }
+        }
+        if record {
+            self.curve_traces
+                .push(*self.num_traces.last().unwrap_or(&0));
+            for (undefined, row) in self.undefined_t.iter_mut().zip(t_values.rows()) {
+                undefined.push(row.iter().filter(|t| t.is_nan()).count());
             }
         }
         self.t_values = Some(t_values);
         if self.chi2 {
-            let results = chi2_results(hist)?;
+            let results = ChiSquared::init(AnalysisPlan {
+                pair: self.pair,
+                order: self.order,
+            })
+            .finalize(hist)?;
             if record {
                 self.max_chi2
                     .push(crate::stats::summarize(&results, CONVENTIONAL).max_neg_log10_p);
@@ -291,6 +366,7 @@ pub fn write_t_values_npz(output_dir: &Path, t_values: &Array2<f64>) -> miette::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::s;
 
     fn loaded(samples: usize) -> Loaded {
         Loaded {
@@ -303,10 +379,10 @@ mod tests {
 
     #[test]
     fn the_length_policy_applies_to_a_batch_of_another_length() {
-        // Pad keeps the length of the first batch. Truncate follows the shortest batch so far.
+        // Pad follows the longest batch. Truncate follows the shortest batch so far.
         // Error accepts only the length of the first batch.
         for (policy, longer, shorter, samples_after) in [
-            (LengthPolicy::Pad, true, true, 3),
+            (LengthPolicy::Pad, true, true, 5),
             (LengthPolicy::Truncate, true, true, 2),
             (LengthPolicy::Error, false, false, 3),
         ] {
@@ -407,6 +483,41 @@ mod tests {
         // Finishing a fold with curves, or an empty fold, does nothing.
         full.finish().unwrap();
         Fold::without_curves(1, false).finish().unwrap();
+    }
+
+    #[test]
+    fn curve_checkpoints_and_infinite_maxima() {
+        let mut full = Fold::new(2, true);
+        let mut spaced = Fold::new(2, true);
+        spaced.set_curve("every:2").unwrap();
+        for _ in 0..5 {
+            full.add(loaded(3)).unwrap();
+            spaced.add(loaded(3)).unwrap();
+        }
+        spaced.finish().unwrap();
+        assert_eq!(spaced.curve_traces, vec![0, 8, 16, 20]);
+        assert_eq!(spaced.max_t[0].len(), 4);
+        assert_eq!(final_bits(&full), final_bits(&spaced));
+        assert_eq!(
+            max_abs_defined([f64::NAN, f64::NEG_INFINITY]),
+            f64::INFINITY
+        );
+    }
+
+    #[test]
+    fn pad_grows_with_zero_counts() {
+        let mut fold = Fold::new(2, true);
+        fold.add(varied(2, 1)).unwrap();
+        fold.add(varied(4, 2)).unwrap();
+        assert_eq!(fold.samples, 4);
+        assert!(
+            fold.hist
+                .as_ref()
+                .unwrap()
+                .histogram(3, 0)
+                .iter()
+                .any(|&(bin, count)| bin == 0 && count >= 20)
+        );
     }
 
     #[test]

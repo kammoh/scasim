@@ -75,6 +75,7 @@ fn files(fx: &Fixture) -> Files {
 
 fn meta(path: &Path, clock_period: Option<u64>, markers: Vec<(u64, u64, u16)>) -> BatchMeta {
     BatchMeta {
+        v1: None,
         trace_path: path.to_path_buf(),
         clock_period,
         markers,

@@ -36,6 +36,39 @@ cargo run --release --bin tvla -- -d 2 --num-threads 4 --show --ttest-output-dir
 
 At the end, `tvla` logs a summary: the largest |t| of each order, the number of samples above 4.5 and above a Bonferroni threshold (alpha = 1e-5), the same for the chi-squared test (-log10 p above 5 and above the Bonferroni value), and the memory of the accumulator.
 
+## Versioned metadata, groups, and statistics caches
+
+`tvla` reads `scasim_meta` version 1 JSON, including gzip files. Times use an integer mantissa
+and a decimal exponent. Conversion to waveform ticks must be exact. Only committed batches
+are analyzed. Version 1 metadata needs `--clock PATH`. Legacy metadata stays readable.
+
+`--pair A B` selects two u16 labels (default `0 1`). `--group G` selects one group. With more
+than one group, choose `--group` or `--pool-groups`. Pooling is always explicit.
+
+```bash
+# Keep all labels and groups in one batch cache.
+tvla --meta-json batch/meta.json --clock TOP.dut.clk --pool-groups \
+    --stats-out batch/statistics.bin --ttest-output-dir batch/report
+
+# Merge caches in batch-id order. A different pair needs no new cache.
+tvla --merge-stats batch0/statistics.bin batch1/statistics.bin \
+    --pair 1 2 --group 0 --ttest-output-dir report
+```
+
+The versioned postcard cache stores compact exact histograms, channel identities, group and
+label counts, and batch provenance. Its key covers the metadata and waveform content and all
+preprocessing settings. Pair and group selection are outside the key. Merge checks versions,
+settings, channel identities, names, counts, and duplicate batch ids. It uses the length policy
+saved in the caches. Write each batch with the same preprocessing settings.
+
+`--curve every|every:K|final` controls checkpoints (default `every`). `every:K` also records the
+last batch. `final` computes only the final results and writes no curve. `curves.tsv` keeps
+infinite maxima and counts undefined t-values separately. Curves describe repeated looks;
+they are not an inference. Plots cannot draw infinity, so those points appear as gaps.
+
+`--stats-out` requires one `--meta-json` batch and reads its waveform. It does not use or write
+`traces.npz`. Plain legacy runs keep that older trace cache.
+
 ## Selecting signals
 
 By default, `tvla` counts the switching activity of all selectable signals in the waveform. Events, strings, reals, and zero-width variables are not selectable. To measure only a part of the design, select signals with rules. Give a rule with `--include` or `--exclude`. Both options can repeat. Each value has the form `KIND:VALUE`, where `KIND` is one of these:
@@ -82,7 +115,7 @@ cargo run --release --bin tvla -- --meta-list path_to_meta_list \
 - `--edges rising|falling|both` chooses the edges (default `rising`). A change to or from `x` or `z` is not an edge. The first value of the clock is not an edge.
 - `--offset N` adds `N` ticks to every edge (default 0). A negative offset is allowed if no edge goes below time 0.
 - `--length-policy pad|truncate|error` decides what happens when traces have different lengths. The default is `pad` without `--clock`, and `error` with `--clock`.
-  - `pad`: inside a batch, pad shorter traces with zeros. Between batches, pad a shorter batch with zeros and cut a longer batch to the length of the first batch.
+  - `pad`: inside a batch, pad shorter traces with zeros. Between batches, grow both sample axes to the longest batch and add zero samples.
   - `truncate`: inside a batch, cut all traces to the shortest trace. Between batches, cut a longer batch to the shortest length so far. A shorter batch shortens the accumulator. The final result equals the result of cutting every batch to the shortest length of all, in any order of the batches. The curve of the maximum |t| keeps the points that were recorded before a shortening.
   - `error`: any difference is an error. The message gives the histogram of the trace lengths for each class.
 
@@ -117,7 +150,7 @@ With `--per-scope`, `traces.npz` is neither read nor written, and `tvla` reads o
 
 ## Null runs with shuffled labels
 
-`--shuffle-labels SEED` shuffles the labels (classes) of each batch before the statistics. A small generator (SplitMix64) with a Fisher-Yates shuffle does this. Its state comes from `SEED` and the batch number, so a run with the same seed gives the same results. The number of traces in each class does not change. All outputs are written as usual, and the summary says that the labels were shuffled. Shuffling removes the expected association between the labels and the traces. So a run with shuffled labels should have few or no exceedances of the thresholds, but chance results can remain. The largest |t| of such a run shows how large |t| gets by chance, which calibrates the false-positive floor of the test.
+`--shuffle-labels SEED` shuffles the labels (classes) of each batch before the statistics. A small generator (SplitMix64) with a Fisher-Yates shuffle does this. Its state comes from `SEED` and the batch id (the metadata path for legacy batches), so a run with the same seed gives the same results. Labels are shuffled within each group. The number of traces in each class and group does not change. All outputs are written as usual, and the summary says that the labels were shuffled. Shuffling removes the expected association between the labels and the traces. So a run with shuffled labels should have few or no exceedances of the thresholds, but chance results can remain. The largest |t| of such a run shows how large |t| gets by chance, which calibrates the false-positive floor of the test.
 
 ## Checking `tvla` on synthetic waveforms
 

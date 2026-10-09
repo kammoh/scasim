@@ -625,7 +625,7 @@ pub fn hierarchy_index(path: &Path) -> Result<HierarchyIndex, PowerError> {
     }
 }
 
-fn is_fst(path: &Path) -> Result<bool, PowerError> {
+pub(crate) fn is_fst(path: &Path) -> Result<bool, PowerError> {
     let mut file = std::fs::File::open(path)?;
     Ok(fst_reader::is_fst_file(&mut file))
 }

@@ -587,7 +587,7 @@ fn a_cache_is_used_if_the_waveform_is_gone_even_if_the_metadata_file_is_newer() 
 }
 
 #[test]
-fn a_marker_label_other_than_0_and_1_is_an_error() {
+fn a_marker_accepts_other_u16_labels() {
     for format in FORMATS {
         let batch = Batch::new_in(format, TOGGLES, None);
         std::fs::write(
@@ -599,12 +599,12 @@ fn a_marker_label_other_than_0_and_1_is_an_error() {
         )
         .unwrap();
         let output = batch.run_any(&[]);
-        assert_fails_with(&output, &["meta.json", "[50,70,2]", "0 or 1"]);
+        assert!(output.status.success(), "{}", text(&output.stderr));
     }
 }
 
 #[test]
-fn a_cache_label_other_than_0_and_1_is_an_error() {
+fn a_cache_accepts_other_u16_labels() {
     let batch = Batch::new(TOGGLES, None);
     let mut npz = NpzWriter::new(std::fs::File::create(batch.npz()).unwrap());
     for (i, row) in cached_traces().outer_iter().enumerate() {
@@ -614,7 +614,7 @@ fn a_cache_label_other_than_0_and_1_is_an_error() {
         .unwrap();
     npz.finish().unwrap();
     set_modified(&batch.npz(), SystemTime::now());
-    assert_fails_with(&batch.run_any(&[]), &["traces.npz", "label 2", "0 or 1"]);
+    assert!(batch.run_any(&[]).status.success());
 }
 
 #[test]

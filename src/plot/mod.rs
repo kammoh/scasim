@@ -255,6 +255,7 @@ pub fn plot_max_t_values(
     let opts = LineOptions {
         thresholds: single_threshold(t_threshold, true),
         non_finite_as_zero: false,
+        y_label: "max(|t|), descriptive repeated looks".into(),
         ..LineOptions::max_t()
     };
     let x: Vec<f64> = num_traces_so_far.iter().map(|&n| n as f64).collect();

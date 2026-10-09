@@ -1708,6 +1708,7 @@ dependencies = [
  "scasim",
  "serde",
  "serde_json",
+ "sha2",
  "statrs",
  "tempfile",
  "thiserror",

@@ -636,6 +636,26 @@ impl HistAccumulator {
         Ok(())
     }
 
+    /// Adds zero samples with one count per trace of each class.
+    pub fn pad_samples(&mut self, new_n_samples: usize) -> Result<(), StatsError> {
+        if new_n_samples < self.n_samples {
+            return Err(StatsError::Incompatible(
+                "padding cannot shorten an accumulator".into(),
+            ));
+        }
+        self.validate()?;
+        while self.hists.len() < new_n_samples {
+            let mut hist = SampleHist::empty();
+            hist.ensure_slots(self.labels.len());
+            for (slot, &count) in self.class_counts.iter().enumerate() {
+                hist.add_count(slot, 0, count as u32, self.max_dense_bins);
+            }
+            self.hists.push(hist);
+        }
+        self.n_samples = new_n_samples;
+        Ok(())
+    }
+
     /// The binning rule.
     pub fn binning(&self) -> Binning {
         self.binning
@@ -1076,6 +1096,21 @@ mod tests {
         .unwrap();
         let labels = Array1::from(vec![5, 5, 5, 9, 9, 9]);
         (traces, labels)
+    }
+
+    #[test]
+    fn pad_samples_adds_each_class_count_at_zero() {
+        let mut a = HistAccumulator::new(1, Binning::Exact);
+        a.update(
+            ndarray::array![[7], [8], [9]].view(),
+            ndarray::array![1, 2, 2].view(),
+        )
+        .unwrap();
+        a.pad_samples(3).unwrap();
+        a.validate().unwrap();
+        assert_eq!(a.histogram(2, 1), vec![(0, 1)]);
+        assert_eq!(a.histogram(2, 2), vec![(0, 2)]);
+        assert!(a.pad_samples(2).is_err());
     }
 
     #[test]

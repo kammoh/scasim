@@ -877,7 +877,10 @@ fn plot_max_t_values_does_not_panic_on_nan() {
         serde_json::json!([0.0, 100.0, 200.0, 300.0])
     );
     assert_eq!(json["layout"]["xaxis"]["title"]["text"], "Number of traces");
-    assert_eq!(json["layout"]["yaxis"]["title"]["text"], "max(|t|)");
+    assert_eq!(
+        json["layout"]["yaxis"]["title"]["text"],
+        "max(|t|), descriptive repeated looks"
+    );
     assert_svg(&dir.join("max_t_values.svg"), (1200, 600));
 }
 

@@ -188,6 +188,7 @@ fn the_channel_traces_add_up_to_the_trace_of_the_whole_selection_bit_for_bit() {
     assert!(plan.channels.iter().any(|c| c.name == "(outside tb.dut)"));
     assert_eq!(plan.channels[0].name, "total");
     let meta = BatchMeta {
+        v1: None,
         trace_path: path.clone(),
         clock_period: None,
         markers: vec![(10, 40, 0), (40, 70, 1)],
@@ -205,6 +206,7 @@ fn the_channel_traces_add_up_to_the_trace_of_the_whole_selection_bit_for_bit() {
     // The same plan on the FST file.
     let (_fst_dir, fst) = temp_fst(&fx);
     let fst_meta = BatchMeta {
+        v1: None,
         trace_path: fst,
         ..meta
     };
