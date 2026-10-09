@@ -17,6 +17,7 @@ pub mod binning;
 pub mod chi2;
 pub mod error;
 pub mod hist;
+mod hist_moments;
 pub mod special;
 pub mod threshold;
 pub mod tstat;

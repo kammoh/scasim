@@ -26,6 +26,9 @@ pub enum StatsError {
     /// The binning parameters are not usable.
     #[error("invalid binning: {0}")]
     InvalidBinning(String),
+    /// Exact sample values are required, but the accumulator uses fixed-width bins.
+    #[error("t-values require exact binning")]
+    NotExactBinning,
     /// A class would hold more than `u32::MAX` traces, which the `u32` bin counters cannot hold.
     #[error("class {label} would exceed {} traces", u32::MAX)]
     CountOverflow {

@@ -635,6 +635,19 @@ impl HistAccumulator {
         self.slot(label).map_or(0, |s| self.class_counts[s])
     }
 
+    /// Fills `out` with the non-zero bins of one sample and class, in bin order.
+    pub(crate) fn fill_bins(&self, sample: usize, slot: usize, out: &mut Vec<(i64, u32)>) {
+        out.clear();
+        if let Some(hist) = self.hists.get(sample) {
+            hist.for_each_nonzero(|s, bin, count| {
+                if s == slot {
+                    out.push((bin, count));
+                }
+            });
+        }
+        out.sort_unstable_by_key(|&(bin, _)| bin);
+    }
+
     /// Total number of sample values that could not be binned (NaN, infinity, fractions under
     /// [`Binning::Exact`], or out-of-range bins). They are not part of any histogram.
     ///
