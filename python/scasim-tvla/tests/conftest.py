@@ -79,3 +79,26 @@ def run_tb(build_dir, tmp_path, monkeypatch):
     return run
 
 
+
+
+@pytest.fixture(scope="session")
+def tvla_bin():
+    """The tvla binary: SCASIM_TVLA_BIN, else PATH, else one `cargo build --release`."""
+    import subprocess
+
+    env = os.environ.get("SCASIM_TVLA_BIN")
+    if env and Path(env).is_file():
+        return Path(env)
+    found = shutil.which("tvla")
+    if found:
+        return Path(found)
+    root = next((p for p in HERE.parents if (p / "Cargo.toml").exists()
+                 and (p / "src" / "bin" / "tvla").exists()), None)
+    if root is None or shutil.which("cargo") is None:
+        pytest.skip("needs a tvla binary: set SCASIM_TVLA_BIN or install cargo")
+    done = subprocess.run(["cargo", "build", "--release", "--bin", "tvla"], cwd=root,
+                          capture_output=True, text=True)
+    exe = root / "target" / "release" / "tvla"
+    if done.returncode != 0 or not exe.exists():
+        pytest.skip(f"cannot build tvla: {done.stderr[-300:]}")
+    return exe
