@@ -4,7 +4,6 @@ use log::*;
 use miette::{IntoDiagnostic, WrapErr, miette};
 use ndarray::{Array1, Array2, s};
 use ndarray_npz::NpzWriter;
-use plotly::plotly_static;
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use scalib::ttest;
 use scasim::batch::{
@@ -459,40 +458,22 @@ fn main() -> miette::Result<()> {
     info!("Saved t_values to {}", npz_path.display());
 
     if args.plot {
-        let mut image_exporter = plotly_static::StaticExporterBuilder::default()
-            .pdf_export_timeout(1000)
-            // .offline_mode(true)
-            .build()
-            .map_err(|e| miette!("cannot create the static plot exporter: {e}"))?;
-
-        let plots_config = plotly::Configuration::new()
-            .display_mode_bar(plotly::configuration::DisplayModeBar::Hover)
-            .show_link(false)
-            .display_logo(false)
-            .editable(false)
-            .responsive(true)
-            .typeset_math(true);
-
         let t_threshold = Some(4.5);
 
         plot_t_traces(
-            t_values,
+            t_values.view(),
             t_threshold,
             false, // abs_values
             &output_dir,
             args.show_plots,
-            &plots_config,
-            &mut image_exporter,
         )?;
 
         plot_max_t_values(
-            max_t_values,
-            num_traces_so_far,
+            &max_t_values,
+            &num_traces_so_far,
             t_threshold,
             &output_dir,
             args.show_plots,
-            &plots_config,
-            &mut image_exporter,
         )?;
     }
 

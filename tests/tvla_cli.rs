@@ -610,3 +610,79 @@ fn order_zero_is_a_usage_error() {
     let output = batch.run_order("0", &[]);
     assert_fails_with(&output, &["invalid value '0'"]);
 }
+
+/// Runs `tvla` with the default `--plot` (true). `PATH` has no program, so a browser driver
+/// (chromedriver, geckodriver) cannot be found or started. Returns the output directory.
+fn run_with_plots(batch: &Batch, order: &str, args: &[&str]) -> (Output, PathBuf) {
+    let out = batch.dir.path().join("plots");
+    let no_programs = batch.dir.path().join("no-programs");
+    std::fs::create_dir_all(&no_programs).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tvla"))
+        .env_remove("RUST_LOG")
+        .env("PATH", &no_programs)
+        .arg("--meta-json")
+        .arg(batch.meta())
+        .arg("--ttest-output-dir")
+        .arg(&out)
+        .args(["-d", order])
+        .args(args)
+        .output()
+        .unwrap();
+    (output, out)
+}
+
+/// The files that `tvla` writes with the default `--plot` for the t-test orders 1..=`order`.
+fn plot_files(order: usize) -> Vec<String> {
+    let mut files = vec!["all_t_values.html".to_string()];
+    for d in 1..=order {
+        for ext in ["html", "svg", "json"] {
+            files.push(format!("t_test_d{d}.{ext}"));
+        }
+    }
+    for ext in ["html", "svg", "json"] {
+        files.push(format!("max_t_values.{ext}"));
+    }
+    files
+}
+
+fn assert_plot_files(out: &Path, order: usize) {
+    for name in plot_files(order) {
+        let path = out.join(&name);
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(!bytes.is_empty(), "{name} is empty");
+        let text = String::from_utf8_lossy(&bytes);
+        match name.rsplit('.').next().unwrap() {
+            "svg" => assert!(text.contains("<svg"), "{name} is not an SVG file"),
+            "html" => assert!(text.contains("plotly"), "{name} has no plotly"),
+            "json" => {
+                let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert!(json["data"].is_array(), "{name} has no data");
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn the_default_plots_are_written_without_a_browser_driver() {
+    let batch = Batch::new(TOGGLES, None);
+    let (output, out) = run_with_plots(&batch, "2", &[]);
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_plot_files(&out, 2);
+    assert!(out.join("t_values.npz").exists());
+    assert!(!stderr.to_lowercase().contains("driver"), "{stderr}");
+}
+
+#[test]
+fn plots_of_traces_without_any_toggle_do_not_panic() {
+    // `aux.a` never toggles, so all traces are zero, every t-value is NaN, and so is every
+    // max |t|. The old code panicked when it printed the maximum.
+    for format in FORMATS {
+        let batch = Batch::new_in(format, TOGGLES, None);
+        let (output, out) = run_with_plots(&batch, "2", &["--include", "signal:aux.a"]);
+        let stderr = text(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_plot_files(&out, 2);
+    }
+}

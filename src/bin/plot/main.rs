@@ -3,7 +3,7 @@ use itertools::Itertools;
 use log::info;
 use ndarray::{Array1, Array2};
 use plotly::common::Mode;
-use plotly::{Plot, Scatter, plotly_static};
+use plotly::{Plot, Scatter};
 use scalib::ttest;
 use scasim::plot::{plot_max_t_values, plot_t_traces};
 use std::fs::File;
@@ -67,7 +67,7 @@ fn main() -> miette::Result<()> {
         .display_logo(false)
         .editable(false)
         .responsive(true)
-        .typeset_math(true);
+        .typeset_math(false);
 
     // set default log level to info
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -260,33 +260,23 @@ fn main() -> miette::Result<()> {
 
             let t_threshold = Some(4.5);
 
-            let mut image_exporter = plotly_static::StaticExporterBuilder::default()
-                .pdf_export_timeout(1000)
-                // .offline_mode(true)
-                .build()
-                .expect("Failed to create static exporter");
-
             plot_t_traces(
-                t_values,
+                t_values.view(),
                 t_threshold,
                 false, // abs_values
                 output_dir,
                 args.show_plots,
-                &plots_config,
-                &mut image_exporter,
             )?;
 
             assert!(max_t_values.len() == order);
             assert!(num_traces_so_far.len() == max_t_values[0].len());
 
             plot_max_t_values(
-                max_t_values,
-                num_traces_so_far,
+                &max_t_values,
+                &num_traces_so_far,
                 t_threshold,
                 output_dir,
                 args.show_plots,
-                &plots_config,
-                &mut image_exporter,
             )?;
         }
     }
