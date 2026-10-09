@@ -9,7 +9,9 @@ That sets the toggle density rho = thresh / 256.
 
 One segment: pulse `start` for one clock (E0, the registers load a value
 derived from `seed`), run `seg_len` clocks (E1..EL), `done` goes high after
-EL. `done` stays high until the next `start`.
+EL. `done` stays high until the next `start`. All three testbenches use the
+same schedule: 4 reset edges, then E0..E(L+1) per segment with one idle edge
+between segments (L+3 edges per segment), and `aux_i` tied to 0.
 
 Files written:
   bench_dut.sv   bench_leaf, bench_top (the design)
@@ -116,11 +118,12 @@ def dut_sv(n, w, s):
 
 def dut_inst(prefix):
     """Instance of bench_top with ports connected to signals named like the ports."""
-    lines = ["  bench_top dut (.clk(clk), .rst_n(rst_n), .start(start), .seed(seed), .seg_len(seg_len),",
+    lines = ["  // verilator tracing_on",
+             "  bench_top dut (.clk(clk), .rst_n(rst_n), .start(start), .seed(seed), .seg_len(seg_len),",
              "    .thresh(thresh), .done(done),"]
     lines += [f"    .probe_{i}(probe_{i})," for i in range(NPROBE)]
     lines += [f"    .aux_{i}(32'd0)," for i in range(NPROBE - 1)]
-    lines += [f"    .aux_{NPROBE - 1}(32'd0));"]
+    lines += [f"    .aux_{NPROBE - 1}(32'd0));", "  // verilator tracing_off"]
     return "\n".join(lines)
 
 
@@ -130,7 +133,7 @@ def wrap_sv():
          "// Variant b: the wrapper drives clock, reset, and segment control.",
          "// Software writes seed_in and increments req. The wrapper runs one segment per request",
          "// and pulses seg_done.",
-         "module bench_wrap (",
+         "module bench_wrap ( // verilator tracing_off",
          "  input  logic [31:0] seed_in, seg_len,",
          "  input  logic [8:0]  thresh,",
          "  input  logic [31:0] req,",
@@ -153,7 +156,11 @@ def wrap_sv():
          "    seg_done <= 1'b0;",
          "    start <= 1'b0;",
          "    case (st)",
-         "      S_RST: if (rcnt == 3'd3) begin rst_n <= 1'b1; st <= S_IDLE; end else rcnt <= rcnt + 3'd1;",
+         "      S_RST: if (rcnt == 3'd3) begin",
+         "        rst_n <= 1'b1;",
+         "        if (req != ack) begin ack <= req; seed <= seed_in; start <= 1'b1; st <= S_START; end",
+         "        else st <= S_IDLE;",
+         "      end else rcnt <= rcnt + 3'd1;",
          "      S_IDLE: if (req != ack) begin ack <= req; seed <= seed_in; start <= 1'b1; st <= S_START; end",
          "      S_START: st <= S_RUN;",
          "      S_RUN: if (done) begin chk <= chk * 32'd31 + probe_0; seg_done <= 1'b1; st <= S_IDLE; end",
@@ -169,6 +176,7 @@ def tb_sv():
          "`timescale 1ns/1ps",
          "// Variant c: pure SystemVerilog testbench. Plusargs: +L= +SEGS= +THRESH= [+trace]",
          "module bench_tb;",
+         "  // verilator tracing_off",
          "  logic clk = 1'b0;",
          "  always #5 clk = ~clk;",
          "  logic rst_n = 1'b0, start = 1'b0, done;",
@@ -193,6 +201,7 @@ def tb_sv():
          "    repeat (4) @(posedge clk);",
          "    rst_n <= 1'b1;",
          "    for (int s = 0; s < segs; s++) begin",
+         "      if (s > 0) @(posedge clk);  // idle edge between segments (as in variants a and b)",
          "      seed <= 32'(s + 1) * 32'h9E3779B1;",
          "      start <= 1'b1;",
          "      @(posedge clk);",
@@ -202,6 +211,7 @@ def tb_sv():
          "      if (!done) $fatal(1, \"done not set\");",
          "      chk = chk * 32'd31 + probe_0;",
          "    end",
+         "    #1;  // let the last edge's nonblocking updates settle before the count is read",
          "    $display(\"BENCH cycles=%0d chk=%0d\", cyc, chk);",
          "    $finish;",
          "  end",

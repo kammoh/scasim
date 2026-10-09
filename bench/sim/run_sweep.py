@@ -39,7 +39,7 @@ TOP = {"a": "bench_top", "b": "bench_wrap", "c": "bench_tb"}
 SRC = {"a": ["bench_dut.sv"], "b": ["bench_dut.sv", "bench_wrap.sv"], "c": ["bench_dut.sv", "bench_tb.sv"]}
 TOP_DEPTH = {"a": 1, "b": 1, "c": 1}  # --trace-depth 1: top module only (near-zero signals)
 
-COLUMNS = ["variant", "trace", "N", "W", "S", "rho", "L", "segs", "K", "cycles", "nsig",
+COLUMNS = ["variant", "trace", "N", "W", "S", "rho", "L", "segs", "K", "cycles", "chk", "nsig",
            "user_s", "sys_s", "cpu_s", "cpu_all_s", "rss_mb", "fst_mb", "reps",
            "build_cpu_s", "build_wall_s"]
 
@@ -180,18 +180,16 @@ class Sweep:
         out = open(a.out, "w" if new else "a")
         if new:
             out.write("\t".join(COLUMNS) + "\n")
-        checks = {}
+        checks = {}  # (design, rho, L, segs, trace) -> [(variant, cycles, chk, fst_mb)]
         for v, trace, n, w, s, th, L, segs, K in self.points():
             bdir, bcpu, bwall = self.build(v, trace, n, w, s)
             tag = f"{v}_{trace}_{n}_{w}_{s}_{th}_{L}_{segs}_{K}"
             reps = [self.run_once(v, trace, bdir, th, L, segs, K, tag) for _ in range(a.repeats)]
             best = min(reps, key=lambda r: r["user"] + r["sys"])
-            # Same design and seeds must give the same checksum in every variant and trace mode.
-            ck = checks.setdefault((n, w, s, th, L, segs), best["chk"])
-            if ck != best["chk"]:
-                print(f"WARNING: checksum differs for {tag}: {ck} vs {best['chk']}", file=sys.stderr)
+            checks.setdefault((n, w, s, th, L, segs, trace), []).append(
+                (v, best["cycles"], best["chk"], best["fst"], K))
             row = dict(variant=v, trace=trace, N=n, W=w, S=s, rho=th / 256, L=L, segs=segs, K=K,
-                       cycles=best["cycles"], nsig=gen_design.n_signals(n, w, s),
+                       cycles=best["cycles"], chk=best["chk"], nsig=gen_design.n_signals(n, w, s),
                        user_s=best["user"], sys_s=best["sys"], cpu_s=best["user"] + best["sys"],
                        cpu_all_s=",".join(f"{r['user'] + r['sys']:.3f}" for r in reps),
                        rss_mb=best["rss"], fst_mb=best["fst"], reps=len(reps),
@@ -200,6 +198,40 @@ class Sweep:
             out.flush()
             print(f"{tag}: cpu {row['cpu_s']:.3f}s cycles {row['cycles']} fst {row['fst_mb']:.1f}MB", flush=True)
         out.close()
+        self.verify(checks)
+
+    @staticmethod
+    def verify(checks):
+        """All variants must simulate the same cycles and record the same activity.
+
+        Same schedule: the printed cycle count is identical. Same behavior: the checksum is
+        identical. Same trace activity: the FST sizes agree (the traced signals and their
+        value changes are the same, so only small header differences remain).
+        """
+        bad = 0
+        spread = 0.0
+        npoints = 0
+        for key, items in sorted(checks.items()):
+            if len({v for v, *_ in items}) < 2:
+                continue
+            npoints += 1
+            if len({c for _, c, *_ in items}) > 1:
+                bad += 1
+                print(f"VERIFY FAIL cycles differ {key}: {[(v, c) for v, c, *_ in items]}", file=sys.stderr)
+            if len({k for _, _, k, *_ in items}) > 1:
+                bad += 1
+                print(f"VERIFY FAIL checksum differs {key}", file=sys.stderr)
+            sizes = [f for *_, f, _ in items if f > 0]
+            if key[-1] != "off" and sizes and min(sizes) >= 1.0:
+                sp = (max(sizes) - min(sizes)) / min(sizes)
+                spread = max(spread, sp)
+                if sp > 0.03:
+                    bad += 1
+                    print(f"VERIFY FAIL FST size differs by {sp:.1%} {key}: {[(v, round(f, 2)) for v, *_, f, _ in items]}",
+                          file=sys.stderr)
+        print(f"VERIFY: {npoints} points compared across variants: "
+              f"{'cycles, checksums, and FST sizes agree' if not bad else str(bad) + ' failures'}; "
+              f"largest FST size spread {spread:.2%}")
 
 
 def main():

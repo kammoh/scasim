@@ -35,7 +35,7 @@ cocotb touches.
 
 | Variant | Testbench | Models |
 | --- | --- | --- |
-| a | cocotb, Python drives the clock (`Clock`) and awaits every edge. It touches K signals per cycle (reads of `probe_i`, writes to `aux_i`). | The current testbench style. |
+| a | cocotb, Python drives the clock (`Clock`) and awaits every edge. It touches K signals per cycle (reads of `probe_i`, writes of the constant 0 to `aux_i`). | The current testbench style. |
 | b | cocotb with `bench_wrap` (SV): the wrapper drives clock, reset, and the segment control. Python writes the seed and a request counter, then awaits `seg_done`. | cocotb with no per-cycle Python. |
 | c | Pure SV testbench `bench_tb` (`verilator --binary --timing`). Plusargs `+L= +SEGS= +THRESH= +trace`. | The floor: no cocotb. |
 
@@ -53,10 +53,21 @@ All variants build with the Verilator flags of `run_tvla.py` (`-O3`, `--x-assign
 runner adds (`--vpi --public-flat-rw`). Variant c does not. So the b-to-c
 difference includes the cost of `--public-flat-rw`, not only of cocotb.
 
-Cycle counts differ by a few per mille between variants (reset cycles, and one
-idle cycle per segment in variant b). Every run prints `BENCH cycles=... chk=...`.
-`run_sweep.py` uses the printed cycle count and warns if the checksum of two
-variants differs for the same design and seeds.
+All variants simulate the same cycles and record the same trace activity:
+
+- The schedule is the same: 4 reset edges, then L + 3 edges per segment (start, L run
+  edges, the edge where `done` is seen, and one idle edge before the next start).
+- `aux_i` is tied to 0 in b and c, and variant a writes only 0 to it. So the design
+  sees the same inputs in all variants, and a Python write costs Python time only.
+- Only the DUT is traced. The wrapper and the SV testbench signals have
+  `// verilator tracing_off`, as variant a has no signals outside the DUT.
+  (`fst_top` traces about 50 signals in a and none in b and c.)
+
+Every run prints `BENCH cycles=... chk=...`. At the end of a sweep, `run_sweep.py` prints a
+`VERIFY` line and warns (`VERIFY FAIL`) if, for the same design, density, and segments, the
+cycle counts or the checksums differ between variants, or the FST sizes differ by more than 3 percent.
+A VCD dump of a small design (16 regs) also gave identical per-signal change counts in a, b,
+and c (only the three `clk` signals differ, by 3 changes).
 
 ## cocotb 2.1 environment
 
@@ -103,3 +114,8 @@ of trace changes (traced groups only), and `c6` the cost of one Python touch
 (variant a). The script prints the coefficients, R-squared, and the median and
 maximum relative error, then which part dominates, then the mapping of the real
 setup (1,064 signals, 1.48 M time points, 150 s per batch; options `--real-*`).
+
+The mapping of the real setup is a hypothesis, not a measurement. The model explains only
+a small part of the observed 150 s per batch. Attributing the rest to per-cycle Python in the
+testbench is an inference. A profile of a real batch (touches per cycle, cycles per batch, where
+the CPU goes) is needed to confirm it. Predicted speedup factors for the real setup are conditional on it.

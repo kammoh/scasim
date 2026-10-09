@@ -194,6 +194,8 @@ def real_mapping(models, args):
     cyc = pts / ppc
     N = max(1, round((sig - 40) / 4))
     print("== Real setup mapped onto the model ==")
+    print("NOTE: the part of the observed time that the model does not explain is attributed to per-cycle Python.")
+    print("That is a hypothesis, not a measurement. A profile of a real batch is needed; the factors below are conditional.")
     print(f"Structural facts: cocotb per-cycle testbench, trace on all signals, {sig} signals, {pts:.3g} time points.")
     print(f"Assumptions: {ppc:g} time points per clock cycle -> {cyc:.3g} cycles; "
           f"{sig} signals ~ {N} model registers (4 handles per register + 40).")
