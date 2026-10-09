@@ -279,12 +279,19 @@ fn describe_lengths(ranges: &[(usize, usize, u16)]) -> String {
         .join("; ")
 }
 
+/// The largest integer that an `f32` holds exactly: 2^24.
+pub const MAX_EXACT_COUNT: u64 = 1 << 24;
+
 /// Builds one row per range from `values`. The ranges are index ranges `[low, high)` with a
 /// label. The length policy decides what happens when the ranges differ in length.
+///
+/// The traces are `f32`, which holds integers exactly up to [`MAX_EXACT_COUNT`]. With `exact`, a
+/// larger value is an error. Without it, a larger value is rounded (the legacy behavior).
 fn cut_ranges(
     values: &[u64],
     ranges: &[(usize, usize, u16)],
     policy: LengthPolicy,
+    exact: bool,
 ) -> miette::Result<(Array2<f32>, Array1<u16>)> {
     let lengths = || ranges.iter().map(|(lo, hi, _)| hi - lo);
     let longest = lengths().max().unwrap_or(0);
@@ -305,7 +312,20 @@ fn cut_ranges(
     for (i, &(lo, hi, label)) in ranges.iter().enumerate() {
         labels[i] = label;
         let hi = hi.min(lo + width);
-        for (cell, &value) in traces.row_mut(i).iter_mut().zip(&values[lo..hi]) {
+        for (j, (cell, &value)) in traces
+            .row_mut(i)
+            .iter_mut()
+            .zip(&values[lo..hi])
+            .enumerate()
+        {
+            if exact && value > MAX_EXACT_COUNT {
+                return Err(miette!(
+                    "the count {value} (segment {i}, sample {j}) is above {MAX_EXACT_COUNT} \
+                     (2^24), the largest integer that an f32 trace holds exactly. The statistics \
+                     would use a rounded count. Select fewer signals or use a smaller clock \
+                     period"
+                ));
+            }
             *cell = value as f32;
         }
     }
@@ -319,7 +339,7 @@ pub fn cut_traces_with(
     markers: &[(u64, u64, u16)],
     policy: LengthPolicy,
 ) -> miette::Result<(Array2<f32>, Array1<u16>)> {
-    cut_ranges(&trace.power, &marker_ranges(trace, markers), policy)
+    cut_ranges(&trace.power, &marker_ranges(trace, markers), policy, false)
 }
 
 /// Cuts one trace per marker. A marker covers the time points in `[start, end)`. Shorter traces
@@ -513,7 +533,17 @@ pub fn compute_batch(
                         Some(period) => trace.keep_multiples_of(period),
                         None => trace,
                     };
-                    channels.push(cut_traces_with(&kept, &meta.markers, policy)?.0);
+                    // The channels of `--per-scope` must be exact. The first one is legacy.
+                    let ranges = marker_ranges(&kept, &meta.markers);
+                    let (traces, _) = cut_ranges(&kept.power, &ranges, policy, true)
+                        .wrap_err_with(|| {
+                            format!(
+                                "{}: channel {}",
+                                meta.trace_path.display(),
+                                plan.channels[c].name
+                            )
+                        })?;
+                    channels.push(traces);
                 }
             }
             let (labels, diagnostics) = first.expect("a plan has a channel");
@@ -583,7 +613,14 @@ pub fn compute_batch(
             let mut channels = Vec::new();
             let mut labels = None;
             for channel in &result.channels {
-                let (traces, l) = cut_ranges(&channel.toggles, &ranges, policy)?;
+                let (traces, l) = cut_ranges(&channel.toggles, &ranges, policy, true)
+                    .wrap_err_with(|| {
+                        format!(
+                            "{}: channel {}",
+                            meta.trace_path.display(),
+                            plan.channels[channels.len()].name
+                        )
+                    })?;
                 channels.push(traces);
                 labels.get_or_insert(l);
             }
@@ -644,6 +681,22 @@ mod tests {
             let (same, _) = cut_traces_with(&trace(), &[(10, 30, 0), (30, 50, 1)], policy).unwrap();
             assert_eq!(same, array![[2.0, 3.0], [4.0, 5.0]]);
         }
+    }
+
+    #[test]
+    fn counts_above_2_pow_24_are_an_error_when_the_traces_must_be_exact() {
+        let values = [3, 1 << 24, (1 << 24) + 1];
+        let ranges = [(0, 3, 0)];
+        // The legacy conversion rounds 2^24 + 1 to 2^24.
+        let (rounded, _) = cut_ranges(&values, &ranges, LengthPolicy::Pad, false).unwrap();
+        assert_eq!(rounded, array![[3.0, 16777216.0, 16777216.0]]);
+        let message = cut_ranges(&values, &ranges, LengthPolicy::Pad, true)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("16777217"), "{message}");
+        assert!(message.contains("sample 2"), "{message}");
+        // 2^24 itself is exact.
+        assert!(cut_ranges(&values[..2], &[(0, 2, 0)], LengthPolicy::Pad, true).is_ok());
     }
 
     #[test]

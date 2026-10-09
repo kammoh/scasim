@@ -452,3 +452,37 @@ fn sections_do_not_change_the_edges() {
     .unwrap();
     assert_eq!(out.channels[0], expected_traces(&bin_sums(&edges, &evs), 4));
 }
+
+/// A 1-million-bit signal that flips all its bits `flips` times inside the first clock period.
+fn wide_flips(flips: u64) -> Fixture {
+    let mut s = Sim::new(&[("tb", "clk", 1), ("tb", "wide", 1_000_000)]);
+    s.clock(0, 100, 100, 4, false);
+    for k in 0..flips {
+        let value = if k % 2 == 0 { "1" } else { "0" }.repeat(1_000_000);
+        s.set(101 + k, 1, &value);
+    }
+    s.finish()
+}
+
+#[test]
+fn a_bin_count_above_2_pow_24_is_an_error_and_2_pow_24_or_less_is_exact() {
+    let plan = PowerPlan::toggles(Selection::parse(&["-signal:tb.clk"]).unwrap());
+    let run = |fx: &Fixture| {
+        let (_dir, path) = temp_fst(fx);
+        compute_batch(
+            &meta(&path, None, vec![(100, 400, 0)]),
+            &plan,
+            &edges_sampling(EdgeKind::Rising, 0),
+            LengthPolicy::Error,
+        )
+    };
+    // 16 flips: 16,000,000 toggles in the first bin. The first flip sets all bits, which
+    // are all toggles after the initial all-zero value.
+    let out = run(&wide_flips(16)).unwrap();
+    assert_eq!(out.channels[0][[0, 0]], 16_000_000.0);
+    // 18 flips: 18,000,000 toggles. f32 would round this.
+    let message = format!("{:?}", run(&wide_flips(18)).unwrap_err());
+    assert!(message.contains("18000000"), "{message}");
+    assert!(message.contains("2^24"), "{message}");
+    assert!(message.contains("segment 0, sample 0"), "{message}");
+}

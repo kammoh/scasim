@@ -86,6 +86,8 @@ cargo run --release --bin tvla -- --meta-list path_to_meta_list \
   - `truncate`: inside a batch, cut all traces to the shortest trace. Between batches, cut a longer batch to the length of the first batch. A shorter batch is an error.
   - `error`: any difference is an error. The message gives the histogram of the trace lengths for each class.
 
+The traces are `f32`, which holds integers exactly up to 2^24 = 16,777,216. With `--clock`, and for the channels of `--per-scope`, a count above 2^24 in one sample is an error that names the batch, the segment, and the count. The legacy sampling keeps the old conversion.
+
 With `--clock` or with a policy other than `pad`, `traces.npz` is neither read nor written.
 
 `tvla` logs the number of clock edges, the statistics of the clock periods, and where the toggles are: inside the bins, before the first edge, and after the last edge. The three counts add up to all toggles of the selection. It warns if the segments start at different places in the clock period.
