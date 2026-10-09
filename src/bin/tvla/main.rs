@@ -1,27 +1,38 @@
-use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
+use clap::{ArgGroup, ArgMatches, CommandFactory, FromArgMatches, Parser};
 use itertools::Itertools;
 use log::*;
-use miette::{IntoDiagnostic, WrapErr};
+use miette::{IntoDiagnostic, WrapErr, miette};
 use ndarray::{Array1, Array2, s};
-use ndarray_npz::{NpzReader, NpzWriter};
+use ndarray_npz::NpzWriter;
 use plotly::plotly_static;
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use scalib::ttest;
-use scasim::batch::{BatchDiagnostics, batch_traces, read_batch_meta};
+use scasim::batch::{
+    BatchDiagnostics, batch_traces, read_batch_meta, read_trace_cache, write_trace_cache,
+};
 use scasim::hierarchy::{HierarchyIndex, Selection};
 use scasim::plot::*;
 use scasim::power::hierarchy_index;
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(name = "scasim-tvla")]
 #[command(author = "Kamyar Mohajerani <kamyar@kamyar.xyz>")]
 #[command(version)]
 #[command(about = "Test-Vector Leakage Analysis", long_about = None)]
+#[command(group(
+    ArgGroup::new("meta")
+        .required(true)
+        .multiple(true)
+        .args(["maybe_metadata", "maybe_meta_list_path"])
+))]
 struct Args {
+    /// Metadata file (`meta.json` or `meta.json.gz`) of one batch.
     #[arg(long = "meta-json", value_name = "META_JSON")]
     maybe_metadata: Option<String>,
+    /// File with one metadata file path per line. Relative paths are relative to the directory of
+    /// this file. If both options are given, `--meta-list` is used.
     #[arg(long = "meta-list", value_name = "META_LIST_PATH")]
     maybe_meta_list_path: Option<String>,
     #[arg(
@@ -51,7 +62,7 @@ struct Args {
     plot: bool,
     #[arg(
         long = "use-existing",
-        help = "Skip generation of power trace data if the NPZ file already exists and is not older than the corresponding trace file. Use their stored data instead.",
+        help = "Skip generation of power trace data if `traces.npz` exists next to the metadata file and is newer than the waveform and the metadata file. Use its stored data instead.",
         action = clap::ArgAction::Set,
         num_args = 0..=1,
         default_missing_value = "true",
@@ -156,6 +167,121 @@ fn report_selection(batch: &str, d: &BatchDiagnostics) {
     }
 }
 
+/// True if `cache` can replace the computation for the batch. The cache must be newer than the
+/// waveform and newer than the metadata file. If the waveform no longer exists, the cache is the
+/// only source, so it is used whatever the age of the metadata file.
+fn cache_is_fresh(cache: &Path, waveform: &Path, metadata: &Path) -> bool {
+    let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified());
+    let Ok(cache_time) = modified(cache) else {
+        return false;
+    };
+    if !waveform.exists() {
+        return true;
+    }
+    match (modified(waveform), modified(metadata)) {
+        (Ok(waveform_time), Ok(metadata_time)) => {
+            cache_time > waveform_time && cache_time > metadata_time
+        }
+        _ => false,
+    }
+}
+
+/// The largest |t| in a row of t-values, or NaN if no value is finite. Values that are not
+/// finite (NaN or infinite) are skipped.
+fn max_abs_finite(row: impl IntoIterator<Item = f64>) -> f64 {
+    row.into_iter()
+        .filter(|x| x.is_finite())
+        .map(f64::abs)
+        .fold(f64::NAN, f64::max)
+}
+
+/// Reads the paths of the metadata files from a meta list file. Relative paths are relative to
+/// the directory of the list file.
+fn read_meta_list(list_path: &Path) -> miette::Result<Vec<PathBuf>> {
+    let root = list_path.parent().unwrap_or(Path::new(""));
+    let text = std::fs::read_to_string(list_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("cannot read the meta list file {}", list_path.display()))?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let path = PathBuf::from(line);
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        })
+        .collect())
+}
+
+/// Reads the traces and labels of one batch from the cache or computes them from the waveform.
+fn batch_data(
+    metadata_path: &Path,
+    use_existing: bool,
+    cache_allowed: bool,
+    selection: &Selection,
+) -> miette::Result<(Array2<f32>, Array1<u16>)> {
+    if !metadata_path.exists() {
+        return Err(miette!(
+            "the metadata file {} does not exist",
+            metadata_path.display()
+        ));
+    }
+    let meta = read_batch_meta(metadata_path)?;
+    let trace_file_path = meta.trace_path.clone();
+    let parent_folder_path = metadata_path.parent().unwrap_or(Path::new("."));
+    let npz_path = parent_folder_path.join("traces.npz");
+
+    if use_existing
+        && cache_allowed
+        && npz_path.exists()
+        && cache_is_fresh(&npz_path, &trace_file_path, metadata_path)
+    {
+        println!(
+            "Using existing traces and labels from {}",
+            npz_path.display()
+        );
+        return read_trace_cache(&npz_path);
+    }
+
+    println!(
+        "Computing power traces from {}...",
+        trace_file_path.display()
+    );
+    let start_time = std::time::Instant::now();
+    let (traces_array, labels_array, diagnostics) = batch_traces(&meta, selection)?;
+    let (num_traces, cur_samples_per_trace) = traces_array.dim();
+    println!(
+        "Computed {num_traces} traces with up to {cur_samples_per_trace} samples in {:.2}s",
+        start_time.elapsed().as_secs_f32()
+    );
+    info!(
+        "{}: {} signals selected; toggles: {} in total, {} at the sampled time points, \
+         {} inside the segments",
+        trace_file_path.display(),
+        diagnostics.info.selected_handles,
+        diagnostics.total_toggles,
+        diagnostics.kept_toggles,
+        diagnostics.segment_toggles
+    );
+    report_selection(&trace_file_path.display().to_string(), &diagnostics);
+
+    if cache_allowed {
+        println!("Saving traces and labels to NPZ file...");
+        let start_time = std::time::Instant::now();
+        write_trace_cache(&npz_path, &traces_array, &labels_array)?;
+        println!(
+            "Saved traces and labels to {} in {:.2}s\n",
+            npz_path.display(),
+            start_time.elapsed().as_secs_f32()
+        );
+    }
+    Ok((traces_array, labels_array))
+}
+
 fn main() -> miette::Result<()> {
     // set default log level to info
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -169,43 +295,25 @@ fn main() -> miette::Result<()> {
         .into_diagnostic()
         .wrap_err("invalid value for --include or --exclude")?;
 
-    let filenames: Vec<PathBuf> = if let Some(meta_list_path) = args.maybe_meta_list_path {
-        let meta_root_path = PathBuf::from(&meta_list_path)
-            .parent()
-            .unwrap_or_else(|| {
-                panic!(
-                    "Meta list path '{}' does not have a parent directory",
-                    meta_list_path
-                )
-            })
-            .to_owned();
-        // Read the meta list file and collect filenames
-        std::fs::read_to_string(meta_list_path)
-            .expect("Failed to read meta list file")
-            .lines()
-            .filter_map(|line| {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    return None; // Skip empty lines
-                }
-                let mut p = PathBuf::from(trimmed);
-                if !p.is_absolute() {
-                    p = meta_root_path.join(p);
-                }
-                Some(p)
-            })
-            .collect_vec()
-    } else if let Some(filename) = args.maybe_metadata {
+    let filenames: Vec<PathBuf> = if let Some(meta_list_path) = &args.maybe_meta_list_path {
+        read_meta_list(Path::new(meta_list_path))?
+    } else if let Some(filename) = &args.maybe_metadata {
         vec![PathBuf::from(filename)]
     } else {
-        panic!("No meta files provided. Please specify at least one NPZ file.");
+        // `clap` requires one of the two options.
+        unreachable!("clap requires --meta-json or --meta-list");
     };
     if filenames.is_empty() {
-        panic!("No meta files provided. Please specify at least one NPZ file.");
+        return Err(miette!(
+            "the meta list file {} has no metadata files",
+            args.maybe_meta_list_path.as_deref().unwrap_or_default()
+        ));
     }
     if args.list_signals {
         let meta = read_batch_meta(&filenames[0])?;
-        let index = hierarchy_index(&meta.trace_path).into_diagnostic()?;
+        let index = hierarchy_index(&meta.trace_path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("cannot read {}", meta.trace_path.display()))?;
         return list_signals(&index, &selection);
     }
     let order = args.order;
@@ -221,232 +329,130 @@ fn main() -> miette::Result<()> {
 
     let mut maybe_ttacc: Option<ttest::Ttest> = None;
 
-    let npz_filename = "traces.npz";
     // `traces.npz` holds the traces of the default selection (all signals). A run with rules
     // computes other traces. It must not reuse the file, and it must not overwrite it, because
     // a later run without rules would then read the traces of this selection.
     let cache_allowed = rules.is_empty();
 
-    args.num_threads.iter().for_each(|&n| {
+    if let Some(n) = args.num_threads {
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build_global()
-            .unwrap()
-    });
-
-    let default_num_threads = rayon::current_num_threads();
+            .into_diagnostic()
+            .wrap_err("cannot set the number of threads")?;
+    }
 
     println!(
         "Using {} threads for parallel processing",
-        default_num_threads
+        rayon::current_num_threads()
     );
 
-    let collected_traces = filenames.into_par_iter().filter_map(|metadata_path| {
-        if !metadata_path.exists() {
-            log::error!(
-                "Metadata file '{}' does not exist!",
-                metadata_path.display()
-            );
-            return None;
-        }
-
-        let meta = read_batch_meta(&metadata_path).expect("Failed to read batch metadata");
-        let trace_file_path = meta.trace_path.clone();
-
-        let parent_folder_path = metadata_path
-            .parent()
-            .expect("Failed to get parent folder of metadata file")
-            .to_path_buf();
-
-        let npz_path = parent_folder_path.join(npz_filename);
-
-        let use_existing = if args.use_existing && cache_allowed && npz_path.exists() {
-            if !trace_file_path.exists() {
-                true
-            } else {
-                // Check if the npz file is older than the trace file
-                let npz_modified = std::fs::metadata(&npz_path).and_then(|m| m.modified());
-                let trace_modified = std::fs::metadata(&trace_file_path).and_then(|m| m.modified());
-                if let (Ok(npz_modified), Ok(trace_modified)) = (npz_modified, trace_modified) {
-                    // Use existing if npz file is newer than trace file
-                    npz_modified > trace_modified
-                } else {
-                    false
-                }
-            }
-        } else {
-            false
-        };
-
-        if use_existing {
-            println!(
-                "Using existing traces and labels from {}",
-                npz_path.display()
-            );
-            let mut npz_reader =
-                NpzReader::new(File::open(&npz_path).expect("Failed to open npz file"))
-                    .expect("Failed to read npz file");
-            let labels_array: Array1<u16> = npz_reader
-                .by_name("labels")
-                .expect("Failed to find 'labels' in NPZ file");
-
-            let traces: Vec<Array1<f32>> = npz_reader
-                .names()
-                .expect("Failed to get names from NPZ file")
-                .iter()
-                .filter(|&name| name.starts_with("trace_")).map(|name| npz_reader
-                            .by_name(name.as_str())
-                            .unwrap_or_else(|_| panic!("Failed to find '{}' in NPZ file", name)))
-                .collect_vec();
-            let num_traces = traces.len();
-            let traces_array: Array2<f32> = Array2::from_shape_vec(
-                (num_traces, traces[0].len()),
-                traces.into_iter().flatten().collect(),
-            )
-            .expect("Failed to create traces array");
-            Some((traces_array, labels_array))
-        } else {
-            println!("Computing power traces from {}...", trace_file_path.display());
-            let start_time = std::time::Instant::now();
-            let (traces_array, labels_array, diagnostics) =
-                batch_traces(&meta, &selection).expect("Failed to compute traces");
-            let (num_traces, cur_samples_per_trace) = traces_array.dim();
-            println!(
-                "Computed {num_traces} traces with up to {cur_samples_per_trace} samples in {:.2}s",
-                start_time.elapsed().as_secs_f32()
-            );
-            info!(
-                "{}: {} signals selected; toggles: {} in total, {} at the sampled time points, \
-                 {} inside the segments",
-                trace_file_path.display(),
-                diagnostics.info.selected_handles,
-                diagnostics.total_toggles,
-                diagnostics.kept_toggles,
-                diagnostics.segment_toggles
-            );
-            report_selection(&trace_file_path.display().to_string(), &diagnostics);
-
-            if cache_allowed {
-                println!("Saving traces and labels to NPZ file...");
-                let start_time: std::time::Instant = std::time::Instant::now();
-                let mut npz = NpzWriter::new_compressed(
-                    File::create(&npz_path).expect("Failed to create npz file"),
-                );
-                for (tidx, trace) in traces_array.outer_iter().enumerate() {
-                    npz.add_array(format!("trace_{tidx}"), &trace)
-                        .expect("Failed to add array 'a' to npz");
-                }
-                npz.add_array("labels", &labels_array)
-                    .expect("Failed to add array 'labels' to npz");
-                npz.finish().expect("Failed to finish writing npz file");
-                println!(
-                    "Saved traces and labels to {} in {:.2}s\n",
-                    npz_path.display(),
-                    start_time.elapsed().as_secs_f32()
-                );
-            }
-
-            Some((traces_array, labels_array))
-        }
-    }).collect_vec_list();
+    let batches: Vec<(PathBuf, Array2<f32>, Array1<u16>)> = filenames
+        .into_par_iter()
+        .map(|metadata_path| {
+            let (traces, labels) =
+                batch_data(&metadata_path, args.use_existing, cache_allowed, &selection)?;
+            Ok((metadata_path, traces, labels))
+        })
+        .collect::<miette::Result<_>>()?;
 
     let mut total_collected_traces: usize = 0;
+    let mut last_t_values: Option<Array2<f64>> = None;
     // must be done sequentially
-    let t_values = collected_traces
-        .into_iter()
-        .flatten()
-        .fold(None, |_prev_tvalues, (traces_array, labels_array)| {
-            let (num_traces, cur_samples_per_trace) = traces_array.dim();
-            total_collected_traces += num_traces;
-            let traces_array = if samples_per_trace == 0 {
-                // Initialize samples_per_trace with the length of the first trace
-                samples_per_trace = cur_samples_per_trace;
-                traces_array
+    for (metadata_path, traces_array, labels_array) in batches {
+        let (num_traces, cur_samples_per_trace) = traces_array.dim();
+        total_collected_traces += num_traces;
+        if num_traces <= 1 {
+            return Err(miette!(
+                "the batch {} has {num_traces} traces; a t-test needs at least two traces",
+                metadata_path.display()
+            ));
+        }
+        if labels_array.len() != num_traces {
+            return Err(miette!(
+                "the batch {} has {num_traces} traces but {} labels",
+                metadata_path.display(),
+                labels_array.len()
+            ));
+        }
+        let traces_array = if samples_per_trace == 0 {
+            // Initialize samples_per_trace with the length of the first trace
+            samples_per_trace = cur_samples_per_trace;
+            traces_array
+        } else if samples_per_trace == cur_samples_per_trace {
+            traces_array
+        } else {
+            error!(
+                "Inconsistent number of samples per trace: expected {}, found {}",
+                samples_per_trace, cur_samples_per_trace
+            );
+            if cur_samples_per_trace > samples_per_trace {
+                warn!(
+                    "Using the first {} samples of the longer trace",
+                    samples_per_trace
+                );
+                traces_array.slice(s![.., ..samples_per_trace]).to_owned()
             } else {
-                if samples_per_trace == cur_samples_per_trace {
-                    traces_array
-                } else {
-                    error!(
-                        "Inconsistent number of samples per trace: expected {}, found {}",
-                        samples_per_trace, cur_samples_per_trace
-                    );
-                    if cur_samples_per_trace > samples_per_trace {
-                        warn!(
-                            "Using the first {} samples of the longer trace",
-                            samples_per_trace
-                        );
-                        // Array2::<f32>::from(traces_array.slice(s![.., ..samples_per_trace]))
-                        traces_array.slice(s![.., ..samples_per_trace]).to_owned()
-                    } else {
-                        error!(
-                            "skipping trace with {} samples as expected {}",
-                            cur_samples_per_trace, samples_per_trace
-                        );
-                        // create a larger array with zeros
-                        let mut t = Array2::<f32>::zeros((num_traces, samples_per_trace));
-                        // fill in each row with the available samples
-                        for (i, row) in traces_array.outer_iter().enumerate() {
-                            t.slice_mut(s![i, ..row.len()]).assign(&row);
-                        }
-                        t
-                    }
+                error!(
+                    "skipping trace with {} samples as expected {}",
+                    cur_samples_per_trace, samples_per_trace
+                );
+                // create a larger array with zeros
+                let mut t = Array2::<f32>::zeros((num_traces, samples_per_trace));
+                // fill in each row with the available samples
+                for (i, row) in traces_array.outer_iter().enumerate() {
+                    t.slice_mut(s![i, ..row.len()]).assign(&row);
                 }
-            };
-            num_traces_so_far.push(
-                num_traces_so_far
-                    .last()
-                    .map_or(num_traces, |&last| last + num_traces),
-            );
-
-            assert!(num_traces > 1, "Number of traces must be greater than 1");
-            assert!(
-                labels_array.len() == num_traces,
-                "Number of trace labels does not match number of traces"
-            );
-
-            if maybe_ttacc.is_none() {
-                maybe_ttacc = Some(ttest::Ttest::new(samples_per_trace, order));
+                t
             }
+        };
+        num_traces_so_far.push(
+            num_traces_so_far
+                .last()
+                .map_or(num_traces, |&last| last + num_traces),
+        );
 
-            if let Some(ref mut ttacc) = maybe_ttacc {
-                // Update the ttest accumulator with the current traces and labels
-                ttacc.update(traces_array.view(), labels_array.view());
+        let ttacc = maybe_ttacc.get_or_insert_with(|| ttest::Ttest::new(samples_per_trace, order));
+        // Update the ttest accumulator with the current traces and labels
+        ttacc.update(traces_array.view(), labels_array.view());
 
-                let t_values = ttacc.get_ttest();
-                max_t_values
-                    .iter_mut()
-                    .zip(t_values.rows())
-                    .for_each(|(max_t, t_row)| {
-                        max_t.push(
-                            t_row
-                                .iter()
-                                .filter_map(|&x| x.is_finite().then_some(x.abs()))
-                                .max_by(|a, b| a.partial_cmp(b).unwrap())
-                                .expect("Failed to find max t-value in current row"),
-                        );
-                    });
-                Some(t_values)
-            } else {
-                panic!("Ttest accumulator is not initialized");
-            }
-        })
-        .expect("Failed to compute t-test values");
+        let t_values = ttacc.get_ttest();
+        for (max_t, t_row) in max_t_values.iter_mut().zip(t_values.rows()) {
+            max_t.push(max_abs_finite(t_row.iter().copied()));
+        }
+        last_t_values = Some(t_values);
+    }
+    let t_values = last_t_values.ok_or_else(|| miette!("there is no batch to analyze"))?;
+    if t_values.iter().any(|t| !t.is_finite()) {
+        warn!(
+            "some t-values are not finite (for example, a sample is constant or a class has too \
+             few traces). The maximum |t| ignores them and is NaN if no t-value is finite"
+        );
+    }
 
     log::info!("Total number of traces: {}", total_collected_traces);
 
     let output_dir = PathBuf::from(&args.ttest_output_dir);
     if !output_dir.exists() {
-        std::fs::create_dir_all(&output_dir).expect("Failed to create output directory for plots");
+        std::fs::create_dir_all(&output_dir)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("cannot create the directory {}", output_dir.display()))?;
     }
 
-    // sage t_values to a npz file
+    // Save t_values to a npz file
     let npz_path = output_dir.join("t_values.npz");
     info!("Saving t-test results to {}", npz_path.display());
-    let mut npz =
-        NpzWriter::new_compressed(File::create(&npz_path).expect("Failed to create npz file"));
+    let mut npz = NpzWriter::new_compressed(
+        File::create(&npz_path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("cannot create {}", npz_path.display()))?,
+    );
     npz.add_array("t_values", &t_values)
-        .expect("Failed to add t_values array to npz");
-    npz.finish().expect("Failed to finish writing npz file");
+        .into_diagnostic()
+        .wrap_err("cannot write the t-values")?;
+    npz.finish()
+        .into_diagnostic()
+        .wrap_err("cannot write the t-values")?;
     info!("Saved t_values to {}", npz_path.display());
 
     if args.plot {
@@ -454,7 +460,7 @@ fn main() -> miette::Result<()> {
             .pdf_export_timeout(1000)
             // .offline_mode(true)
             .build()
-            .expect("Failed to create static exporter");
+            .map_err(|e| miette!("cannot create the static plot exporter: {e}"))?;
 
         let plots_config = plotly::Configuration::new()
             .display_mode_bar(plotly::configuration::DisplayModeBar::Hover)
@@ -527,6 +533,14 @@ mod tests {
             ]),
             ["+scope:a", "-signal:a.b", "+scope:c"]
         );
+    }
+
+    #[test]
+    fn max_abs_finite_skips_values_that_are_not_finite() {
+        assert_eq!(max_abs_finite([1.0, -3.0, 2.0]), 3.0);
+        assert_eq!(max_abs_finite([f64::NAN, -2.0, f64::INFINITY]), 2.0);
+        assert!(max_abs_finite([f64::NAN, f64::NEG_INFINITY]).is_nan());
+        assert!(max_abs_finite([]).is_nan());
     }
 
     #[test]

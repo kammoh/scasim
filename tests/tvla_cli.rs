@@ -108,21 +108,27 @@ impl Batch {
     /// Writes `traces.npz` with the cached traces. A fresh file is newer than the waveform. A
     /// stale file is older.
     fn write_cache(&self, fresh: bool) {
+        self.write_cache_with(&[0, 1, 2, 3], true, fresh.then(SystemTime::now));
+    }
+
+    /// Writes `traces.npz` with the entries `trace_<i>` for the given `indices`, in this order
+    /// in the archive. `labels` come first or last. `time` is the modification time, or two
+    /// hours ago if it is `None`.
+    fn write_cache_with(&self, indices: &[usize], labels_last: bool, time: Option<SystemTime>) {
+        let traces = cached_traces();
+        let labels = Array1::from_vec(LABELS.to_vec());
         let mut npz = NpzWriter::new(std::fs::File::create(self.npz()).unwrap());
-        for (i, row) in cached_traces().outer_iter().enumerate() {
-            npz.add_array(format!("trace_{i}"), &row).unwrap();
+        if !labels_last {
+            npz.add_array("labels", &labels).unwrap();
         }
-        npz.add_array("labels", &Array1::from_vec(LABELS.to_vec()))
-            .unwrap();
+        for &i in indices {
+            npz.add_array(format!("trace_{i}"), &traces.row(i)).unwrap();
+        }
+        if labels_last {
+            npz.add_array("labels", &labels).unwrap();
+        }
         npz.finish().unwrap();
-        set_modified(
-            &self.npz(),
-            if fresh {
-                SystemTime::now()
-            } else {
-                hours_ago(2)
-            },
-        );
+        set_modified(&self.npz(), time.unwrap_or_else(|| hours_ago(2)));
     }
 
     /// The traces and labels in `traces.npz`.
@@ -138,6 +144,11 @@ impl Batch {
     /// Runs `tvla` with `args` after the fixed arguments. Returns the output of a run that
     /// fails as well.
     fn run_any(&self, args: &[&str]) -> Output {
+        self.run_order("1", args)
+    }
+
+    /// Like `run_any`, with the highest t-test order `order`.
+    fn run_order(&self, order: &str, args: &[&str]) -> Output {
         let out = self.dir.path().join("out");
         Command::new(env!("CARGO_BIN_EXE_tvla"))
             .env_remove("RUST_LOG")
@@ -145,7 +156,7 @@ impl Batch {
             .arg(self.meta())
             .arg("--ttest-output-dir")
             .arg(&out)
-            .args(["--plot=false", "-d", "1"])
+            .args(["--plot=false", "-d", order])
             .args(args)
             .output()
             .unwrap()
@@ -363,4 +374,196 @@ fn list_signals_prints_only_data_lines_on_stdout() {
             "{stderr}"
         );
     }
+}
+
+/// Asserts that a run failed with a message and without a panic.
+fn assert_fails_with(output: &Output, expected: &[&str]) {
+    let stderr = text(&output.stderr);
+    assert!(!output.status.success(), "the run succeeded: {stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!stderr.contains("RUST_BACKTRACE"), "{stderr}");
+    for part in expected {
+        assert!(stderr.contains(part), "missing {part:?} in: {stderr}");
+    }
+}
+
+/// A shortened path text: miette wraps long lines, so tests look for the file name only.
+fn name_of(path: &Path) -> String {
+    path.file_name().unwrap().to_string_lossy().into_owned()
+}
+
+#[test]
+fn an_empty_selection_is_an_error_that_lists_the_unmatched_rules() {
+    for format in FORMATS {
+        let batch = Batch::new_in(format, TOGGLES, None);
+        let output = batch.run_any(&["--include", "signal:does.not.exist"]);
+        assert_fails_with(&output, &["selects no signals", "+signal:does.not.exist"]);
+    }
+}
+
+#[test]
+fn missing_meta_options_are_a_usage_error() {
+    let output = Command::new(env!("CARGO_BIN_EXE_tvla"))
+        .env_remove("RUST_LOG")
+        .output()
+        .unwrap();
+    assert_fails_with(&output, &["--meta-json", "--meta-list"]);
+    assert!(!text(&output.stderr).contains("NPZ"));
+}
+
+#[test]
+fn a_missing_metadata_file_is_an_error_that_names_the_file() {
+    let batch = Batch::new(TOGGLES, None);
+    let missing = batch.dir.path().join("no_such_meta.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_tvla"))
+        .env_remove("RUST_LOG")
+        .arg("--meta-json")
+        .arg(&missing)
+        .args(["--plot=false", "--ttest-output-dir"])
+        .arg(batch.dir.path().join("out"))
+        .output()
+        .unwrap();
+    assert_fails_with(&output, &["no_such_meta.json"]);
+}
+
+#[test]
+fn a_missing_batch_in_the_meta_list_is_an_error_that_names_the_file() {
+    let batch = Batch::new(TOGGLES, None);
+    let list = batch.dir.path().join("meta.list");
+    std::fs::write(&list, "meta.json\ngone/meta.json.gz\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tvla"))
+        .env_remove("RUST_LOG")
+        .arg("--meta-list")
+        .arg(&list)
+        .args(["--plot=false", "--ttest-output-dir"])
+        .arg(batch.dir.path().join("out"))
+        .output()
+        .unwrap();
+    assert_fails_with(&output, &["meta.json.gz"]);
+}
+
+#[test]
+fn a_missing_waveform_is_an_error_that_names_the_file() {
+    for format in FORMATS {
+        let batch = Batch::new_in(format, TOGGLES, None);
+        let waveform = batch.dir.path().join(format.file_name());
+        std::fs::remove_file(&waveform).unwrap();
+        let output = batch.run_any(&[]);
+        assert_fails_with(&output, &[&name_of(&waveform)]);
+    }
+}
+
+#[test]
+fn bad_metadata_is_an_error_that_names_the_file() {
+    let batch = Batch::new(TOGGLES, None);
+    std::fs::write(batch.meta(), "{ not json").unwrap();
+    assert_fails_with(&batch.run_any(&[]), &["meta.json", "not valid JSON"]);
+    let gz = batch.dir.path().join("meta.json.gz");
+    std::fs::write(&gz, "not gzip").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tvla"))
+        .env_remove("RUST_LOG")
+        .arg("--meta-json")
+        .arg(&gz)
+        .args(["--plot=false", "--ttest-output-dir"])
+        .arg(batch.dir.path().join("out"))
+        .output()
+        .unwrap();
+    assert_fails_with(&output, &["meta.json.gz"]);
+}
+
+#[test]
+fn a_batch_with_one_trace_is_an_error() {
+    let batch = Batch::new(TOGGLES, None);
+    std::fs::write(
+        batch.meta(),
+        r#"{"trace_filename": "tvla.vcd", "markers": [[10, 30, 0]]}"#,
+    )
+    .unwrap();
+    assert_fails_with(&batch.run_any(&[]), &["at least two traces", "meta.json"]);
+}
+
+#[test]
+fn traces_without_any_toggle_do_not_panic() {
+    // `aux.a` never toggles, so all traces are zero and every t-value is NaN.
+    for format in FORMATS {
+        let batch = Batch::new_in(format, TOGGLES, None);
+        let output = batch.run(&["--include", "signal:aux.a"]);
+        let stderr = text(&output.stderr);
+        assert!(stderr.contains("not finite"), "{stderr}");
+        assert_eq!(stderr.matches("not finite").count(), 1, "{stderr}");
+        assert!(batch.t_values().iter().all(|t| !t.is_finite()));
+    }
+}
+
+#[test]
+fn a_second_order_test_with_two_traces_per_class_does_not_panic() {
+    let batch = Batch::new(TOGGLES, None);
+    let output = batch.run_order("2", &[]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+}
+
+#[test]
+fn the_cache_is_read_in_the_order_of_the_trace_indices() {
+    for format in FORMATS {
+        let batch = Batch::new_in(format, TOGGLES, None);
+        batch.write_cache_with(&[3, 1, 0, 2], false, Some(SystemTime::now()));
+        let output = batch.run(&[]);
+        assert!(text(&output.stdout).contains("Using existing traces"));
+        assert_close(&batch.t_values(), &welch_t(&cached_traces(), &LABELS));
+    }
+}
+
+#[test]
+fn a_cache_with_missing_or_extra_trace_indices_is_an_error() {
+    let batch = Batch::new(TOGGLES, None);
+    // The index 2 is missing, and the index 4 has no place.
+    batch.write_cache_with(&[0, 1, 3], true, Some(SystemTime::now()));
+    assert_fails_with(&batch.run_any(&[]), &["traces.npz", "trace_2"]);
+    // Four labels but three traces.
+    batch.write_cache_with(&[0, 1, 2], true, Some(SystemTime::now()));
+    assert_fails_with(&batch.run_any(&[]), &["traces.npz", "labels"]);
+}
+
+#[test]
+fn a_cache_without_traces_is_an_error() {
+    let batch = Batch::new(TOGGLES, None);
+    batch.write_cache_with(&[], true, Some(SystemTime::now()));
+    assert_fails_with(&batch.run_any(&[]), &["traces.npz", "no traces"]);
+}
+
+#[test]
+fn a_metadata_file_newer_than_the_cache_causes_a_recompute() {
+    for format in FORMATS {
+        let batch = Batch::new_in(format, TOGGLES, None);
+        // The cache is newer than the waveform (one hour old) and older than the metadata file.
+        batch.write_cache_with(
+            &[0, 1, 2, 3],
+            true,
+            Some(hours_ago(0) - Duration::from_secs(1800)),
+        );
+        let before = std::fs::read(batch.npz()).unwrap();
+        let output = batch.run(&[]);
+        assert!(text(&output.stdout).contains("Computing power traces from"));
+        assert_ne!(std::fs::read(batch.npz()).unwrap(), before, "traces.npz");
+        assert_eq!(batch.read_cache().0, s0_s1_traces());
+        // An old metadata file does not cause a recompute.
+        set_modified(&batch.meta(), hours_ago(3));
+        batch.write_cache(true);
+        let before = std::fs::read(batch.npz()).unwrap();
+        assert!(text(&batch.run(&[]).stdout).contains("Using existing traces"));
+        assert_eq!(std::fs::read(batch.npz()).unwrap(), before, "traces.npz");
+    }
+}
+
+#[test]
+fn a_cache_is_used_if_the_waveform_is_gone_even_if_the_metadata_file_is_newer() {
+    let batch = Batch::new(TOGGLES, None);
+    std::fs::remove_file(batch.dir.path().join("tvla.vcd")).unwrap();
+    batch.write_cache_with(
+        &[0, 1, 2, 3],
+        true,
+        Some(hours_ago(0) - Duration::from_secs(1800)),
+    );
+    let output = batch.run(&[]);
+    assert!(text(&output.stdout).contains("Using existing traces"));
 }
