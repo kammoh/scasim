@@ -112,3 +112,7 @@ The outputs for the whole selection do not change. In `--ttest-output-dir`, `--p
 - the t-value plots of the best channel only, in `top_channel/`.
 
 With `--per-scope`, `traces.npz` is neither read nor written, and `tvla` reads one batch at a time. The accumulators need memory for every channel. The summary shows it.
+
+## Null runs with shuffled labels
+
+`--shuffle-labels SEED` shuffles the labels (classes) of each batch before the statistics. A small generator (SplitMix64) with a Fisher-Yates shuffle does this. Its state comes from `SEED` and the batch number, so a run with the same seed gives the same results. The number of traces in each class does not change. All outputs are written as usual, and the summary says that the labels were shuffled. With shuffled labels, the classes carry no information. A leak must disappear. The largest |t| of such a run shows how large |t| gets by chance, which calibrates the false-positive floor of the test.

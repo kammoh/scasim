@@ -166,6 +166,8 @@ pub struct SummaryInput<'a> {
     pub edges: Option<EdgeTotals>,
     /// Present with `--per-scope`.
     pub channels: Option<ChannelsSummary>,
+    /// The seed of `--shuffle-labels`, if the labels were shuffled.
+    pub shuffle_seed: Option<u64>,
 }
 
 fn mib(bytes: usize) -> f64 {
@@ -175,6 +177,11 @@ fn mib(bytes: usize) -> f64 {
 /// Formats the summary as one block of lines.
 pub fn render(input: &SummaryInput<'_>) -> String {
     let mut lines = vec!["Summary".to_string()];
+    if let Some(seed) = input.shuffle_seed {
+        lines.push(format!(
+            "  null run: labels were shuffled with the seed {seed}; no leak is expected"
+        ));
+    }
     let orders: Vec<OrderSummary> = input
         .t_values
         .rows()
@@ -320,6 +327,7 @@ mod tests {
             memory_bytes: 3 << 20,
             edges: None,
             channels: None,
+            shuffle_seed: None,
         });
         assert_eq!(text.matches("d=1: max |t| 1.000 at sample 0").count(), 1);
         assert_eq!(text.matches("d=2: max |t| 7.000 at sample 1").count(), 1);
@@ -366,6 +374,7 @@ mod tests {
             memory_bytes: 0,
             edges: None,
             channels: None,
+            shuffle_seed: None,
         });
         assert!(text.contains("max -log10(p) 6.000 at sample 1 (dof 3, 2 bins merged)"));
         assert!(text.contains("1 p-values failed"));
@@ -392,6 +401,7 @@ mod tests {
             memory_bytes: 0,
             edges: Some(edges),
             channels: None,
+            shuffle_seed: None,
         });
         assert!(
             text.contains("20 bins in 2 batches; toggles: 90 inside the bins + 6 before"),
@@ -441,7 +451,12 @@ mod tests {
                 memory_bytes: 2 << 20,
                 top,
             }),
+            shuffle_seed: Some(9),
         });
+        assert!(
+            text.contains("null run: labels were shuffled with the seed 9"),
+            "{text}"
+        );
         assert!(text.contains("channels: 2 below tb.dut (depth 1); 3 signals with several names; 4 selected signals outside the scope; accumulators of the channels: 2.00 MiB"), "{text}");
         assert!(
             text.contains("best channels by max |t|: 1. tb.a |t| 12.500 (d=2, sample 4); 2. tb.b"),

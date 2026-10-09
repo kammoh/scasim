@@ -18,6 +18,7 @@ use scasim::plot::*;
 use scasim::power::edges::EdgeKind;
 use scasim::power::{PowerPlan, hierarchy_index};
 use scasim::scopes::{group_by_scope, scope_plan};
+use scasim::shuffle::shuffle_labels;
 use scasim::stats::threshold::{CONVENTIONAL, bonferroni, family_size, t_bonferroni};
 use scasim::stats::{HistAccumulator, TestResult};
 use std::fs::File;
@@ -186,6 +187,11 @@ struct Args {
         requires = "per_scope"
     )]
     depth: u64,
+    /// Null run: shuffle the labels of each batch before the statistics, with a generator seeded
+    /// by SEED and the batch number. The run is reproducible and the class counts do not change.
+    /// All outputs are written as usual. Use it to see how large |t| gets without a leak.
+    #[arg(long = "shuffle-labels", value_name = "SEED")]
+    shuffle_labels: Option<u64>,
     /// What to do when the traces have different lengths. `pad`: pad shorter traces with zeros.
     /// A later batch is padded or cut to the length of the first batch. `truncate`: cut traces to
     /// the shortest trace of the batch, and a longer batch to the length of the first batch. A
@@ -309,6 +315,8 @@ struct BatchSettings<'a> {
     cache_allowed: bool,
     /// The scope and the depth of the per-scope channels.
     per_scope: Option<(String, usize)>,
+    /// The seed of the shuffle of the labels (`--shuffle-labels`).
+    shuffle_seed: Option<u64>,
 }
 
 /// The traces of one per-scope channel in one batch.
@@ -349,7 +357,20 @@ fn cache_is_fresh(cache: &Path, waveform: &Path, metadata: &Path) -> bool {
 
 /// Reads the traces and labels of one batch from the cache or computes them from the waveform.
 /// Also returns the edge report of the batch, if it was computed in edges mode.
-fn batch_data(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Result<BatchResult> {
+fn batch_data(
+    batch_index: usize,
+    metadata_path: &Path,
+    settings: &BatchSettings<'_>,
+) -> miette::Result<BatchResult> {
+    let mut result = load_batch(metadata_path, settings)?;
+    if let Some(seed) = settings.shuffle_seed {
+        shuffle_labels(&mut result.total.labels, seed, batch_index);
+    }
+    Ok(result)
+}
+
+/// Like [`batch_data`], without the shuffle of the labels.
+fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Result<BatchResult> {
     if !metadata_path.exists() {
         return Err(miette!(
             "the metadata file {} does not exist",
@@ -607,6 +628,7 @@ fn main() -> miette::Result<()> {
             .per_scope
             .clone()
             .map(|scope| (scope, args.depth as usize)),
+        shuffle_seed: args.shuffle_labels,
     };
     if let Some(clock) = &args.clock {
         info!(
@@ -639,10 +661,12 @@ fn main() -> miette::Result<()> {
     };
     let mut scope_folds: Vec<ScopeFold> = Vec::new();
     let (mut aliased, mut outside) = (0, 0);
-    for window in filenames.chunks(window_size) {
+    for (window_number, window) in filenames.chunks(window_size).enumerate() {
+        let first_index = window_number * window_size;
         let loaded: Vec<BatchResult> = window
             .par_iter()
-            .map(|metadata_path| batch_data(metadata_path, &settings))
+            .enumerate()
+            .map(|(i, metadata_path)| batch_data(first_index + i, metadata_path, &settings))
             .collect::<miette::Result<_>>()?;
         for result in loaded {
             if let Some(edges) = &result.edges {
@@ -734,6 +758,7 @@ fn main() -> miette::Result<()> {
             memory_bytes,
             edges: (edge_totals.batches > 0).then_some(edge_totals),
             channels: channels_summary,
+            shuffle_seed: args.shuffle_labels,
         })
     );
     if let Some(c) = &chi2_report
