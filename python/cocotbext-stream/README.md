@@ -89,3 +89,16 @@ Differences from `cocotb_ext`:
   edge wake-up. This is a timing change, not only a port.
 - `Scoreboard` collects field-level mismatches, unexpected (duplicate) items, and missing items,
   and `wait_for_completion(timeout=...)` reports the missing items instead of hanging.
+
+## Benchmark
+
+`bench/bench_stream.py` sends the same traffic through this package and through `cocotb_ext`
+(Verilator, one simulator process). It prints CPU time (`time.process_time`) per transaction and
+per cycle, and checks that every run delivers exactly the sent transactions.
+
+```
+python bench/bench_stream.py --out OUT_DIR -n 20000 --reps 7 --cocotb-ext DIR
+```
+
+`DIR` holds a copy of `cocotb_ext` ported to cocotb 2.1 (needs `cocotb-bus`). The copy is not part
+of this repository. Without `--cocotb-ext`, only this package runs.
