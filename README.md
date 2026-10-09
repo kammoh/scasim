@@ -83,7 +83,7 @@ cargo run --release --bin tvla -- --meta-list path_to_meta_list \
 - `--offset N` adds `N` ticks to every edge (default 0). A negative offset is allowed if no edge goes below time 0.
 - `--length-policy pad|truncate|error` decides what happens when traces have different lengths. The default is `pad` without `--clock`, and `error` with `--clock`.
   - `pad`: inside a batch, pad shorter traces with zeros. Between batches, pad a shorter batch with zeros and cut a longer batch to the length of the first batch.
-  - `truncate`: inside a batch, cut all traces to the shortest trace. Between batches, cut a longer batch to the length of the first batch. A shorter batch is an error.
+  - `truncate`: inside a batch, cut all traces to the shortest trace. Between batches, cut a longer batch to the shortest length so far. A shorter batch shortens the accumulator. The final result equals the result of cutting every batch to the shortest length of all, in any order of the batches. The curve of the maximum |t| keeps the points that were recorded before a shortening.
   - `error`: any difference is an error. The message gives the histogram of the trace lengths for each class.
 
 The traces are `f32`, which holds integers exactly up to 2^24 = 16,777,216. With `--clock`, and for the channels of `--per-scope`, a count above 2^24 in one sample is an error that names the batch, the segment, and the count. The legacy sampling keeps the old conversion.

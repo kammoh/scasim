@@ -54,8 +54,8 @@ pub fn chi2_results(hist: &HistAccumulator) -> miette::Result<Vec<TestResult>> {
 pub struct Fold {
     pub order: usize,
     pub chi2: bool,
-    /// What to do with a batch whose traces have another length than those of the first batch.
-    /// See [`LengthPolicy`].
+    /// What to do with a batch whose traces have another length than the batches before it.
+    /// See [`LengthPolicy`]. With `Truncate`, `samples` is the shortest length so far.
     pub policy: LengthPolicy,
     /// True if the fold computes the results and the curves after every batch.
     curves: bool,
@@ -138,13 +138,16 @@ impl Fold {
                     ));
                 }
                 LengthPolicy::Truncate if cur_samples_per_trace < self.samples => {
-                    return Err(miette!(
-                        "the batch {} has {cur_samples_per_trace} samples per trace, fewer than \
-                         the {} of the first batch. The policy truncate cannot make traces \
-                         longer. Use --length-policy pad to pad them with zeros",
-                        metadata.display(),
-                        self.samples
-                    ));
+                    // A shorter batch shortens the accumulator: the final result is the same
+                    // as if every batch had been cut to the shortest length from the start.
+                    // The maxima recorded before this batch stay as they were.
+                    if let Some(hist) = self.hist.as_mut() {
+                        hist.truncate_samples(cur_samples_per_trace)
+                            .into_diagnostic()
+                            .wrap_err("cannot shorten the accumulator")?;
+                    }
+                    self.samples = cur_samples_per_trace;
+                    traces
                 }
                 LengthPolicy::Truncate => traces.slice(s![.., ..self.samples]).to_owned(),
                 LengthPolicy::Pad => {
@@ -300,18 +303,21 @@ mod tests {
 
     #[test]
     fn the_length_policy_applies_to_a_batch_of_another_length() {
-        for (policy, longer, shorter) in [
-            (LengthPolicy::Pad, true, true),
-            (LengthPolicy::Truncate, true, false),
-            (LengthPolicy::Error, false, false),
+        // Pad keeps the length of the first batch. Truncate follows the shortest batch so far.
+        // Error accepts only the length of the first batch.
+        for (policy, longer, shorter, samples_after) in [
+            (LengthPolicy::Pad, true, true, 3),
+            (LengthPolicy::Truncate, true, true, 2),
+            (LengthPolicy::Error, false, false, 3),
         ] {
             let mut fold = Fold::new(1, false);
             fold.policy = policy;
             fold.add(loaded(3)).unwrap();
             assert_eq!(fold.add(loaded(5)).is_ok(), longer, "{policy:?} longer");
             assert_eq!(fold.add(loaded(2)).is_ok(), shorter, "{policy:?} shorter");
-            assert_eq!(fold.samples, 3);
-            assert!(fold.add(loaded(3)).is_ok(), "{policy:?} same");
+            assert_eq!(fold.samples, samples_after, "{policy:?}");
+            assert!(fold.add(loaded(samples_after)).is_ok(), "{policy:?} same");
+            assert!(fold.add(loaded(4)).is_ok() || policy == LengthPolicy::Error);
         }
         let mut fold = Fold::new(1, false);
         fold.policy = LengthPolicy::Error;
@@ -319,6 +325,61 @@ mod tests {
         let message = fold.add(loaded(5)).unwrap_err().to_string();
         assert!(message.contains("5 samples per trace"), "{message}");
         assert!(message.contains("first batch has 3"), "{message}");
+    }
+
+    /// 40 traces with two classes and values that depend on the sample and the class.
+    fn varied(samples: usize, seed: usize) -> Loaded {
+        Loaded {
+            metadata: PathBuf::from("m.json"),
+            source: PathBuf::from("w.fst"),
+            traces: Array2::from_shape_fn((40, samples), |(i, j)| {
+                ((i * 31 + j * 17 + seed * 13 + (i % 2) * j * (seed + 1)) % 7) as f32
+            }),
+            labels: Array1::from_iter((0..40).map(|i| (i % 2) as u16)),
+        }
+    }
+
+    /// The final t-values and chi-squared results as bits, for an exact comparison.
+    fn final_bits(fold: &Fold) -> (Vec<u64>, Vec<u64>) {
+        let t = fold.t_values.as_ref().unwrap().iter().map(|v| v.to_bits());
+        let chi2 = fold.chi2_results.as_ref().unwrap();
+        let p = chi2.iter().map(|r| r.neg_log10_p.to_bits());
+        (t.collect(), p.collect())
+    }
+
+    #[test]
+    fn truncate_gives_the_same_results_in_every_order_of_the_batches() {
+        // Batches of 5, 3, and 4 samples.
+        let batches = [(5, 1), (3, 2), (4, 3)];
+        let run = |order: &[usize]| {
+            let mut fold = Fold::new(2, true);
+            fold.policy = LengthPolicy::Truncate;
+            for &i in order {
+                fold.add(varied(batches[i].0, batches[i].1)).unwrap();
+            }
+            fold
+        };
+        // The reference: every batch cut to the global minimum of 3 samples.
+        let mut reference = Fold::new(2, true);
+        for (samples, seed) in batches {
+            let mut b = varied(samples, seed);
+            b.traces = b.traces.slice(s![.., ..3]).to_owned();
+            reference.add(b).unwrap();
+        }
+        let want = final_bits(&reference);
+        assert!(want.0.iter().any(|&b| f64::from_bits(b).is_finite()));
+        for order in [
+            [0, 1, 2],
+            [1, 0, 2],
+            [0, 2, 1],
+            [2, 1, 0],
+            [1, 2, 0],
+            [2, 0, 1],
+        ] {
+            let fold = run(&order);
+            assert_eq!(fold.samples, 3, "{order:?}");
+            assert_eq!(final_bits(&fold), want, "{order:?}");
+        }
     }
 
     #[test]

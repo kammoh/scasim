@@ -195,8 +195,8 @@ struct Args {
     shuffle_labels: Option<u64>,
     /// What to do when the traces have different lengths. `pad`: pad shorter traces with zeros.
     /// A later batch is padded or cut to the length of the first batch. `truncate`: cut traces to
-    /// the shortest trace of the batch, and a longer batch to the length of the first batch. A
-    /// shorter batch is an error. `error`: any difference is an error. Default: `pad` without
+    /// the shortest trace of the batch, and to the shortest length of all batches so far. The
+    /// final result does not depend on the order of the batches. `error`: any difference is an error. Default: `pad` without
     /// --clock, `error` with --clock. A policy other than `pad` turns `traces.npz` off.
     #[arg(long = "length-policy", value_enum)]
     length_policy: Option<LengthPolicyArg>,

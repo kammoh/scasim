@@ -226,3 +226,61 @@ fn different_alignments_in_different_batches_give_one_warning_at_the_end() {
     let log = stderr(&run(&list));
     assert!(!log.contains("different places"), "{log}");
 }
+
+#[test]
+fn truncate_gives_the_same_files_in_every_order_of_the_batches() {
+    let long = write_leak_batch(&LeakSpec {
+        traces: 60,
+        cycles: 6,
+        ..LeakSpec::default()
+    });
+    let short = write_leak_batch(&LeakSpec {
+        traces: 60,
+        cycles: 4,
+        seed: 2,
+        ..LeakSpec::default()
+    });
+    let root = tempfile::tempdir().unwrap();
+    let run = |name: &str, first: &Path, second: &Path| {
+        let list = root.path().join(format!("{name}.list"));
+        std::fs::write(
+            &list,
+            format!("{}\n{}\n", first.display(), second.display()),
+        )
+        .unwrap();
+        let out = root.path().join(name);
+        let output = Command::new(env!("CARGO_BIN_EXE_tvla"))
+            .env_remove("RUST_LOG")
+            .arg("--meta-list")
+            .arg(&list)
+            .arg("--ttest-output-dir")
+            .arg(&out)
+            .args(["--plot=false", "-d", "2", "--clock", "tb.clk"])
+            .args(["--length-policy", "truncate"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        out
+    };
+    let a = run("long_short", &long.meta, &short.meta);
+    let b = run("short_long", &short.meta, &long.meta);
+    for file in ["t_values.npz", "chi2.npz"] {
+        let name = if file == "chi2.npz" {
+            "neg_log10_p"
+        } else {
+            "t_values"
+        };
+        let read = |dir: &Path| -> Vec<u64> {
+            let f = std::fs::File::open(dir.join(file)).unwrap();
+            let mut npz = ndarray_npz::NpzReader::new(f).unwrap();
+            // `t_values` has two dimensions and the chi-squared column one.
+            match npz.by_name::<ndarray::OwnedRepr<f64>, ndarray::IxDyn>(name) {
+                Ok(array) => array.iter().map(|v| v.to_bits()).collect(),
+                Err(e) => panic!("{file}: {e}"),
+            }
+        };
+        let (x, y) = (read(&a), read(&b));
+        assert_eq!(x, y, "{file}");
+        assert_eq!(x.len(), if file == "chi2.npz" { 4 } else { 8 }, "{file}");
+    }
+}

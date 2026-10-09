@@ -238,8 +238,10 @@ fn marker_ranges(trace: &PowerTrace, markers: &[(u64, u64, u16)]) -> Vec<(usize,
 ///   batches, a shorter batch is padded with zeros and a longer batch is cut to the length of
 ///   the first batch. This is the behavior of `tvla` before the policy existed.
 /// - `Truncate`: inside a batch, all traces are cut to the shortest trace. Between batches, a
-///   longer batch is cut to the length of the first batch. A shorter batch is an error, because
-///   the first batch fixed the length.
+///   longer batch is cut to the shortest length so far. A shorter batch shortens the accumulator
+///   (it drops the trailing samples). So the final result is the same in every order of the
+///   batches: it equals the result of cutting every batch to the global minimum. The curve of the
+///   maxima (max |t| versus traces) keeps the points recorded before a shortening.
 /// - `Error`: any difference in length, inside a batch or between batches, is an error.
 ///   Inside a batch, the message has the histogram of the lengths for each class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

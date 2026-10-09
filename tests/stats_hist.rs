@@ -834,3 +834,76 @@ mod validation {
         assert_eq!(serde_json::to_value(&acc).unwrap(), before);
     }
 }
+
+mod truncate_samples {
+    //! Dropping the trailing samples of an accumulator.
+
+    use ndarray::{Array1, Array2, s};
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    use scasim::stats::{Binning, HistAccumulator, StatsError, TestOptions};
+
+    fn data(seed: u64) -> (Array2<u8>, Array1<u16>) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let labels = Array1::from_iter((0..400).map(|_| rng.random_range(0..2) as u16));
+        let traces = Array2::from_shape_fn((400, 10), |(i, s)| {
+            rng.random_range(0..4u8) + u8::from(s == 2 && labels[i] == 1)
+        });
+        (traces, labels)
+    }
+
+    #[test]
+    fn truncating_equals_never_having_seen_the_trailing_samples() {
+        let (traces, labels) = data(5);
+        let mut cut = HistAccumulator::new(10, Binning::Exact);
+        cut.update(traces.view(), labels.view()).unwrap();
+        cut.truncate_samples(6).unwrap();
+        let mut narrow = HistAccumulator::new(6, Binning::Exact);
+        narrow
+            .update(traces.slice(s![.., ..6]), labels.view())
+            .unwrap();
+        assert_eq!(cut.n_samples(), 6);
+        for label in [0, 1] {
+            assert_eq!(cut.class_count(label), narrow.class_count(label));
+            for sample in 0..6 {
+                assert_eq!(
+                    cut.histogram(sample, label),
+                    narrow.histogram(sample, label)
+                );
+            }
+        }
+        let bits = |a: &HistAccumulator| -> Vec<u64> {
+            a.t_values(0, 1, 2)
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        assert_eq!(bits(&cut), bits(&narrow));
+        let chi2 = |a: &HistAccumulator| a.test_pair(0, 1, &TestOptions::default()).unwrap();
+        assert_eq!(chi2(&cut), chi2(&narrow));
+        // More batches still work after the cut.
+        let (more, more_labels) = data(6);
+        cut.update(more.slice(s![.., ..6]), more_labels.view())
+            .unwrap();
+        narrow
+            .update(more.slice(s![.., ..6]), more_labels.view())
+            .unwrap();
+        assert_eq!(bits(&cut), bits(&narrow));
+        cut.validate().unwrap();
+    }
+
+    #[test]
+    fn a_larger_number_of_samples_is_an_error_and_the_same_number_changes_nothing() {
+        let (traces, labels) = data(7);
+        let mut acc = HistAccumulator::new(10, Binning::Exact);
+        acc.update(traces.view(), labels.view()).unwrap();
+        assert!(matches!(
+            acc.truncate_samples(11),
+            Err(StatsError::Incompatible(_))
+        ));
+        assert_eq!(acc.n_samples(), 10);
+        acc.truncate_samples(10).unwrap();
+        assert_eq!(acc.n_samples(), 10);
+    }
+}

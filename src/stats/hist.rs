@@ -620,6 +620,22 @@ impl HistAccumulator {
         self.n_samples
     }
 
+    /// Drops the samples from `new_n_samples` on. The remaining samples keep their counts, so
+    /// the result equals an accumulator that never saw the dropped samples. The count of the
+    /// values that could not be binned (`rejected`) is not changed. Fails if `new_n_samples` is
+    /// larger than the current number of samples.
+    pub fn truncate_samples(&mut self, new_n_samples: usize) -> Result<(), StatsError> {
+        if new_n_samples > self.n_samples {
+            return Err(StatsError::Incompatible(format!(
+                "cannot grow an accumulator from {} to {new_n_samples} samples",
+                self.n_samples
+            )));
+        }
+        self.hists.truncate(new_n_samples);
+        self.n_samples = new_n_samples;
+        Ok(())
+    }
+
     /// The binning rule.
     pub fn binning(&self) -> Binning {
         self.binning
