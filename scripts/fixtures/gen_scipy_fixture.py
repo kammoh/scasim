@@ -5,7 +5,9 @@ Run it from the repository root, in a virtual environment that has the pinned ve
     python3 -m venv VENV && VENV/bin/pip install scipy==1.18.1 numpy==2.5.3 mpmath==1.4.1
     VENV/bin/python -I scripts/fixtures/gen_scipy_fixture.py [OUTPUT_FILE]
 
-Pinned versions: SciPy 1.18.1 (the output file records it), NumPy 2.5.3, mpmath 1.4.1.
+Pinned versions: SciPy 1.18.1, NumPy 2.5.3, mpmath 1.4.1. The output file records the SciPy and
+NumPy versions. The committed fixture was made before the NumPy field existed, so it records
+only SciPy.
 NumPy matters because the tables come from `numpy.random.default_rng(20261008)`.
 The default output file is `tests/fixtures/stats/scipy_tables.json`.
 
@@ -126,7 +128,9 @@ def main() -> None:
 
     default = Path(__file__).resolve().parent.parent.parent / "tests/fixtures/stats/scipy_tables.json"
     path = Path(sys.argv[1]) if len(sys.argv) > 1 else default
-    path.write_text(json.dumps({"scipy": scipy.__version__, "cases": cases}))
+    path.write_text(
+        json.dumps({"scipy": scipy.__version__, "numpy": np.__version__, "cases": cases})
+    )
     finite_p = sum(1 for c in cases if c["pearson"]["p"] > 1e-300)
     print(f"wrote {len(cases)} tables ({finite_p} with a finite Pearson p-value) to {path}")
 
