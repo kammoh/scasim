@@ -226,3 +226,22 @@ def test_read_meta_rejects_other_versions(tmp_path):
     (tmp_path / "m.json").write_text('{"scasim_meta": 2}')
     with pytest.raises(MetaError):
         read_meta(tmp_path / "m.json")
+
+
+def test_set_design_random(tmp_path):
+    w = make(tmp_path)
+    w.set_design_random({"requested": "on", "applied": "on", "how": "hook: h"})
+    w.segment(0, 1, 0)
+    w.commit()
+    assert read_meta(tmp_path / "meta.json")["batch"]["design_random"]["how"] == "hook: h"
+
+
+def test_file_permissions_follow_umask(tmp_path):
+    old = os.umask(0o022)
+    try:
+        w = make(tmp_path)
+        w.segment(0, 1, 0)
+        w.commit()
+    finally:
+        os.umask(old)
+    assert (tmp_path / "meta.json").stat().st_mode & 0o777 == 0o644

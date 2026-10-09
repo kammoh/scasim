@@ -11,7 +11,7 @@ import gzip
 import json
 import operator
 import os
-import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -137,6 +137,11 @@ class MetaWriter:
         self._last_end = end
         return seg_id
 
+    def set_design_random(self, record: Mapping[str, str]) -> None:
+        """Set the `design_random` record (requested, applied, how)."""
+        self._check_open()
+        self._design_random = dict(record)
+
     # -- writing --------------------------------------------------------------------------
 
     def commit(self) -> None:
@@ -181,7 +186,9 @@ class MetaWriter:
         if self.path.name.endswith(".gz"):
             data = gzip.compress(data, mtime=0)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=self.path.name + ".", suffix=".tmp")
+        tmp = self.path.parent / f".{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        # Created with the normal permissions (the umask applies), unlike tempfile.mkstemp.
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
