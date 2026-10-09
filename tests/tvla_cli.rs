@@ -378,7 +378,12 @@ fn list_signals_prints_only_data_lines_on_stdout() {
 
 /// Asserts that a run failed with a message and without a panic.
 fn assert_fails_with(output: &Output, expected: &[&str]) {
-    let stderr = text(&output.stderr);
+    // miette wraps long lines and draws a bar at the start of each wrapped line.
+    let stderr = text(&output.stderr)
+        .replace('│', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(!output.status.success(), "the run succeeded: {stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
     assert!(!stderr.contains("RUST_BACKTRACE"), "{stderr}");
@@ -566,4 +571,42 @@ fn a_cache_is_used_if_the_waveform_is_gone_even_if_the_metadata_file_is_newer() 
     );
     let output = batch.run(&[]);
     assert!(text(&output.stdout).contains("Using existing traces"));
+}
+
+#[test]
+fn a_marker_label_other_than_0_and_1_is_an_error() {
+    for format in FORMATS {
+        let batch = Batch::new_in(format, TOGGLES, None);
+        std::fs::write(
+            batch.meta(),
+            format!(
+                r#"{{"trace_filename": "{}", "markers": [[10, 30, 0], [30, 50, 1], [50, 70, 2]]}}"#,
+                format.file_name()
+            ),
+        )
+        .unwrap();
+        let output = batch.run_any(&[]);
+        assert_fails_with(&output, &["meta.json", "[50,70,2]", "0 or 1"]);
+    }
+}
+
+#[test]
+fn a_cache_label_other_than_0_and_1_is_an_error() {
+    let batch = Batch::new(TOGGLES, None);
+    let mut npz = NpzWriter::new(std::fs::File::create(batch.npz()).unwrap());
+    for (i, row) in cached_traces().outer_iter().enumerate() {
+        npz.add_array(format!("trace_{i}"), &row).unwrap();
+    }
+    npz.add_array("labels", &Array1::from_vec(vec![0u16, 1, 0, 2]))
+        .unwrap();
+    npz.finish().unwrap();
+    set_modified(&batch.npz(), SystemTime::now());
+    assert_fails_with(&batch.run_any(&[]), &["traces.npz", "label 2", "0 or 1"]);
+}
+
+#[test]
+fn order_zero_is_a_usage_error() {
+    let batch = Batch::new(TOGGLES, None);
+    let output = batch.run_order("0", &[]);
+    assert_fails_with(&output, &["invalid value '0'"]);
 }

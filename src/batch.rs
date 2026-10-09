@@ -16,7 +16,8 @@ pub struct BatchMeta {
     /// If present, only time points at multiples of the clock period are kept (legacy sampling).
     /// It is greater than zero. `read_batch_meta` rejects a zero.
     pub clock_period: Option<u64>,
-    /// One marker per trace: start time, end time (exclusive), and class label.
+    /// One marker per trace: start time, end time (exclusive), and class label (0 = fixed input,
+    /// 1 = random input).
     pub markers: Vec<(u64, u64, u16)>,
 }
 
@@ -74,6 +75,13 @@ pub fn read_batch_meta(meta_path: &Path) -> miette::Result<BatchMeta> {
                     meta_path.display()
                 )
             })?;
+            if label > 1 {
+                return Err(miette!(
+                    "{}: the label of the marker {marker} must be 0 or 1 (0 = fixed input, \
+                     1 = random input)",
+                    meta_path.display()
+                ));
+            }
             Ok((n(0)?, n(1)?, label))
         })
         .collect::<miette::Result<Vec<_>>>()?;
@@ -88,7 +96,8 @@ pub fn read_batch_meta(meta_path: &Path) -> miette::Result<BatchMeta> {
 /// Reads the traces and labels from a `traces.npz` cache file.
 ///
 /// The file has the arrays `trace_<i>` and `labels`. The indices `i` must be exactly `0..n`, in
-/// any order in the archive. The traces have the same length, and `labels` has `n` entries.
+/// any order in the archive. The traces have the same length, and `labels` has `n` entries,
+/// each 0 or 1.
 /// Any other file is an error, and the message names the file.
 pub fn read_trace_cache(path: &Path) -> miette::Result<(Array2<f32>, Array1<u16>)> {
     let name = path.display();
@@ -102,6 +111,13 @@ pub fn read_trace_cache(path: &Path) -> miette::Result<(Array2<f32>, Array1<u16>
         .by_name("labels")
         .into_diagnostic()
         .wrap_err_with(|| format!("cannot read the array `labels` in {name}"))?;
+    if let Some(bad) = labels.iter().position(|&l| l > 1) {
+        return Err(miette!(
+            "{name}: trace {bad} has the label {}, but a label must be 0 or 1 (0 = fixed input, \
+             1 = random input). Delete the file or use --use-existing=false",
+            labels[bad]
+        ));
+    }
     let names = npz
         .names()
         .into_diagnostic()

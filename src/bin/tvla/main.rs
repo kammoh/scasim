@@ -42,8 +42,8 @@ struct Args {
     )]
     num_threads: Option<usize>,
     /// The highest order of t-test to perform
-    #[arg(short = 'd', default_value_t = 2)]
-    order: usize,
+    #[arg(short = 'd', default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..))]
+    order: u64,
     #[arg(
         long = "show",
         help = "Show the plots in a web browser",
@@ -317,7 +317,9 @@ fn main() -> miette::Result<()> {
             .wrap_err_with(|| format!("cannot read {}", meta.trace_path.display()))?;
         return list_signals(&index, &selection);
     }
-    let order = args.order;
+    let order = usize::try_from(args.order)
+        .into_diagnostic()
+        .wrap_err("the order is too large")?;
 
     let mut samples_per_trace = 0;
     let mut max_t_values = vec![Vec::<f64>::new(); order];
