@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 mod cache;
 mod channels;
 mod summary;
+mod traces;
 
 /// The family-wise error level of the Bonferroni thresholds in the summary and the plots.
 const ALPHA: f64 = 1e-5;
@@ -95,6 +96,19 @@ struct Args {
     /// Write a validated per-batch statistics cache. Requires one --meta-json batch.
     #[arg(long, requires="maybe_metadata", conflicts_with_all=["maybe_meta_list_path","merge_stats"])]
     stats_out: Option<PathBuf>,
+    /// Write the exact per-channel traces of one batch to an `.npz` file, in every mode. The
+    /// arrays `t_<i>` hold the `u32` values of the channel `i` (0 is the total), with one row for
+    /// each segment. The file also holds the raw labels (before --shuffle-labels), the groups,
+    /// the segment ids, and `meta.json`. Needs one --meta-json batch. Can be combined with
+    /// --stats-out. A run with --traces-out computes the traces from the waveform and does not
+    /// use `traces.npz`.
+    #[arg(long, requires="maybe_metadata", conflicts_with_all=["maybe_meta_list_path","merge_stats"])]
+    traces_out: Option<PathBuf>,
+    /// The channels that --traces-out writes: exact names or `regex:PATTERN` (the whole name must
+    /// match). The channels are `total` and, with --per-scope, one for each scope. Default: all.
+    /// A spec that matches no channel is an error.
+    #[arg(long, num_args = 1.., value_name = "SPEC", requires = "traces_out")]
+    traces_channels: Vec<String>,
     /// Merge statistics caches in the given order.
     #[arg(long, num_args=1.., conflicts_with_all=["maybe_metadata","maybe_meta_list_path","list_signals","clock","edges","offset","include","exclude","per_scope","depth","shuffle_labels"])]
     merge_stats: Vec<PathBuf>,
@@ -341,6 +355,7 @@ struct BatchSettings<'a> {
     shuffle_seed: Option<u64>,
     stats_common: Option<cache::CommonKey>,
     stats_out: Option<PathBuf>,
+    traces_out: Option<traces::TracesOut>,
 }
 
 /// The traces of one per-scope channel in one batch.
@@ -390,6 +405,10 @@ fn batch_data(
     settings: &BatchSettings<'_>,
 ) -> miette::Result<BatchResult> {
     let mut result = load_batch(metadata_path, settings)?;
+    // The traces file holds the raw labels, so it is written before the shuffle.
+    if let Some(out) = &settings.traces_out {
+        write_traces(&result, metadata_path, out, settings.shuffle_seed)?;
+    }
     if let Some(seed) = settings.shuffle_seed {
         // Stable batch identity makes separate --stats-out jobs match a normal run.
         let mut id = batch_id(&result.meta, metadata_path);
@@ -423,6 +442,50 @@ fn batch_data(
         cache.write(path)?;
     }
     Ok(result)
+}
+
+/// Writes the traces file of a batch (`--traces-out`). The labels are the raw ones: the caller
+/// runs this before the shuffle of the labels. All segments are written, whatever `--group` says.
+fn write_traces(
+    result: &BatchResult,
+    metadata_path: &Path,
+    out: &traces::TracesOut,
+    shuffle_seed: Option<u64>,
+) -> miette::Result<()> {
+    let key = result.key.as_ref().expect("traces output has a key");
+    let matrices: Vec<&Array2<f32>> = std::iter::once(&result.total.traces)
+        .chain(result.scopes.iter().map(|s| &s.traces))
+        .collect();
+    let names: Vec<&str> = result.identities.iter().map(|i| i.name.as_str()).collect();
+    let chosen = traces::select_channels(&out.channels, &names)?;
+    let channels: Vec<traces::ChannelData<'_>> = chosen
+        .into_iter()
+        .map(|index| traces::ChannelData {
+            index,
+            identity: &result.identities[index],
+            traces: matrices[index],
+        })
+        .collect();
+    let rows = result.total.labels.len();
+    let groups = batch_groups(&result.meta, rows);
+    let segment_ids: Vec<u64> = result.meta.v1.as_ref().map_or_else(
+        || (0..rows as u64).collect(),
+        |v| v.segments.iter().map(|s| s.id).collect(),
+    );
+    let held_bytes = matrices.iter().map(|m| 4 * m.len() as u64).sum();
+    traces::write(
+        &out.path,
+        &channels,
+        &traces::BatchInfo {
+            batch_id: &batch_id(&result.meta, metadata_path),
+            key,
+            labels: &result.total.labels,
+            groups: &groups,
+            segment_ids: &segment_ids,
+            shuffle_seed,
+            held_bytes,
+        },
+    )
 }
 
 /// Like [`batch_data`], without the shuffle of the labels.
@@ -542,7 +605,7 @@ fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Res
             scope_plan(settings.selection.clone(), &groups)
         }
     };
-    let identities = if settings.stats_out.is_some() {
+    let identities = if settings.stats_common.is_some() {
         let index = hierarchy_index(&trace_file_path).into_diagnostic()?;
         plan.channels
             .iter()
@@ -579,6 +642,11 @@ fn load_batch(metadata_path: &Path, settings: &BatchSettings<'_>) -> miette::Res
     } else {
         Vec::new()
     };
+    if let Some(out) = &settings.traces_out {
+        // Fail before the long computation if a spec matches no channel.
+        let names: Vec<&str> = identities.iter().map(|i| i.name.as_str()).collect();
+        traces::select_channels(&out.channels, &names)?;
+    }
     let output = compute_batch(&meta, &plan, &settings.sampling, settings.policy)?;
     require_pair_labels(
         output.labels.as_slice().expect("labels are contiguous"),
@@ -976,9 +1044,14 @@ fn main() -> miette::Result<()> {
         sampling,
         policy,
         use_existing: args.use_existing,
-        cache_allowed: cache_allowed && args.stats_out.is_none(),
-        stats_common: args.stats_out.as_ref().map(|_| stats_common.clone()),
+        cache_allowed: cache_allowed && args.stats_out.is_none() && args.traces_out.is_none(),
+        stats_common: (args.stats_out.is_some() || args.traces_out.is_some())
+            .then(|| stats_common.clone()),
         stats_out: args.stats_out.clone(),
+        traces_out: args.traces_out.clone().map(|path| traces::TracesOut {
+            path,
+            channels: args.traces_channels.clone(),
+        }),
         per_scope: args
             .per_scope
             .clone()

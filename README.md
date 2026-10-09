@@ -69,6 +69,14 @@ they are not an inference. Plots cannot draw infinity, so those points appear as
 `--stats-out` requires one `--meta-json` batch and reads its waveform. It does not use or write
 `traces.npz`. Plain legacy runs keep that older trace cache.
 
+`--traces-out FILE` saves the exact per-channel traces of one `--meta-json` batch, in every mode (legacy, version 1, `--clock`, `--per-scope`). It can be combined with `--stats-out`. Like `--stats-out`, it reads the waveform and does not use or write `traces.npz`. `FILE` is an `.npz` archive:
+
+- `t_<i>`: the traces of channel `i` as `u32`, shape `(segments, samples)`. These are the values and the sample axis that go into the histograms, after the length policy. Channel 0 is `total`. With `--per-scope`, the scope channels are `t_1`, `t_2`, ... in the order of `channels.txt`. The index does not change when you select channels. A count above 2^24 is an error, because an `f32` trace may have rounded it.
+- `labels` (`u16`, the raw labels before `--shuffle-labels`), `groups` (`u64`), and `segment_ids` (`u64`; `0..n` for legacy metadata). The file holds all segments, whatever `--group` says.
+- `meta.json`: JSON text as a `u8` array (`bytes(npz["meta.json"]).decode()` in Python). It holds `format` (1), the channel names, indices, array names, and identities (`handles`, `handles_hash`), `samples`, `segments`, `batch_id`, `shuffle_seed`, and `cache_key` (the key that `--stats-out` writes).
+
+`--traces-channels SPEC...` writes only some channels. A spec is an exact channel name (`total`, or a scope path with `--per-scope`) or `regex:PATTERN` (the whole name must match). A spec that matches no channel is an error. The file is written to a temporary file first and then renamed. The estimated size (segments x samples x 4 bytes x channels, plus the traces in memory) is checked against the 8 GiB memory limit.
+
 ## Selecting signals
 
 By default, `tvla` counts the switching activity of all selectable signals in the waveform. Events, strings, reals, and zero-width variables are not selectable. To measure only a part of the design, select signals with rules. Give a rule with `--include` or `--exclude`. Both options can repeat. Each value has the form `KIND:VALUE`, where `KIND` is one of these:
