@@ -21,7 +21,10 @@
 //! * For a small shape (`a < 0.5`) and `x < a + 1`, the form `1 - P` loses all digits when `Q` is
 //!   tiny, so the upper tail is computed directly (see `ln_gamma_q`).
 //! * A series or fraction that does not converge gives NaN, never a guess. The supported range is
-//!   `a` up to about `1e12` (see `ln_gamma_q`).
+//!   `a` up to about `1e12` (see `ln_gamma_q`). The stopping rules are convergence tests (the
+//!   last term or the last factor is small), not proven error bounds. The accuracy is measured
+//!   against mpmath in the tests. Callers report NaN as a failed test: `TestResult::is_failed`
+//!   and the `failed` count of `Summary` in the `chi2` module.
 //!
 //! The same saddle-point helper `bd0` is also used to compute the G statistic without
 //! cancellation.
@@ -42,6 +45,11 @@ const LN_SQRT_2PI: f64 = 0.918_938_533_204_672_8;
 
 /// Relative accuracy target for the series and the continued fraction.
 const EPS: f64 = 1.0e-16;
+
+/// Convergence test of the continued fraction, on `|delta - 1|`. It is above `EPS`: `delta` is a
+/// product of two rounded numbers, so it can stay at `1 +- 1.1e-16` or `1 + 2.2e-16` forever and
+/// never reach `1e-16`.
+const CF_TOL: f64 = 1.0e-15;
 
 /// Smallest magnitude allowed in the Lentz recurrences.
 const TINY: f64 = 1.0e-300;
@@ -260,7 +268,11 @@ fn ln_q_small_shape(a: f64, x: f64) -> f64 {
 /// when `x` is close to `a`. The function allows `20 * sqrt(max(a, x)) + 10,000` terms, up to
 /// 30 million. So `a` up to about `1e12` converges (this covers `chi2_ln_sf` for every `u32`
 /// degrees of freedom). If the series or the fraction does not converge in this budget, the
-/// function returns NaN. It never returns a value that did not converge. The relative error of
+/// function returns NaN. It never returns a value that did not converge. The stopping rules
+/// are convergence tests, not proven error bounds: the series stops when a term is below
+/// `1e-16` of the sum, and the fraction stops when its last factor is within `1e-15` of 1 (a
+/// product of two rounded numbers cannot be reliably closer to 1 than about `2e-16`). Callers
+/// report a NaN result as a failed test. The relative error of
 /// `ln Q` is about `1e-15` for `a` up to `1e3`, and grows with the number of terms: it is below
 /// `1e-9` for `a` up to `1e12` (tested against mpmath).
 ///
@@ -323,7 +335,7 @@ pub fn ln_gamma_q(a: f64, x: f64) -> f64 {
             d = 1.0 / d;
             let delta = d * c;
             h *= delta;
-            if (delta - 1.0).abs() < EPS {
+            if (delta - 1.0).abs() < CF_TOL {
                 converged = true;
                 break;
             }
@@ -654,6 +666,66 @@ mod tests {
             let below = ln_gamma_q(0.5 - 1e-12, x);
             let at = ln_gamma_q(0.5, x);
             assert!((below - at).abs() < 1e-9, "x = {x}: {below} versus {at}");
+        }
+    }
+
+    /// Fix round 2, item 3: `chi2_ln_sf(1e308, 2)` was NaN. For `dof = 2`, `ln Q = -x / 2`.
+    #[test]
+    fn huge_statistics_converge() {
+        assert_relative_eq!(chi2_ln_sf(1e308, 2), -5e307, max_relative = 1e-14);
+        assert_relative_eq!(chi2_ln_sf(1e300, 2), -5e299, max_relative = 1e-14);
+        assert_relative_eq!(chi2_ln_sf(1e308, 10), -5e307, max_relative = 1e-14);
+    }
+
+    /// Closed forms. For even `dof = 2m`: `Q = exp(-y) sum_{k<m} y^k / k!` with `y = x / 2`. For
+    /// `dof = 1`: `Q = erfc(sqrt(y))`, and for large `z = sqrt(y)` the asymptotic series
+    /// `erfc(z) = exp(-z^2) / (z sqrt(pi)) * (1 - 1/(2 z^2) + 3/(4 z^4) - 15/(8 z^6) + ...)`, whose
+    /// truncation error after the `z^-6` term is below `105 / (16 z^8)`.
+    #[test]
+    fn huge_statistics_match_closed_forms_over_the_whole_range() {
+        let mut n = 0;
+        for i in 0..=400 {
+            // x from 1e3 to 1e308, log-spaced.
+            let x = 10f64.powf(3.0 + f64::from(i) * 305.0 / 400.0).min(1e308);
+            let y = x / 2.0;
+            for m in [1_u32, 2, 3, 10, 50] {
+                // ln of the sum, by log-sum-exp over the terms k ln y - ln k!.
+                let logs: Vec<f64> = (0..m)
+                    .map(|k| f64::from(k) * y.ln() - ln_gamma(f64::from(k) + 1.0))
+                    .collect();
+                let top = logs.iter().copied().fold(f64::MIN, f64::max);
+                let ln_sum = top + logs.iter().map(|l| (l - top).exp()).sum::<f64>().ln();
+                let want = -y + ln_sum;
+                let got = chi2_ln_sf(x, 2 * m);
+                assert!(got.is_finite(), "x = {x:e}, dof = {}", 2 * m);
+                assert_relative_eq!(got, want, max_relative = 1e-13);
+                n += 1;
+            }
+            let z2 = y;
+            let series = 1.0 - 0.5 / z2 + 0.75 / (z2 * z2) - 1.875 / (z2 * z2 * z2);
+            let want = -y - (y.sqrt() * PI.sqrt()).ln() + series.ln();
+            let got = chi2_ln_sf(x, 1);
+            assert_relative_eq!(got, want, max_relative = 1e-12);
+            n += 1;
+        }
+        assert!(n > 2000);
+    }
+
+    /// A sweep over many shapes: no NaN for a finite statistic, whatever the roundoff.
+    #[test]
+    fn no_nan_for_finite_statistics_in_the_supported_range() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut uniform = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1_u64 << 53) as f64
+        };
+        for dof in [1_u32, 2, 3, 4, 10, 100, 1000, 100_000, u32::MAX] {
+            for _ in 0..500 {
+                let x = ((f64::from(dof) + 1.0) * 10f64.powf(uniform() * 308.0 - 1.0)).min(1e308);
+                assert!(chi2_ln_sf(x, dof).is_finite(), "dof {dof}, x = {x:e}");
+            }
         }
     }
 }
