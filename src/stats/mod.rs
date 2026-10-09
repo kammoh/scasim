@@ -6,6 +6,8 @@
 //!   per-sample, per-class histograms ([`HistAccumulator`]) that feed the chi-squared test.
 //! * [`chi2`]: the Pearson chi-squared test and the G test on a classes-by-bins table.
 //! * [`threshold`]: multiple-testing thresholds, on `-log10(p)` and on `|t|`.
+//! * [`ttest`]: the one-pass moment accumulator ([`MomentAccumulator`]) for t-tests of order 1..d.
+//! * [`tstat`]: the one definition of the Welch t-statistic of order k, used by both t-test paths.
 //! * [`error`]: the error type [`StatsError`].
 //!
 //! The statistical methods follow Moradi, Richter, Schneider, and Standaert, "Leakage Detection
@@ -17,6 +19,8 @@ pub mod error;
 pub mod hist;
 pub mod special;
 pub mod threshold;
+pub mod tstat;
+pub mod ttest;
 
 pub use binning::{BinValue, Binning};
 pub use chi2::{
@@ -25,3 +29,4 @@ pub use chi2::{
 };
 pub use error::StatsError;
 pub use hist::HistAccumulator;
+pub use ttest::MomentAccumulator;

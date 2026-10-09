@@ -54,4 +54,52 @@ pub enum StatsError {
     /// A deserialized accumulator is inconsistent.
     #[error("invalid accumulator state: {0}")]
     InvalidState(String),
+    /// The t-test order is zero.
+    #[error("t-test order must be greater than zero")]
+    ZeroOrder,
+    /// A batch has more than `u32::MAX` traces.
+    #[error("batch has more than u32::MAX traces")]
+    BatchTooLarge,
+    /// Two moment accumulators have different sample counts or orders.
+    #[error("accumulators have different sample counts or orders")]
+    IncompatibleAccumulators,
+    /// A size or count computed from the inputs does not fit in `usize` or `u64`.
+    #[error("a size computed from the inputs overflows")]
+    SizeOverflow,
+    /// Saved moments of a class have the wrong number of values.
+    #[error("class {label} has {found} moment values, expected {expected}")]
+    WrongMomentLength {
+        /// The class label.
+        label: u16,
+        /// The expected number of values.
+        expected: usize,
+        /// The number of values found.
+        found: usize,
+    },
+    /// Saved moments of an empty class are not zero.
+    #[error("class {label} has nonzero moment data but a zero trace count")]
+    EmptyClassHasData {
+        /// The class label.
+        label: u16,
+    },
+    /// Saved moments contain NaN or infinity.
+    #[error("class {label} contains a non-finite moment value")]
+    NonFiniteMoments {
+        /// The class label.
+        label: u16,
+    },
+    /// Saved moments cannot come from the class's trace count.
+    #[error("class {label} contains moments that cannot come from its trace count")]
+    InvalidMoments {
+        /// The class label.
+        label: u16,
+    },
+    /// A moment order is outside the supported range.
+    #[error("moment order {order} is outside 2..={max}")]
+    InvalidMomentOrder {
+        /// The requested order.
+        order: usize,
+        /// The largest supported order.
+        max: usize,
+    },
 }
