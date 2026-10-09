@@ -35,6 +35,7 @@ from .meta import read_meta
 MANIFEST = "manifest.json"
 CACHE_NAME = "statistics.bin"
 TRACE_FILE = "tvla.fst"
+TMP_MARK = ".tmp-"
 PLACEHOLDER_WAVEFORM_BYTES = 500_000_000
 # An unmeasured assumption for the default job count: RAM per simulation job.
 RAM_PER_JOB = 2_000_000_000
@@ -221,6 +222,49 @@ def build_key(sources: Sequence[Path], toplevel: str, build_args: Sequence[str],
     return h.hexdigest()
 
 
+def parse_dep_file(text: str) -> list[str]:
+    """The prerequisites of the make rule in a Verilator `V<prefix>__ver.d` file."""
+    text = text.replace("\\\n", " ")
+    _targets, sep, deps = text.partition(" : ")
+    if not sep:
+        return []
+    return [d.replace("\\ ", " ") for d in re.split(r"(?<!\\)\s+", deps.strip()) if d]
+
+
+def file_hash(path: str | Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_build_inputs(build_dir: Path) -> dict[str, str] | None:
+    """Every input file that Verilator read (sources, includes, library files) with its hash.
+
+    Verilator writes them to `V<prefix>__ver.d`. Returns None if that file is missing or lists
+    nothing, so the caller cannot check the build.
+    """
+    found = sorted(build_dir.glob("V*__ver.d"))
+    if not found:
+        return None
+    inputs: dict[str, str] = {}
+    for dep in parse_dep_file(found[0].read_text()):
+        if os.path.isfile(dep):
+            inputs[dep] = file_hash(dep)
+    return inputs or None
+
+
+def inputs_unchanged(inputs: dict[str, str] | None) -> bool:
+    """True if every recorded input still exists with the same hash."""
+    if not inputs:
+        return False
+    try:
+        return all(os.path.isfile(p) and file_hash(p) == h for p, h in inputs.items())
+    except OSError:
+        return False
+
+
 def tool_versions() -> tuple[str, str]:
     """(Verilator version text, cocotb version). Imports nothing from cocotb."""
     from importlib import metadata
@@ -384,6 +428,7 @@ class Pipeline:
         self.build_dir: Path | None = None
         self.build_hash = ""
         self.largest_waveform = 0
+        self._recover = False  # may a directory without a manifest state be taken over?
         self._lock = threading.Lock()
         self.jobs = 1
 
@@ -431,6 +476,11 @@ class Pipeline:
         if old is not None and old != new:
             _log("the configuration changed since the last run: all batches run again")
             self.manifest.reset_batches()
+        # Only a directory of the same configuration can be taken over. A leftover temporary
+        # directory is never trusted: the run that made it did not finish.
+        self._recover = old == new
+        for leftover in self.out.glob(f"*{TMP_MARK}*"):
+            shutil.rmtree(leftover, ignore_errors=True)
         self.manifest.set_root(seed=self.seed, config=new, tvla_args=list(cfg.tvla_args),
                                curve=cfg.curve, keep=cfg.keep, tests_per_batch=cfg.tests_per_batch)
 
@@ -453,8 +503,9 @@ class Pipeline:
         build_dir = (self.out / "build").resolve()
         key_file = build_dir / "scasim-tvla-build.json"
         try:
-            same = json.loads(key_file.read_text()).get("key") == key
-        except (OSError, ValueError):
+            record = json.loads(key_file.read_text())
+            same = record.get("key") == key and inputs_unchanged(record.get("inputs"))
+        except (OSError, ValueError, AttributeError):
             same = False
         if same and (build_dir / sim.toplevel).exists():
             _log("reusing the build")
@@ -469,7 +520,11 @@ class Pipeline:
         code = self._run_worker("build", spec_path, log)
         if code != 0 or not (build_dir / sim.toplevel).exists():
             raise RunnerError(f"the build failed (exit {code}); see {log}:\n{_tail(log)}")
-        _write_json_atomic(key_file, {"key": key, "verilator": verilator, "cocotb": cocotb})
+        inputs = read_build_inputs(build_dir)
+        if inputs is None:
+            _log("warning: no Verilator dependency file, so the build cannot be reused")
+        _write_json_atomic(key_file, {"key": key, "verilator": verilator, "cocotb": cocotb,
+                                      "inputs": inputs})
         return build_dir
 
     def _run_worker(self, mode: str, spec_path: Path, log: Path) -> int:
@@ -489,7 +544,7 @@ class Pipeline:
     def sim_env(self, batch: str, seed: int, tests: int) -> dict[str, str]:
         """The variables that the testbench side reads (`scasim_tvla.session`)."""
         env = {
-            "SCASIM_TVLA_OUT": str(self.batch_dir(batch).resolve()),
+            "SCASIM_TVLA_OUT": str(self.tmp_dir(batch).resolve()),
             "SCASIM_TVLA_SEED": str(seed),
             "SCASIM_TVLA_BATCH": batch,
             "SCASIM_TVLA_TESTS": str(tests),
@@ -501,8 +556,22 @@ class Pipeline:
             env["COCOTB_ENABLE_PROFILING"] = "1"
         return env
 
+    def tmp_dir(self, batch: str) -> Path:
+        """Where a batch is simulated. It is renamed to `batch_dir` when the run has finished."""
+        return self.out / f"{batch}{TMP_MARK}{os.getpid()}"
+
+    def promote(self, batch: str) -> None:
+        """Rename the temporary directory of `batch` to its final place (atomic)."""
+        tmp, final = self.tmp_dir(batch), self.batch_dir(batch)
+        if not tmp.exists():
+            return
+        if final.exists():
+            shutil.rmtree(final)
+        os.replace(tmp, final)
+
     def simulate_batch(self, batch: str, tests: int) -> SimResult:
-        d = self.batch_dir(batch)
+        """Simulate into the temporary directory. The caller checks it, then calls `promote`."""
+        d = self.tmp_dir(batch)
         if d.exists():
             shutil.rmtree(d)
         d.mkdir(parents=True)
@@ -528,9 +597,9 @@ class Pipeline:
         return SimResult(exit_code=data.get("exit"), tests=data.get("tests", 0),
                          fails=data.get("fails", 0), error=data.get("error"), cpu=data.get("cpu"))
 
-    def check_batch(self, batch: str, result: SimResult) -> str | None:
+    def check_batch(self, batch: str, result: SimResult, d: Path | None = None) -> str | None:
         """None if the batch is usable, else the reason. The metadata decides, not the exit code."""
-        d = self.batch_dir(batch)
+        d = d if d is not None else self.batch_dir(batch)
         meta_path = meta_file(d)
         if result.error:
             return result.error
@@ -576,13 +645,18 @@ class Pipeline:
         if self.tvla_bin is None:
             return
         _log("probe run and signal check")
-        result = self.simulate_batch("probe", min(self.cfg.tests_per_batch, 2))
-        reason = self.check_batch("probe", result)
-        if reason is not None:
-            raise RunnerError(f"the probe run failed: {reason} (see {self.batch_dir('probe')})")
-        count = self.check_selection(meta_file(self.batch_dir("probe")))
+        tmp = self.tmp_dir("probe")
+        try:
+            result = self.simulate_batch("probe", min(self.cfg.tests_per_batch, 2))
+            reason = self.check_batch("probe", result, tmp)
+            if reason is not None:
+                raise RunnerError(f"the probe run failed: {reason} (see {self.batch_dir('probe')})")
+            count = self.check_selection(meta_file(tmp))
+        except BaseException:
+            self.promote("probe")  # keep it for diagnosis
+            raise
         _log(f"{count} signals are selected")
-        shutil.rmtree(self.batch_dir("probe"))
+        shutil.rmtree(tmp)
 
     def analyze_batch(self, batch: str) -> None:
         """`tvla --stats-out` on a committed batch. Raises RunnerError on failure."""
@@ -611,6 +685,8 @@ class Pipeline:
             return "skip"
         if state == "simulated" and self.check_batch(batch, SimResult(tests=1)) is None:
             return "analyze" if self.cfg.analyze else "skip"
+        if state is None and self._recover and self.check_batch(batch, SimResult(tests=1)) is None:
+            return "recover"  # finished and promoted, but the run stopped before the manifest
         return "simulate"
 
     def _free_disk_ok(self) -> bool:
@@ -631,23 +707,29 @@ class Pipeline:
             self._fail(batch, "not enough free disk for another waveform")
             return False
         self.manifest.set(batch, seed=batch_seed(self.seed, batch), error=None)
+        tmp = self.tmp_dir(batch)
         try:
             result = self.simulate_batch(batch, self.cfg.tests_per_batch)
         except Exception as exc:  # noqa: BLE001
+            self.promote(batch)
             self._fail(batch, f"the simulation could not run: {exc}")
             return False
-        reason = self.check_batch(batch, result)
+        reason = self.check_batch(batch, result, tmp)
+        self.promote(batch)  # a failed batch keeps its files too
         if reason is not None:
             self._fail(batch, reason)
             return False
+        self._record_simulated(batch, result.cpu)
+        return True
+
+    def _record_simulated(self, batch: str, cpu: dict[str, float] | None = None) -> None:
         size = (self.batch_dir(batch) / TRACE_FILE).stat().st_size
         with self._lock:
             self.largest_waveform = max(self.largest_waveform, size)
         fields: dict[str, Any] = {"state": "simulated", "waveform_bytes": size}
-        if result.cpu is not None:
-            fields["sim_cpu"] = result.cpu
+        if cpu is not None:
+            fields["sim_cpu"] = cpu
         self.manifest.set(batch, **fields)
-        return True
 
     def _analyze_stage(self, batch: str) -> None:
         try:
@@ -683,6 +765,9 @@ class Pipeline:
                 if self.manifest.get(batch).get("state") == "cached":
                     self._drop_waveform(batch)
                 return
+            if action == "recover":
+                _log(f"{batch}: found a finished simulation without a record; keeping it")
+                self._record_simulated(batch)
             if action == "simulate" and not self._simulate_stage(batch):
                 return
             if not self.cfg.analyze or action == "skip":
@@ -738,7 +823,7 @@ class Pipeline:
             if "simulate" in actions.values():
                 self.probe()
             else:  # nothing to simulate: check the selection on a waveform that waits
-                waiting = next((b for b, a in actions.items() if a == "analyze"), None)
+                waiting = next((b for b, a in actions.items() if a in ("analyze", "recover")), None)
                 if waiting is not None:
                     self.check_selection(meta_file(self.batch_dir(waiting)))
         _log(f"running {self.cfg.batches} batches, {self.jobs} at a time, seed {self.seed}")
@@ -781,7 +866,8 @@ def _batch_dirs(root: Path) -> list[Path]:
     def natural(p: Path) -> list:
         return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", p.name)]
 
-    for d in sorted((p for p in root.iterdir() if p.is_dir() and p.name not in skip), key=natural):
+    for d in sorted((p for p in root.iterdir()
+                             if p.is_dir() and p.name not in skip and TMP_MARK not in p.name), key=natural):
         if (d / "meta.json").exists() or (d / "meta.json.gz").exists():
             found.append(d)
     return found

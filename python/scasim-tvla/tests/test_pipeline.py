@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import pytest
+from unittest.mock import patch as _patch
 
 from scasim_tvla import _args, cli, runner
 from scasim_tvla.meta import MetaWriter
@@ -256,7 +257,7 @@ def test_the_batch_environment(tmp_path, fake_tvla):
     assert env["SCASIM_TVLA_SEED"] == str(runner.batch_seed(7, "b0002"))
     assert env["SCASIM_TVLA_TESTS"] == "2"
     assert env["SCASIM_TVLA_WAVEFORM"] == "tvla.fst"
-    assert env["SCASIM_TVLA_OUT"] == str((tmp_path / "out" / "b0002").resolve())
+    assert env["SCASIM_TVLA_OUT"] == str((tmp_path / "out" / f"b0002.tmp-{os.getpid()}").resolve())
     assert env["SCASIM_TVLA_DESIGN_RANDOM"] == "on"
     assert "COCOTB_ENABLE_PROFILING" not in env
 
@@ -416,3 +417,158 @@ def test_arguments_after_the_separator_go_to_tvla_and_bad_ones_are_usage_errors(
     make_batch(tmp_path, "b0")
     assert cli.main(["collect", str(tmp_path), "--", "--curve", "final"]) == 0  # stored only
     assert cli.main(["merge", str(tmp_path), "--tvla", "/nonexistent/tvla"]) == 2
+
+
+# -- crash safety -----------------------------------------------------------------------
+
+
+def test_a_batch_is_simulated_in_a_temporary_directory_and_then_renamed(tmp_path, fake_tvla):
+    class Spy(FakeSim):
+        def __call__(self, pipe, batch, info):
+            self.dirs = getattr(self, "dirs", {})
+            self.dirs[batch] = Path(info["dir"]).name
+            return super().__call__(pipe, batch, info)
+
+    sim = Spy()
+    run(tmp_path, fake_tvla, sim=sim, keep="waveform")
+    out = tmp_path / "out"
+    assert ".tmp-" in sim.dirs["b0002"] and sim.dirs["b0002"].startswith("b0002")
+    assert (out / "b0002" / "tvla.fst").exists()
+    assert not list(out.glob("*.tmp-*"))
+
+
+def test_a_crash_after_the_simulation_does_not_lose_the_batch(tmp_path, fake_tvla):
+    real_set = runner.Manifest.set
+    crashed = []
+
+    def crashing_set(self, batch, **fields):
+        if batch == "b0001" and fields.get("state") == "simulated" and not crashed:
+            crashed.append(batch)
+            raise RuntimeError("the run was killed here")
+        return real_set(self, batch, **fields)
+
+    sim1 = FakeSim()
+    with _patch.object(runner.Manifest, "set", crashing_set):
+        with pytest.raises(RuntimeError, match="killed"):
+            run(tmp_path, fake_tvla, sim=sim1, jobs=1)
+    out = tmp_path / "out"
+    assert (out / "b0001" / "tvla.fst").exists()  # promoted: the data is there
+    assert "state" not in json.loads((out / "manifest.json").read_text())["batches"]["b0001"]
+    sim2 = FakeSim()
+    report, _ = run(tmp_path, fake_tvla, sim=sim2, jobs=1)
+    assert "b0001" not in sim2.calls  # recovered, not simulated again
+    assert not report.failed and len(report.ok) == 4
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    run(clean, fake_tvla, jobs=1)
+    assert (out / "report" / "merged.txt").read_text() == \
+        (clean / "out" / "report" / "merged.txt").read_text()
+
+
+def test_a_leftover_temporary_directory_is_removed_and_never_trusted(tmp_path, fake_tvla):
+    out = tmp_path / "out"
+    run(tmp_path, fake_tvla, batches=2)
+    leftover = out / "b0001.tmp-4242"
+    leftover.mkdir()
+    (leftover / "tvla.fst").write_bytes(b"x")
+    (leftover / "meta.json").write_text("{}")
+    sim = FakeSim()
+    run(tmp_path, fake_tvla, sim=sim, batches=2)
+    assert not leftover.exists()
+    assert sim.calls == []
+
+
+def test_a_finished_directory_of_an_older_configuration_is_not_recovered(tmp_path, fake_tvla):
+    run(tmp_path, fake_tvla, batches=2, analyze=False)
+    manifest = json.loads((tmp_path / "out" / "manifest.json").read_text())
+    for rec in manifest["batches"].values():
+        rec.pop("state")
+    (tmp_path / "out" / "manifest.json").write_text(json.dumps(manifest))
+    sim = FakeSim()
+    run(tmp_path, fake_tvla, sim=sim, batches=2, tests_per_batch=5)  # another configuration
+    assert sorted(b for b in sim.calls if b != "probe") == ["b0000", "b0001"]
+
+
+def test_collect_ignores_temporary_directories(tmp_path):
+    make_batch(tmp_path, "b0")
+    make_batch(tmp_path, "b1.tmp-7")
+    runner.collect(tmp_path, tvla_args=TVLA_ARGS)
+    assert (tmp_path / "meta.list").read_text().splitlines() == ["b0/meta.json"]
+
+
+# -- build reuse ------------------------------------------------------------------------
+
+
+class FakeBuild:
+    """Replaces the build worker: writes the executable and a Verilator dependency file."""
+
+    def __init__(self, header):
+        self.header, self.count = header, 0
+
+    def __call__(self, pipe, mode, spec_path, log):
+        assert mode == "build"
+        self.count += 1
+        spec = json.loads(Path(spec_path).read_text())
+        b = Path(spec["build_dir"])
+        b.mkdir(parents=True, exist_ok=True)
+        (b / spec["toplevel"]).write_text("exe")
+        src = spec["sources"][0]
+        (b / "Vtop__ver.d").write_text(
+            f"{b}/Vtop.cpp {b}/Vtop__ver.d  : /usr/bin/verilator_bin {src} {self.header} \\\n"
+            f" /usr/bin/verilator_bin\n")
+        return 0
+
+
+def build_pipeline(tmp_path, fake, src):
+    cfg = config(tmp_path, fake)
+    cfg.sim = runner.SimSpec(sources=[str(src)], toplevel="top")
+    pipe = runner.Pipeline(cfg)
+    pipe.out.mkdir(parents=True, exist_ok=True)
+    return pipe
+
+
+@pytest.fixture
+def fake_tools(monkeypatch):
+    monkeypatch.setattr(runner, "tool_versions", lambda: ("Verilator 5", "2.1.0"))
+
+
+def test_the_build_is_reused_until_an_included_file_changes(tmp_path, fake_tvla, fake_tools,
+                                                            monkeypatch):
+    src, header = tmp_path / "top.sv", tmp_path / "defs.svh"
+    src.write_text('`include "defs.svh"\nmodule top; endmodule\n')
+    header.write_text("`define W 8\n")
+    worker = FakeBuild(header)
+    monkeypatch.setattr(runner.Pipeline, "_run_worker",
+                        lambda self, mode, spec, log: worker(self, mode, spec, log))
+    build_pipeline(tmp_path, fake_tvla, src)._build()
+    build_pipeline(tmp_path, fake_tvla, src)._build()
+    assert worker.count == 1  # reused
+    header.write_text("`define W 16\n")  # only the header changes
+    build_pipeline(tmp_path, fake_tvla, src)._build()
+    assert worker.count == 2
+    record = json.loads((tmp_path / "out" / "build" / "scasim-tvla-build.json").read_text())
+    assert str(header) in record["inputs"]
+
+
+def test_a_build_without_a_dependency_file_is_not_reused(tmp_path, fake_tvla, fake_tools,
+                                                         monkeypatch):
+    src = tmp_path / "top.sv"
+    src.write_text("module top; endmodule\n")
+    count = []
+
+    def worker(self, mode, spec_path, log):
+        spec = json.loads(Path(spec_path).read_text())
+        Path(spec["build_dir"]).mkdir(parents=True, exist_ok=True)
+        (Path(spec["build_dir"]) / "top").write_text("exe")
+        count.append(1)
+        return 0
+
+    monkeypatch.setattr(runner.Pipeline, "_run_worker", worker)
+    build_pipeline(tmp_path, fake_tvla, src)._build()
+    build_pipeline(tmp_path, fake_tvla, src)._build()
+    assert len(count) == 2
+
+
+def test_parse_dep_file_reads_the_prerequisites():
+    text = "/b/Vtop.cpp /b/Vtop.h  : /v/bin /src/my\\ file.sv \\\n /inc/a.svh /v/bin\n"
+    assert runner.parse_dep_file(text) == ["/v/bin", "/src/my file.sv", "/inc/a.svh", "/v/bin"]

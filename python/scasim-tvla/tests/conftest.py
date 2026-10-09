@@ -86,6 +86,9 @@ def tvla_bin():
     """The tvla binary: SCASIM_TVLA_BIN, else PATH, else one `cargo build --release`."""
     import subprocess
 
+    reason = _sim_missing()  # skip before any cargo build: CI has no simulator
+    if reason:
+        pytest.skip(reason)
     env = os.environ.get("SCASIM_TVLA_BIN")
     if env and Path(env).is_file():
         return Path(env)

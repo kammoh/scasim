@@ -254,3 +254,33 @@ def test_a_rule_that_matches_nothing_stops_the_run_before_the_batches(runs, caps
     assert "matches no signal" in capsys.readouterr().err
     assert not list(runs.out("badrule").glob("b0*"))
     assert (runs.out("badrule") / "probe" / "meta.json").exists()  # kept for diagnosis
+
+
+def test_a_changed_include_file_rebuilds_the_design(tmp_path, tvla_bin):
+    src, header = tmp_path / "inc_top.sv", tmp_path / "defs.svh"
+    src.write_text('`include "defs.svh"\nmodule inc_top(input logic clk, output logic [`W-1:0] q);\n'
+                   "  always_ff @(posedge clk) q <= q + 1;\nendmodule\n")
+    header.write_text("`define W 8\n")
+    (tmp_path / "files.f").write_text(f"inc_top.sv\n+incdir+{tmp_path}\n")
+    builds = []
+    real = runner.Pipeline._run_worker
+
+    def spy(self, mode, spec_path, log):
+        builds.append(mode)
+        return real(self, mode, spec_path, log)
+
+    def build():
+        cfg = runner.RunConfig(out=tmp_path / "out", batches=1, tests_per_batch=1, analyze=False,
+                               sim=runner.SimSpec(sources=[str(tmp_path / "files.f")], toplevel="inc_top"))
+        runner.Pipeline(cfg)._build()
+
+    with mock.patch.object(runner.Pipeline, "_run_worker", spy):
+        (tmp_path / "out").mkdir()
+        build()
+        build()
+        assert builds == ["build"]  # the second call reuses the build
+        header.write_text("`define W 16\n")  # only the included file changes
+        build()
+        assert builds == ["build", "build"]
+    record = json.loads((tmp_path / "out" / "build" / "scasim-tvla-build.json").read_text())
+    assert str(header.resolve()) in record["inputs"] or str(header) in record["inputs"]
