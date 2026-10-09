@@ -205,8 +205,11 @@ fn moments_round_trip() {
     let c0 = &m.classes[0];
     let mean = acc.mean(0).unwrap();
     for j in [0, 1, ns - 1] {
-        assert_eq!(c0.mean(ns, j), mean[j]);
-        assert_eq!(c0.central_sum(ns, 2, j), acc.central_sum(0, 2).unwrap()[j]);
+        assert_eq!(c0.mean(ns, j).unwrap(), mean[j]);
+        assert_eq!(
+            c0.central_sum(ns, 2, j).unwrap(),
+            acc.central_sum(0, 2).unwrap()[j]
+        );
     }
 }
 
@@ -251,6 +254,51 @@ fn from_moments_rejects_invalid_state() {
         Err(StatsError::DuplicateLabel(0))
     ));
     assert!(MomentAccumulator::from_moments(ok).is_ok());
+}
+
+#[test]
+fn restore_then_merge_rejects_impossible_single_trace_moments() {
+    use scasim::stats::ttest::{ClassMoments, Moments};
+
+    let bad = Moments {
+        ns: 1,
+        d: 1,
+        classes: vec![
+            ClassMoments {
+                label: 0,
+                count: 1,
+                data: vec![0.0, 0.0, 1.0],
+            },
+            ClassMoments {
+                label: 1,
+                count: 2,
+                data: vec![1.0, 0.0, 0.0],
+            },
+        ],
+    };
+    assert!(MomentAccumulator::from_moments(bad).is_err());
+
+    let valid = Moments {
+        ns: 1,
+        d: 1,
+        classes: vec![
+            ClassMoments {
+                label: 0,
+                count: 1,
+                data: vec![0.0, 0.0, 0.0],
+            },
+            ClassMoments {
+                label: 1,
+                count: 2,
+                data: vec![1.0, 0.0, 0.0],
+            },
+        ],
+    };
+    let mut restored = MomentAccumulator::from_moments(valid).unwrap();
+    restored
+        .update(ndarray::array![[0.0]].view(), ndarray::array![0u16].view())
+        .unwrap();
+    assert_eq!(restored.t_values(0, 1)[[0, 0]], f64::NEG_INFINITY);
 }
 
 #[test]

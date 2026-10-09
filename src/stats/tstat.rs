@@ -56,6 +56,25 @@ pub fn welch_t(order: usize, a: &ClassSample<'_>, b: &ClassSample<'_>) -> f64 {
             a.cs[0] / a.n as f64,
             b.cs[0] / b.n as f64,
         )
+    } else if order == 2 {
+        let cm2a = a.cs[0] / a.n as f64;
+        let cm2b = b.cs[0] / b.n as f64;
+        let exponent = [cm2a, cm2b]
+            .into_iter()
+            .filter(|v| *v > 0.0 && v.is_finite())
+            .map(|v| v.log2().floor() as i32)
+            .max()
+            .unwrap_or(0)
+            .div_euclid(2);
+        let cm2a_scaled = scale_pow2(cm2a, -2 * exponent);
+        let cm2b_scaled = scale_pow2(cm2b, -2 * exponent);
+        let cm4a_scaled = scale_pow2(a.cs[2 * a.cs_stride] / a.n as f64, -4 * exponent);
+        let cm4b_scaled = scale_pow2(b.cs[2 * b.cs_stride] / b.n as f64, -4 * exponent);
+        (
+            cm2a_scaled - cm2b_scaled,
+            cm4a_scaled - cm2a_scaled * cm2a_scaled,
+            cm4b_scaled - cm2b_scaled * cm2b_scaled,
+        )
     } else {
         let cm = |s: &ClassSample<'_>, p: usize| s.cs[(p - 2) * s.cs_stride] / s.n as f64;
         let (ma, va) = preprocessed(order, cm(a, 2), |p| cm(a, p));
@@ -83,15 +102,44 @@ pub fn welch_t(order: usize, a: &ClassSample<'_>, b: &ClassSample<'_>) -> f64 {
 
 #[inline]
 fn preprocessed(order: usize, cm2: f64, cm: impl Fn(usize) -> f64) -> (f64, f64) {
+    if cm2 <= 0.0 || !cm2.is_finite() {
+        if order == 2 {
+            return (cm2, cm(4) - cm2 * cm2);
+        }
+        return (f64::NAN, f64::NAN);
+    }
+
+    // Scale moments by an exact power of two so the standardized values stay near one.
+    // The exponent comes from CM_2 and is applied before any products or powers form.
+    let exponent = cm2.log2().floor() as i32;
+    let scale_exponent = exponent.div_euclid(2);
+    let scaled = |p: usize| scale_pow2(cm(p), -scale_exponent * p as i32);
+    let cm2_scaled = scaled(2);
     if order == 2 {
-        (cm2, cm(4) - cm2 * cm2)
+        let cm4_scaled = scaled(4);
+        (cm2_scaled, cm4_scaled - cm2_scaled * cm2_scaled)
     } else {
         let k = order as i32;
-        let variance = cm2;
-        let mean = cm(order) / variance.sqrt().powi(k);
-        let out_var = (cm(2 * order) - cm(order).powi(2)) / variance.powi(k);
+        let cmk = scaled(order);
+        let cm2k = scaled(2 * order);
+        let mean = cmk / cm2_scaled.powf(k as f64 / 2.0);
+        let out_var = (cm2k - cmk * cmk) / cm2_scaled.powi(k);
         (mean, out_var)
     }
+}
+
+/// Multiplies by 2^exponent in bounded steps, including subnormal inputs and outputs.
+#[inline]
+fn scale_pow2(mut value: f64, mut exponent: i32) -> f64 {
+    while exponent > 512 {
+        value *= 2.0f64.powi(512);
+        exponent -= 512;
+    }
+    while exponent < -512 {
+        value *= 2.0f64.powi(-512);
+        exponent += 512;
+    }
+    value * 2.0f64.powi(exponent)
 }
 
 #[cfg(test)]
@@ -182,6 +230,39 @@ mod tests {
                 "order {k}"
             );
             assert_eq!(welch_t(k, &b, &a), -got, "order {k}");
+        }
+    }
+
+    #[test]
+    fn standardized_orders_are_invariant_to_power_of_two_scale() {
+        let base_a = [0.0, 0.0, 0.0, 1.0];
+        let base_b = [0.0, 0.0, 1.0, 1.0];
+        let values = |samples: &[f64], e: i32| {
+            let scale = 2.0f64.powi(e);
+            let x: Vec<f64> = samples.iter().map(|v| v * scale).collect();
+            let mean = x.iter().sum::<f64>() / x.len() as f64;
+            let cs: Vec<f64> = (2..=8)
+                .map(|p| x.iter().map(|v| (v - mean).powi(p)).sum())
+                .collect();
+            (mean, cs)
+        };
+        let reference = |e| {
+            let (ma, ca) = values(&base_a, e);
+            let (mb, cb) = values(&base_b, e);
+            let a = sample(4, ma, 0.0, &ca);
+            let b = sample(4, mb, 0.0, &cb);
+            (1..=4).map(|k| welch_t(k, &a, &b)).collect::<Vec<_>>()
+        };
+        let expected = reference(0);
+        for e in [-100, -50, 0, 50, 100] {
+            let got = reference(e);
+            for (k, (&actual, &want)) in got.iter().zip(&expected).enumerate() {
+                assert!(
+                    (actual - want).abs() <= 1e-12 * want.abs().max(1.0),
+                    "scale exponent {e}, order {}: {actual} vs {want}",
+                    k + 1
+                );
+            }
         }
     }
 }

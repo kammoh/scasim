@@ -22,22 +22,25 @@ pub struct ClassMoments {
 impl ClassMoments {
     /// The mean at sample point `j`, for a state with `ns` sample points.
     ///
-    /// # Panics
-    ///
-    /// Panics if `j >= ns` or if `data` is too short.
-    pub fn mean(&self, ns: usize, j: usize) -> f64 {
-        assert!(j < ns);
-        self.data[j] + self.data[ns + j]
+    /// Returns `None` if `j` is out of range or the data has the wrong length.
+    pub fn mean(&self, ns: usize, j: usize) -> Option<f64> {
+        if j >= ns {
+            return None;
+        }
+        let offset_index = ns.checked_add(j)?;
+        Some(*self.data.get(j)? + *self.data.get(offset_index)?)
     }
 
     /// The central sum of order `p` (`2 <= p <= 2d`) at sample point `j`.
     ///
-    /// # Panics
-    ///
-    /// Panics if `p < 2`, `j >= ns`, or `data` is too short.
-    pub fn central_sum(&self, ns: usize, p: usize, j: usize) -> f64 {
-        assert!(p >= 2 && j < ns);
-        self.data[p * ns + j]
+    /// Returns `None` if the order or sample index is invalid, the index overflows, or the data
+    /// has the wrong length.
+    pub fn central_sum(&self, ns: usize, p: usize, j: usize) -> Option<f64> {
+        if p < 2 || j >= ns {
+            return None;
+        }
+        let index = p.checked_mul(ns)?.checked_add(j)?;
+        self.data.get(index).copied()
     }
 }
 
@@ -61,10 +64,18 @@ impl Moments {
         if self.d == 0 {
             return Err(StatsError::ZeroOrder);
         }
+        if self.d > super::MAX_ORDER {
+            return Err(StatsError::InvalidMomentOrder {
+                order: self.d,
+                max: super::MAX_ORDER,
+            });
+        }
         let rows = self
             .d
             .checked_mul(2)
             .and_then(|v| v.checked_add(1))
+            .ok_or(StatsError::CountOverflow)?;
+        rows.checked_mul(super::kernel::W)
             .ok_or(StatsError::CountOverflow)?;
         let expected = rows.checked_mul(self.ns).ok_or(StatsError::CountOverflow)?;
         let mut seen = std::collections::BTreeSet::new();
@@ -84,6 +95,14 @@ impl Moments {
             }
             if class.count == 0 && class.data.iter().any(|&v| v != 0.0) {
                 return Err(StatsError::EmptyClassHasData { label: class.label });
+            }
+            for p in 2..=2 * self.d {
+                let row = p * self.ns;
+                for &value in &class.data[row..row + self.ns] {
+                    if (class.count == 1 && value != 0.0) || (p % 2 == 0 && value < 0.0) {
+                        return Err(StatsError::InvalidMoments { label: class.label });
+                    }
+                }
             }
         }
         Ok(())

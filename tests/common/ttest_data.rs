@@ -111,16 +111,31 @@ pub fn reference_t(x: &Array2<f64>, labels: &[u16], a: u16, b: u16, d: usize) ->
 pub fn max_err(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     assert_eq!(a.dim(), b.dim(), "shape mismatch");
     let mut worst: f64 = 0.0;
-    for ((idx, &x), &y) in a.indexed_iter().zip(b.iter()) {
-        assert_eq!(
-            x.is_nan(),
-            y.is_nan(),
-            "NaN mismatch at {idx:?}: {x} vs {y}"
-        );
-        if x.is_nan() {
-            continue;
+    for ((_, &x), &y) in a.indexed_iter().zip(b.iter()) {
+        if !x.is_finite() || !y.is_finite() {
+            if (x.is_nan() && y.is_nan()) || x == y {
+                continue;
+            }
+            return f64::INFINITY;
         }
         worst = worst.max((x - y).abs() / 1.0f64.max(x.abs()).max(y.abs()));
     }
     worst
+}
+
+#[cfg(test)]
+mod tests {
+    use super::max_err;
+    use ndarray::array;
+
+    #[test]
+    fn non_finite_values_match_only_when_equal_by_policy() {
+        assert_eq!(
+            max_err(&array![[f64::INFINITY]], &array![[f64::INFINITY]]),
+            0.0
+        );
+        assert_eq!(max_err(&array![[f64::NAN]], &array![[f64::NAN]]), 0.0);
+        assert!(max_err(&array![[f64::INFINITY]], &array![[1.0]]).is_infinite());
+        assert!(max_err(&array![[f64::INFINITY]], &array![[f64::NEG_INFINITY]]).is_infinite());
+    }
 }

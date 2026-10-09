@@ -24,6 +24,8 @@ pub enum StatsError {
     EmptyClassHasData { label: u16 },
     #[error("class {label} contains a non-finite moment value")]
     NonFiniteMoments { label: u16 },
+    #[error("class {label} contains moments that cannot come from its trace count")]
+    InvalidMoments { label: u16 },
     #[error("class label {0} appears more than once")]
     DuplicateLabel(u16),
     #[error("moment order {order} is outside 2..={max}")]

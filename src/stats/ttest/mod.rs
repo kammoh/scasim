@@ -83,6 +83,6 @@ mod moments;
 mod sample;
 mod tvalues;
 
-pub use accumulator::MomentAccumulator;
+pub use accumulator::{MAX_ORDER, MomentAccumulator};
 pub use moments::{ClassMoments, Moments};
 pub use sample::TraceSample;
