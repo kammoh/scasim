@@ -928,6 +928,7 @@ fn plot_series_serves_the_chi2_plots() {
     let opts = LineOptions {
         x_label: "Sample".into(),
         y_label: "-log10(p)".into(),
+        symmetric: false,
         thresholds: vec![
             Threshold::new(5.0, "5"),
             Threshold::new(7.3, "Bonferroni 7.3"),
@@ -994,4 +995,162 @@ fn static_plot_with_non_finite_x_values_does_not_panic() {
     let s = [Series::with_x("a", &x, &y)];
     save_line_plot(dir.join("x.svg"), &s, &LineOptions::max_t(), (400, 300)).unwrap();
     save_line_plot(dir.join("x.png"), &s, &LineOptions::max_t(), (400, 300)).unwrap();
+}
+
+// ---------------------------------------------------------------------------------------
+// symmetric t-value plots
+// ---------------------------------------------------------------------------------------
+
+/// The number of y values of the `data` traces of a figure that are the constant `y`
+/// (the threshold lines).
+fn lines_at(json: &serde_json::Value, y: f64) -> usize {
+    json["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| {
+            t["y"]
+                .as_array()
+                .is_some_and(|v| v.len() == 2 && v[0] == y && v[1] == y)
+        })
+        .count()
+}
+
+#[test]
+fn t_plots_of_all_zero_and_all_positive_values_are_symmetric_with_two_threshold_lines() {
+    for (name, value) in [("zero", 0.0), ("positive", 2.0)] {
+        let dir = test_dir(&format!("symmetric_{name}"));
+        let t = ndarray::Array2::from_elem((1, 60), value);
+        plot_t_traces(t.view(), Some(4.5), false, &dir, false).unwrap();
+        // HTML and JSON: range [-m, m], m = 1.5 * 4.5 + 0.5 = 7.25, and both lines.
+        let json = read_json(&dir.join("t_test_d1.json"));
+        assert_eq!(
+            json["layout"]["yaxis"]["range"],
+            serde_json::json!([-7.25, 7.25]),
+            "{name}"
+        );
+        assert_eq!(lines_at(&json, 4.5), 1, "{name}");
+        assert_eq!(lines_at(&json, -4.5), 1, "{name}");
+        // SVG: the y axis has negative tick labels, and the threshold line is drawn twice.
+        let svg = std::fs::read_to_string(dir.join("t_test_d1.svg")).unwrap();
+        assert!(
+            svg.lines()
+                .any(|l| l.starts_with('-') && l[1..].parse::<f64>().is_ok()),
+            "{name}: no negative tick label in the SVG"
+        );
+        let red = svg.matches("#FF0000").count();
+        let one_sided = {
+            let o = LineOptions {
+                symmetric: false,
+                ..LineOptions::t_values()
+            };
+            let p = dir.join("one_sided.svg");
+            let y = [value; 60];
+            save_line_plot(&p, &[Series::indexed("d=1", &y)], &o, (1200, 600)).unwrap();
+            std::fs::read_to_string(p)
+                .unwrap()
+                .matches("#FF0000")
+                .count()
+        };
+        assert!(
+            red > one_sided + one_sided / 2,
+            "{name}: {red} red items, one-sided {one_sided}"
+        );
+    }
+}
+
+#[test]
+fn chi2_style_plots_stay_non_negative() {
+    let dir = test_dir("non_negative");
+    let y = [0.5, 2.0, 7.0, 1.0];
+    let opts = LineOptions {
+        symmetric: false,
+        thresholds: vec![Threshold::new(5.0, "5")],
+        ..LineOptions::t_values()
+    };
+    plot_series(
+        "chi2",
+        &[Series::indexed("pearson", &y)],
+        &opts,
+        &dir,
+        false,
+    )
+    .unwrap();
+    let json = read_json(&dir.join("chi2.json"));
+    assert_eq!(json["layout"]["yaxis"]["range"][0], 0.0);
+    assert_eq!(lines_at(&json, 5.0), 1);
+    assert_eq!(lines_at(&json, -5.0), 0);
+    // max |t| plots are non-negative, too.
+    let max = LineOptions::max_t();
+    assert!(!max.symmetric);
+    let x = [1.0, 2.0];
+    let v = [1.0, 3.0];
+    let fig = parsed(&line_figure(&[Series::with_x("d=1", &x, &v)], &max).unwrap());
+    assert_eq!(fig["layout"]["yaxis"]["range"][0], 0.0);
+    // A t-value series with negative values is symmetric with or without the option.
+    let signed = [-3.0, 1.0];
+    let sym =
+        parsed(&line_figure(&[Series::indexed("a", &signed)], &LineOptions::t_values()).unwrap());
+    assert_eq!(sym["layout"]["yaxis"]["range"][0], -7.25);
+}
+
+/// The lengths of the dashes that the SVG draws in `color`: horizontal two-point polylines.
+fn dash_lengths(svg: &str, color: &str) -> std::collections::BTreeSet<i64> {
+    let needle = format!("stroke=\"{color}\" stroke-width=\"1\" points=\"");
+    svg.lines()
+        .filter_map(|l| {
+            let rest = &l[l.find(&needle)? + needle.len()..];
+            let points = rest.split('"').next()?;
+            let xs: Vec<(i64, i64)> = points
+                .split_whitespace()
+                .map(|p| {
+                    let (x, y) = p.split_once(',').unwrap();
+                    (x.parse().unwrap(), y.parse().unwrap())
+                })
+                .collect();
+            (xs.len() == 2 && xs[0].1 == xs[1].1).then(|| xs[1].0 - xs[0].0)
+        })
+        .collect()
+}
+
+#[test]
+fn static_threshold_lines_match_the_html_dash_styles() {
+    let dir = test_dir("dash_styles");
+    let y = [0.0, 1.0, -1.0, 0.5];
+    let opts = LineOptions {
+        thresholds: vec![
+            Threshold::new(2.0, "first"),
+            Threshold::new(3.0, "second"),
+            Threshold::new(4.0, "third"),
+            Threshold::new(5.0, "fourth"),
+        ],
+        ..LineOptions::t_values()
+    };
+    let svg_path = dir.join("dashes.svg");
+    save_line_plot(&svg_path, &[Series::indexed("a", &y)], &opts, (1200, 600)).unwrap();
+    let svg = std::fs::read_to_string(svg_path).unwrap();
+    // Pixel rounding changes a length by one, so the test only tells short (dot) from long
+    // (dash) pieces. First: red dotted. Second: black dashed. Third and later: gray dash-dot.
+    let kinds = |color: &str| {
+        let lengths = dash_lengths(&svg, color);
+        (
+            lengths.iter().any(|&l| l <= 3),
+            lengths.iter().any(|&l| l >= 8),
+        )
+    };
+    assert_eq!(kinds("#FF0000"), (true, false), "dotted");
+    assert_eq!(kinds("#000000"), (false, true), "dashed");
+    assert_eq!(kinds("#646464"), (true, true), "dash-dot");
+    // The HTML uses the same styles.
+    let json = parsed(&line_figure(&[Series::indexed("a", &y)], &opts).unwrap());
+    let dashes: Vec<&str> = json["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["line"]["dash"].as_str())
+        .collect();
+    assert_eq!(
+        &dashes[..6],
+        ["dot", "dot", "dash", "dash", "dashdot", "dashdot"]
+    );
 }

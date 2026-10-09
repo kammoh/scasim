@@ -224,15 +224,33 @@ impl Drawer for LineDrawer<'_> {
             for (i, t) in opts.thresholds.iter().enumerate() {
                 let (r, g, b) = threshold_color(i);
                 let color = RGBColor(r, g, b);
-                // Dotted for the first threshold, dashed for the others.
-                let (dash, gap) = if i == 0 { (2, 4) } else { (9, 5) };
                 let signs: &[f64] = if lay.negative_lines {
                     &[1.0, -1.0]
                 } else {
                     &[1.0]
                 };
+                // Dotted for the first threshold, dashed for the second, and dash-dot (as in
+                // the HTML) for the others.
+                let (dash, gap) = match i {
+                    0 => (2, 4),
+                    1 => (9, 5),
+                    _ => (9, 8),
+                };
+                // Pixel width of the plot area, to shift the dots of a dash-dot line.
+                let width_px = f64::from(chart.plotting_area().dim_in_pixel().0.max(1));
                 for (k, sign) in signs.iter().enumerate() {
                     let y = sign * t.value;
+                    if i >= 2 {
+                        // One period is 17 pixels: a dash of 9, a gap of 3, a dot of 2, and a
+                        // gap of 3. The dots start 12 pixels after the dashes.
+                        let shift = 12.0 * (x1 - x0) / width_px;
+                        chart.draw_series(DashedLineSeries::new(
+                            vec![(x0 + shift, y), (x1, y)],
+                            2,
+                            15,
+                            color.stroke_width(1),
+                        ))?;
+                    }
                     let annotation = chart.draw_series(DashedLineSeries::new(
                         vec![(x0, y), (x1, y)],
                         dash,

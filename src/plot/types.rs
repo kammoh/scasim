@@ -103,7 +103,8 @@ pub struct LineOptions {
     pub y_label: String,
     /// The threshold lines. If the list is empty, the y axis scales automatically.
     /// Otherwise the y range is fixed, like in the old plots: from `-m` to `m`, or from
-    /// 0 to `m` if all values are not negative, where `m` is
+    /// 0 to `m` for non-negative data in a plot that is not [`symmetric`](Self::symmetric),
+    /// where `m` is
     /// `max(largest threshold * 1.5, largest |value|) + 0.5`.
     pub thresholds: Vec<Threshold>,
     /// Plot `|value|` instead of `value`.
@@ -115,6 +116,12 @@ pub struct LineOptions {
     /// If `true` (as in the old plots), NaN and infinite values are plotted as 0. If
     /// `false`, they are plotted as gaps.
     pub non_finite_as_zero: bool,
+    /// If `true`, the plot is for signed values, like t-values: with thresholds, the y range
+    /// is always `[-m, m]` and each threshold is drawn at `+value` and at `-value`, even if
+    /// all values are zero or positive. If `false`, the range is `[0, m]` and only the lines
+    /// at `+value` are drawn when no value is negative (for example for max |t| or
+    /// -log10(p)). `abs_values` always gives the non-negative form.
+    pub symmetric: bool,
     /// HTML and JSON only: round the plotted values to this number of decimal places.
     /// This makes the file about half as large. `None` keeps all digits.
     pub decimals: Option<u32>,
@@ -132,6 +139,7 @@ impl LineOptions {
             abs_values: false,
             buckets: 4000,
             non_finite_as_zero: true,
+            symmetric: true,
             decimals: Some(4),
             line_width: 2.0,
         }
@@ -144,6 +152,7 @@ impl LineOptions {
             y_label: "max(|t|)".into(),
             thresholds: vec![Threshold::new(4.5, "4.5")],
             line_width: 1.0,
+            symmetric: false,
             ..Self::t_values()
         }
     }
@@ -275,7 +284,8 @@ pub(crate) fn layout(prepared: &[Prepared], opts: &LineOptions) -> Layout2d {
     }
     let (y_min, y_max) = y.unwrap_or((0.0, 0.0));
     let top = (y_max.abs().max(y_min.abs())).max(t_top).max(1.5 * t_top) + 0.5;
-    let non_negative = y_min >= 0.0;
+    // `abs_values` and plots that are not symmetric use the non-negative form if the data allow.
+    let non_negative = opts.abs_values || (!opts.symmetric && y_min >= 0.0);
     Layout2d {
         x_range,
         y_range: Some((if non_negative { 0.0 } else { -top }, top)),

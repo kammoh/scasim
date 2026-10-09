@@ -108,8 +108,8 @@ fn check_stem(name_stem: &str) -> Result<(), PlotError> {
 /// * max |t| or max χ² versus the number of traces: [`Series::with_x`] with the numbers of
 ///   traces as `x`, and the options [`LineOptions::max_t`] or a copy with another
 ///   `y_label`;
-/// * −log10(p) per sample: [`Series::indexed`], `y_label` `"-log10(p)"`, and the thresholds
-///   5 and the Bonferroni value (a list of [`Threshold`] values).
+/// * −log10(p) per sample: [`Series::indexed`], `y_label` `"-log10(p)"`, `symmetric: false`,
+///   and the thresholds 5 and the Bonferroni value (a list of [`Threshold`] values).
 ///
 /// The HTML file has the plotly.js library and works offline. The SVG file is drawn by
 /// plotters. A long series without x values is reduced with an envelope. See
@@ -152,7 +152,8 @@ pub fn plot_series(
 /// orders in one figure.
 ///
 /// With `t_threshold = Some(t)`, the plots have threshold lines at `t` (and at `-t`, if
-/// `abs_values` is `false` and some t-value is negative) and a fixed y range. With `None`,
+/// `abs_values` is `false`) and a fixed y range, also if all t-values are zero or positive.
+/// With `None`,
 /// the y axis scales automatically. With `abs_values`, the plots show `|t|`. NaN and
 /// infinite t-values are plotted as 0. The x axis is the sample index.
 ///
