@@ -106,34 +106,52 @@ fn resolve_handle(index: &HierarchyIndex, path: &str) -> Result<usize, PowerErro
 /// Reads the value changes of the signal with the exact path `signal_path`. FST files use the
 /// section API of the `fst-reader` fork. All other formats use `wellen`.
 pub fn probe_changes(path: &Path, signal_path: &str) -> Result<ProbeTrace, PowerError> {
+    let mut probe = ProbeTrace::new(signal_path);
+    visit_values(path, signal_path, |time, chars| probe.push(time, chars))?;
+    Ok(probe)
+}
+
+/// Calls `visit(time, state characters)` for every value of the signal with the exact path
+/// `signal_path`, in time order. The first call is the initial value (see the module
+/// documentation). A call also happens for a value equal to the one before it. Nothing is
+/// collected, so the memory does not grow with the number of changes. The characters are as the
+/// file gives them (not lower case).
+pub fn visit_values(
+    path: &Path,
+    signal_path: &str,
+    visit: impl FnMut(u64, &[u8]),
+) -> Result<(), PowerError> {
     if is_fst(path)? {
-        probe_fst(path, signal_path)
+        probe_fst(path, signal_path, visit)
     } else {
-        probe_reference(path, signal_path)
+        probe_reference(path, signal_path, visit)
     }
 }
 
 /// The characters of an FST value, or `None` for a value that is not a bit vector.
-fn fst_chars(value: FstValue<'_>, scratch: &mut Vec<u8>) -> Option<Vec<u8>> {
+fn fst_chars<'a>(value: FstValue<'a>, scratch: &'a mut Vec<u8>) -> Option<&'a [u8]> {
     match value {
         FstValue::Packed { width, bytes } => {
             packed_to_chars(width, bytes, scratch);
-            Some(scratch.clone())
+            Some(scratch)
         }
-        FstValue::Chars(chars) => Some(chars.to_vec()),
+        FstValue::Chars(chars) => Some(chars),
         FstValue::VarLen(_) | FstValue::Real(_) => None,
     }
 }
 
-fn probe_fst(path: &Path, signal_path: &str) -> Result<ProbeTrace, PowerError> {
+fn probe_fst(
+    path: &Path,
+    signal_path: &str,
+    mut visit: impl FnMut(u64, &[u8]),
+) -> Result<(), PowerError> {
     let mut reader = fst::open_reader(path)?;
     let end_time = reader.get_header().end_time;
     let has_time_points = reader.get_time_table().is_some_and(|t| !t.is_empty());
     let index = HierarchyIndex::from_fst(&mut reader)?;
     let handle = resolve_handle(&index, signal_path)?;
-    let mut probe = ProbeTrace::new(signal_path);
     if !has_time_points {
-        return Ok(probe);
+        return Ok(());
     }
     let mut scratch = Vec::new();
     let mut first_section = true;
@@ -151,7 +169,7 @@ fn probe_fst(path: &Path, signal_path: &str) -> Result<ProbeTrace, PowerError> {
                 if h.get_index() == handle
                     && let Some(chars) = fst_chars(value, &mut scratch)
                 {
-                    probe.push(info.start_time, &chars);
+                    visit(info.start_time, chars);
                 }
             })?;
         }
@@ -167,24 +185,27 @@ fn probe_fst(path: &Path, signal_path: &str) -> Result<ProbeTrace, PowerError> {
             last_time_index,
             |time_index, value| {
                 if let Some(chars) = fst_chars(value, &mut scratch) {
-                    probe.push(times[time_index], &chars);
+                    visit(times[time_index], chars);
                 }
             },
         )?;
     }
-    Ok(probe)
+    Ok(())
 }
 
-fn probe_reference(path: &Path, signal_path: &str) -> Result<ProbeTrace, PowerError> {
+fn probe_reference(
+    path: &Path,
+    signal_path: &str,
+    mut visit: impl FnMut(u64, &[u8]),
+) -> Result<(), PowerError> {
     let header = wellen::viewers::read_header_from_file(path, &reference::load_options())?;
     let hierarchy = header.hierarchy;
     let index = HierarchyIndex::from_wellen(&hierarchy);
     let handle = resolve_handle(&index, signal_path)?;
     let body = wellen::viewers::read_body(header.body, &hierarchy, None)?;
-    let mut probe = ProbeTrace::new(signal_path);
     if body.time_table.is_empty() {
         // `wellen` panics when it loads signals of an FST file without time points.
-        return Ok(probe);
+        return Ok(());
     }
     let signal_ref = wellen::SignalRef::from_index(handle).expect("a valid signal index");
     let mut source = body.source;
@@ -197,8 +218,8 @@ fn probe_reference(path: &Path, signal_path: &str) -> Result<ProbeTrace, PowerEr
             };
             chars.clear();
             chars.extend(bits.iter_msb_to_lsb().map(|b| b.as_ascii() as u8));
-            probe.push(body.time_table[time_index as usize], &chars);
+            visit(body.time_table[time_index as usize], &chars);
         }
     }
-    Ok(probe)
+    Ok(())
 }

@@ -4,7 +4,7 @@
 //! state is not an edge. The first value of the signal is not a change, so a clock that starts
 //! high has its first rising edge at its first `0` to `1` change.
 
-use super::probe::ProbeTrace;
+use super::probe::{ProbeTrace, visit_values};
 use super::{Bins, PowerError};
 
 /// Which clock edges open a bin.
@@ -16,13 +16,107 @@ pub enum EdgeKind {
     Both,
 }
 
-/// The level of a state character: `Some(false)` for `0` and `l`, `Some(true)` for `1` and `h`,
-/// and `None` for any other state.
-fn level(value: &str) -> Option<bool> {
-    match value {
-        "0" | "l" => Some(false),
-        "1" | "h" => Some(true),
+/// The level of a state character: `Some(false)` for `0` and `l`, `Some(true)` for `1` and `h`
+/// (in any case), and `None` for any other state.
+fn level(value: u8) -> Option<bool> {
+    match value.to_ascii_lowercase() {
+        b'0' | b'l' => Some(false),
+        b'1' | b'h' => Some(true),
         _ => None,
+    }
+}
+
+/// Collects the edge times of a 1-bit signal from its values, one at a time. It keeps only the
+/// previous level and the edge times, so its memory grows with the number of edges only.
+pub struct EdgeCollector {
+    path: String,
+    kind: EdgeKind,
+    offset: i64,
+    started: bool,
+    previous: Option<bool>,
+    times: Vec<u64>,
+    error: Option<PowerError>,
+}
+
+impl EdgeCollector {
+    pub fn new(path: &str, kind: EdgeKind, offset: i64) -> Self {
+        EdgeCollector {
+            path: path.to_string(),
+            kind,
+            offset,
+            started: false,
+            previous: None,
+            times: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn fail(&mut self, reason: String) {
+        self.error.get_or_insert(PowerError::Probe {
+            path: self.path.clone(),
+            reason,
+        });
+    }
+
+    /// Adds the value `chars` (state characters) at `time`. The first value is the initial value
+    /// and makes no edge.
+    pub fn push(&mut self, time: u64, chars: &[u8]) {
+        if self.error.is_some() {
+            return;
+        }
+        if chars.len() != 1 {
+            self.fail(format!(
+                "the clock must be 1 bit wide, but this signal has {} bits",
+                chars.len()
+            ));
+            return;
+        }
+        let now = level(chars[0]);
+        let was_started = std::mem::replace(&mut self.started, true);
+        let edge = match (self.previous, now) {
+            _ if !was_started => false,
+            (Some(false), Some(true)) => self.kind != EdgeKind::Falling,
+            (Some(true), Some(false)) => self.kind != EdgeKind::Rising,
+            _ => false,
+        };
+        self.previous = now;
+        if !edge {
+            return;
+        }
+        let Some(shifted) = time.checked_add_signed(self.offset) else {
+            self.fail(format!(
+                "the edge at time {time} moves to a time below 0 (or above the largest time) \
+                 with the offset {}",
+                self.offset
+            ));
+            return;
+        };
+        // A glitch has several edges at one time: they count once.
+        if self.times.last() != Some(&shifted) {
+            self.times.push(shifted);
+        }
+    }
+
+    /// The edge times, strictly increasing. Fails if a value was not 1 bit wide, if a shifted
+    /// time is below 0, if the signal never had a value, or if there are fewer than 2 edges.
+    pub fn finish(mut self) -> Result<Vec<u64>, PowerError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        if !self.started {
+            self.fail("the clock signal has no value".into());
+        } else if self.times.len() < 2 {
+            let reason = format!(
+                "the clock has {} {:?} edges, but sampling needs at least 2",
+                self.times.len(),
+                self.kind
+            );
+            self.fail(reason);
+        }
+        match self.error {
+            Some(error) => Err(error),
+            None => Ok(self.times),
+        }
     }
 }
 
@@ -30,51 +124,28 @@ fn level(value: &str) -> Option<bool> {
 /// are strictly increasing: edges at the same time (a glitch) count once. Fails if the probe is
 /// not 1 bit wide, if a shifted time is below 0, or if there are fewer than 2 edges.
 pub fn edge_times(probe: &ProbeTrace, kind: EdgeKind, offset: i64) -> Result<Vec<u64>, PowerError> {
-    let error = |reason: String| PowerError::Probe {
-        path: probe.path.clone(),
-        reason,
-    };
-    let initial = probe
-        .initial
-        .as_deref()
-        .ok_or_else(|| error("the clock signal has no value".into()))?;
-    if initial.len() != 1 {
-        return Err(error(format!(
-            "the clock must be 1 bit wide, but this signal has {} bits",
-            initial.len()
-        )));
+    let mut collector = EdgeCollector::new(&probe.path, kind, offset);
+    if let Some(initial) = &probe.initial {
+        collector.push(0, initial.as_bytes());
     }
-    let mut times: Vec<u64> = Vec::new();
-    let mut previous = level(initial);
     for (time, value) in &probe.changes {
-        let now = level(value);
-        let edge = match (previous, now) {
-            (Some(false), Some(true)) => kind != EdgeKind::Falling,
-            (Some(true), Some(false)) => kind != EdgeKind::Rising,
-            _ => false,
-        };
-        previous = now;
-        if !edge {
-            continue;
-        }
-        let shifted = time.checked_add_signed(offset).ok_or_else(|| {
-            error(format!(
-                "the edge at time {time} moves to a time below 0 (or above the largest time) \
-                 with the offset {offset}"
-            ))
-        })?;
-        // A glitch has several edges at one time: they count once.
-        if times.last() != Some(&shifted) {
-            times.push(shifted);
-        }
+        collector.push(*time, value.as_bytes());
     }
-    if times.len() < 2 {
-        return Err(error(format!(
-            "the clock has {} {kind:?} edges, but sampling needs at least 2",
-            times.len()
-        )));
-    }
-    Ok(times)
+    collector.finish()
+}
+
+/// Reads the signal with the exact path `signal_path` from a waveform file and returns its edge
+/// times (see [`edge_times`]). The values go straight into the edge collector: the memory does
+/// not grow with the number of value changes.
+pub fn probe_edge_times(
+    path: &std::path::Path,
+    signal_path: &str,
+    kind: EdgeKind,
+    offset: i64,
+) -> Result<Vec<u64>, PowerError> {
+    let mut collector = EdgeCollector::new(signal_path, kind, offset);
+    visit_values(path, signal_path, |time, chars| collector.push(time, chars))?;
+    collector.finish()
 }
 
 /// The statistics of the clock periods, for the report.

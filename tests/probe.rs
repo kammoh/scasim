@@ -98,3 +98,37 @@ fn an_unknown_path_is_an_error_with_at_most_ten_candidates() {
         assert!(!message.contains("tb.u11.clk"), "{message}");
     }
 }
+
+#[test]
+fn streamed_edges_equal_the_edges_of_the_collected_changes() {
+    use scasim::power::edges::{EdgeKind, edge_times, probe_edge_times};
+    let fx = fixture();
+    let (_fst_dir, fst) = temp_fst(&fx);
+    let (_vcd_dir, vcd) = temp_vcd(&fx);
+    for path in [&fst, &vcd] {
+        let probe = probe_changes(path, "tb.clk").unwrap();
+        for kind in [EdgeKind::Rising, EdgeKind::Both] {
+            for offset in [0, 2] {
+                let want = edge_times(&probe, kind, offset).unwrap();
+                let got = probe_edge_times(path, "tb.clk", kind, offset).unwrap();
+                assert_eq!(got, want, "{kind:?} {offset}");
+            }
+        }
+        // Rising edges at 5 and 15; the change at 25 comes from `x`.
+        let rising = probe_edge_times(path, "tb.clk", EdgeKind::Rising, 0).unwrap();
+        assert_eq!(rising, [5, 15]);
+        // One falling edge only: not enough.
+        let message = probe_edge_times(path, "tb.clk", EdgeKind::Falling, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("at least 2"), "{message}");
+        let message = probe_edge_times(path, "tb.d", EdgeKind::Both, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("4 bits"), "{message}");
+        let message = probe_edge_times(path, "tb.nope", EdgeKind::Both, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("tb.nope"), "{message}");
+    }
+}
