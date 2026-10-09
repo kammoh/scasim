@@ -109,9 +109,16 @@ pub struct TestResult {
 }
 
 impl TestResult {
-    /// True if the table had at least two rows and two columns after dropping and merging.
+    /// True if the table had at least two rows and two columns after dropping and merging
+    /// (`dof >= 1`), and the p-value is finite. A p-value that is NaN means that the computation
+    /// did not converge (see [`ln_gamma_q`](super::special::ln_gamma_q)): that test failed.
     pub fn is_valid(&self) -> bool {
-        self.dof >= 1
+        self.dof >= 1 && self.neg_log10_p.is_finite()
+    }
+
+    /// True if the table is valid (`dof >= 1`) but the p-value is not finite.
+    pub fn is_failed(&self) -> bool {
+        self.dof >= 1 && !self.neg_log10_p.is_finite()
     }
 
     fn invalid(n: u64, rows: usize, nonzero_columns: u32) -> Self {
@@ -338,9 +345,14 @@ pub struct Summary {
     pub valid: usize,
     /// Number of samples with `-log10(p)` at or above the threshold.
     pub above: usize,
+    /// Number of samples whose test failed: the table is valid (`dof >= 1`), but the p-value is
+    /// not finite (the computation did not converge). They are not in `valid`, `above`,
+    /// `max_neg_log10_p`, or `argmax`. A report must show this count.
+    pub failed: usize,
 }
 
-/// Summarizes per-sample results against a `-log10(p)` threshold.
+/// Summarizes per-sample results against a `-log10(p)` threshold. Failed tests (a valid table
+/// with a non-finite p-value) are only counted in `failed`.
 pub fn summarize(results: &[TestResult], threshold: f64) -> Summary {
     let s = summarize2(results, threshold, threshold);
     Summary {
@@ -348,6 +360,7 @@ pub fn summarize(results: &[TestResult], threshold: f64) -> Summary {
         argmax: s.argmax,
         valid: s.valid,
         above: s.above[0],
+        failed: s.failed,
     }
 }
 
@@ -366,6 +379,10 @@ pub struct Summary2 {
     pub valid: usize,
     /// For each threshold, the number of valid samples with `-log10(p)` at or above it.
     pub above: [usize; 2],
+    /// Number of samples whose test failed: the table is valid (`dof >= 1`), but the p-value is
+    /// not finite (the computation did not converge). They are not in `valid`, `above`,
+    /// `max_neg_log10_p`, or `argmax`. A report must show this count.
+    pub failed: usize,
 }
 
 /// Summarizes per-sample results against two `-log10(p)` thresholds, `t1` and `t2`.
@@ -378,8 +395,12 @@ pub fn summarize2(results: &[TestResult], t1: f64, t2: f64) -> Summary2 {
         argmax: 0,
         valid: 0,
         above: [0, 0],
+        failed: 0,
     };
     for (i, r) in results.iter().enumerate() {
+        if r.is_failed() {
+            s.failed += 1;
+        }
         if !r.is_valid() {
             continue;
         }
@@ -561,5 +582,34 @@ mod tests {
         // An invalid test is never counted, even with a threshold of 0.
         let s = summarize2(&[result(0.0, 0), result(0.0, 1)], 0.0, f64::NAN);
         assert_eq!((s.valid, s.above), (1, [1, 0]));
+    }
+
+    /// Fix round 2, item 2: a NaN p-value is a failed test, not a valid one.
+    #[test]
+    fn a_non_finite_p_is_a_failed_test() {
+        let r = [
+            result(2.0, 1),
+            result(f64::NAN, 1),
+            result(9.0, 3),
+            result(f64::INFINITY, 2),
+            result(f64::NAN, 0),
+        ];
+        assert!(!r[1].is_valid() && !r[3].is_valid());
+        assert!(r[0].is_valid() && r[2].is_valid());
+        let s2 = summarize2(&r, 1.0, 5.0);
+        assert_eq!((s2.valid, s2.failed, s2.above), (2, 2, [2, 1]));
+        assert_eq!((s2.max_neg_log10_p, s2.argmax), (9.0, 2));
+        let s = summarize(&r, 5.0);
+        assert_eq!((s.valid, s.failed, s.above), (2, 2, 1));
+        assert_eq!((s.max_neg_log10_p, s.argmax), (9.0, 2));
+        // Only failed results: nothing is valid, the maximum stays 0.
+        let s = summarize(&[result(f64::NAN, 1)], 5.0);
+        assert_eq!(
+            (s.valid, s.failed, s.above, s.max_neg_log10_p),
+            (0, 1, 0, 0.0)
+        );
+        // A result without a valid table (dof 0) is neither valid nor failed.
+        let s = summarize(&[result(0.0, 0)], 5.0);
+        assert_eq!((s.valid, s.failed), (0, 0));
     }
 }
