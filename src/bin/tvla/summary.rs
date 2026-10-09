@@ -196,7 +196,7 @@ pub fn render(input: &SummaryInput<'_>) -> String {
     let mut lines = vec!["Summary".to_string()];
     if let Some(seed) = input.shuffle_seed {
         lines.push(format!(
-            "  null run: labels were shuffled with the seed {seed}; no leak is expected"
+            "  null run: labels were shuffled with the seed {seed}; few or no exceedances are expected"
         ));
     }
     let orders: Vec<OrderSummary> = input
