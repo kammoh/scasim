@@ -195,16 +195,24 @@ mod merge_serde {
         let acc = one_pass(&t, &l);
         let mut v = serde_json::to_value(&acc).unwrap();
         v["class_counts"][0] = serde_json::json!(1);
-        let bad: HistAccumulator = serde_json::from_value(v).unwrap();
-        assert!(matches!(bad.validate(), Err(StatsError::InvalidState(_))));
+        let err = serde_json::from_value::<HistAccumulator>(v).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid accumulator state"),
+            "{err}"
+        );
     }
 
     #[test]
     fn counter_overflow_is_an_error_not_a_wraparound() {
         let (t, l) = data(5);
         let acc = one_pass(&t, &l);
+        // A valid state in which class 0 holds u32::MAX - 1 traces. The traces that the
+        // histograms do not hold are accounted for as rejected values (one per sample).
         let mut v = serde_json::to_value(&acc).unwrap();
-        v["class_counts"][0] = serde_json::json!(u64::from(u32::MAX) - 1);
+        let n0 = acc.class_count(acc.labels()[0]);
+        let near_max = u64::from(u32::MAX) - 1;
+        v["class_counts"][0] = serde_json::json!(near_max);
+        v["rejected"] = serde_json::json!((near_max - n0) * SAMPLES as u64);
         let mut near_full: HistAccumulator = serde_json::from_value(v).unwrap();
         let label = near_full.labels()[0];
         let before = near_full.class_count(label);
@@ -625,7 +633,7 @@ mod validation {
     //! `validate` rejects inconsistent states, and no accessor panics on them (ruling A14).
 
     use ndarray::{Array1, Array2};
-    use scasim::stats::{Binning, HistAccumulator, StatsError, TestOptions};
+    use scasim::stats::{Binning, HistAccumulator};
     use serde_json::{Value, json};
 
     /// Three classes, four samples; values 0..8 so that the histograms are dense. Sample 3
@@ -646,16 +654,24 @@ mod validation {
         acc
     }
 
-    fn corrupt(acc: &HistAccumulator, edit: impl FnOnce(&mut Value)) -> HistAccumulator {
+    /// Edits the JSON form of a valid accumulator and loads it. Deserialization validates, so a
+    /// malformed state is an error here (and never an accumulator).
+    fn corrupt(
+        acc: &HistAccumulator,
+        edit: impl FnOnce(&mut Value),
+    ) -> Result<HistAccumulator, serde_json::Error> {
         let mut v = serde_json::to_value(acc).unwrap();
         edit(&mut v);
-        serde_json::from_value(v).unwrap()
+        serde_json::from_value(v)
     }
 
-    fn assert_invalid(acc: &HistAccumulator, what: &str) {
-        match acc.validate() {
-            Err(StatsError::InvalidState(msg)) => eprintln!("{what}: {msg}"),
-            other => panic!("{what}: expected InvalidState, got {other:?}"),
+    fn assert_invalid(result: Result<HistAccumulator, serde_json::Error>, what: &str) {
+        match result {
+            Err(e) if e.to_string().contains("invalid accumulator state") => {
+                eprintln!("{what}: {e}")
+            }
+            Err(e) => panic!("{what}: wrong error: {e}"),
+            Ok(_) => panic!("{what}: a malformed state was accepted"),
         }
     }
 
@@ -663,13 +679,13 @@ mod validation {
     fn dense_slot_count_must_equal_the_label_count() {
         let acc = accumulator(8);
         let bad = corrupt(&acc, |v| v["hists"][0]["Dense"]["slots"] = json!(2));
-        assert_invalid(&bad, "fewer slots than labels");
+        assert_invalid(bad, "fewer slots than labels");
         let bad = corrupt(&acc, |v| v["hists"][0]["Dense"]["slots"] = json!(4));
-        assert_invalid(&bad, "more slots than labels");
+        assert_invalid(bad, "more slots than labels");
     }
 
     #[test]
-    fn a_state_with_too_few_slots_gives_an_error_not_a_panic() {
+    fn a_state_with_too_few_class_rows_does_not_load() {
         let acc = accumulator(8);
         let bad = corrupt(&acc, |v| {
             // Drop a class row from sample 0: slots 2, counts for two rows.
@@ -679,16 +695,7 @@ mod validation {
             let counts: Vec<Value> = d["counts"].as_array().unwrap()[..2 * width].to_vec();
             d["counts"] = Value::Array(counts);
         });
-        assert_invalid(&bad, "too few slots");
-        let opts = TestOptions::default();
-        assert!(matches!(
-            bad.test_all(&opts),
-            Err(StatsError::InvalidState(_))
-        ));
-        assert!(matches!(
-            bad.test_pair(2, 9, &opts),
-            Err(StatsError::InvalidState(_))
-        ));
+        assert_invalid(bad, "too few slots");
     }
 
     #[test]
@@ -698,12 +705,12 @@ mod validation {
             let bad = corrupt(&acc, |v| {
                 v["hists"].as_array_mut().unwrap().pop();
             });
-            assert_invalid(&bad, "missing histogram");
+            assert_invalid(bad, "missing histogram");
             let bad = corrupt(&acc, |v| {
                 let extra = v["hists"][0].clone();
                 v["hists"].as_array_mut().unwrap().push(extra);
             });
-            assert_invalid(&bad, "extra histogram");
+            assert_invalid(bad, "extra histogram");
         }
     }
 
@@ -711,11 +718,27 @@ mod validation {
     fn labels_must_be_increasing() {
         let acc = accumulator(8);
         let bad = corrupt(&acc, |v| v["labels"] = json!([5, 2, 9]));
-        assert_invalid(&bad, "unsorted labels");
+        assert_invalid(bad, "unsorted labels");
         let bad = corrupt(&acc, |v| v["labels"] = json!([2, 5, 5]));
-        assert_invalid(&bad, "duplicate labels");
+        assert_invalid(bad, "duplicate labels");
         let bad = corrupt(&acc, |v| v["labels"] = json!([2, 5]));
-        assert_invalid(&bad, "labels and counts differ in length");
+        assert_invalid(bad, "labels and counts differ in length");
+    }
+
+    /// The case of the review: `labels = [0]` and `class_counts = []` must not load, because
+    /// `class_count(0)` would index the empty vector.
+    #[test]
+    fn labels_without_counts_do_not_load() {
+        let empty = HistAccumulator::new(2, Binning::Exact);
+        let bad = corrupt(&empty, |v| v["labels"] = json!([0]));
+        assert_invalid(bad, "label without a count");
+        // The case of the review for the window: no classes, a huge dense window.
+        let bad = corrupt(&empty, |v| {
+            v["max_dense_bins"] = json!(u64::MAX);
+            v["hists"][0] =
+                json!({"Dense": {"base": i64::MIN, "width": u64::MAX, "slots": 0, "counts": []}});
+        });
+        assert_invalid(bad, "huge empty window");
     }
 
     #[test]
@@ -724,13 +747,13 @@ mod validation {
             let acc = accumulator(max_dense);
             // A class total that is lower than the counts in the histograms.
             let bad = corrupt(&acc, |v| v["class_counts"][1] = json!(3));
-            assert_invalid(&bad, "class count too low");
+            assert_invalid(bad, "class count too low");
             // A class total that is higher: the missing values are not explained by `rejected`.
             let bad = corrupt(&acc, |v| v["class_counts"][1] = json!(11));
-            assert_invalid(&bad, "class count too high");
+            assert_invalid(bad, "class count too high");
             // A wrong rejected counter.
             let bad = corrupt(&acc, |v| v["rejected"] = json!(1));
-            assert_invalid(&bad, "rejected counter");
+            assert_invalid(bad, "rejected counter");
         }
     }
 
@@ -756,7 +779,7 @@ mod validation {
             let last = v["hists"][3]["Sparse"].as_array().unwrap().len() - 1;
             v["hists"][3]["Sparse"][last][1] = json!(3);
         });
-        assert_invalid(&bad, "unknown class slot");
+        assert_invalid(bad, "unknown class slot");
     }
 
     #[test]
@@ -778,11 +801,11 @@ mod validation {
     fn dense_windows_are_checked() {
         let acc = accumulator(8);
         let bad = corrupt(&acc, |v| v["hists"][0]["Dense"]["width"] = json!(9));
-        assert_invalid(&bad, "counts do not match the window");
+        assert_invalid(bad, "counts do not match the window");
         let bad = corrupt(&acc, |v| v["hists"][0]["Dense"]["width"] = json!(u64::MAX));
-        assert_invalid(&bad, "huge width");
+        assert_invalid(bad, "huge width");
         let bad = corrupt(&acc, |v| v["hists"][0]["Dense"]["base"] = json!(i64::MAX));
-        assert_invalid(&bad, "window past the largest bin");
+        assert_invalid(bad, "window past the largest bin");
     }
 
     #[test]
@@ -791,7 +814,7 @@ mod validation {
         let bad = corrupt(&acc, |v| {
             v["binning"] = json!({"Fixed": {"origin": 0.0, "width": 0.0}});
         });
-        assert_invalid(&bad, "zero bin width");
+        assert_invalid(bad, "zero bin width");
     }
 
     #[test]

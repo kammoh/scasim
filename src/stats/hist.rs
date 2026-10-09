@@ -53,10 +53,10 @@
 //!
 //! # Saved state
 //!
-//! The type implements `Serialize` and `Deserialize`. Deserialization checks only the format.
-//! Call [`HistAccumulator::validate`] after loading data that you do not trust. The methods that
-//! read the histograms return [`StatsError::InvalidState`] (they do not panic) if a layout does
-//! not fit the labels.
+//! The type implements `Serialize` and `Deserialize`. Deserialization calls
+//! [`HistAccumulator::validate`], so a malformed saved state is an error and never an
+//! accumulator: no method can receive an inconsistent state. (`validate` stays public for
+//! states that you build in another way.)
 //!
 //! Call [`HistAccumulator::compact`] before saving. The window of a dense histogram depends on
 //! the order in which the values arrived. After `compact`, it is exactly the occupied range. A
@@ -76,6 +76,13 @@ use super::error::StatsError;
 
 /// Default limit on the number of bins in a dense window.
 pub const DEFAULT_MAX_DENSE_BINS: usize = 4096;
+
+/// Largest value of `max_dense_bins`. A larger limit is lowered to this value.
+pub const MAX_DENSE_BINS_LIMIT: usize = 1 << 20;
+
+/// Largest number of counters (`slots * width`) of one dense histogram: 2^28 counters, 1 GiB.
+/// A histogram that would need more becomes sparse.
+pub const MAX_DENSE_COUNTERS: usize = 1 << 28;
 
 /// Smallest window allocated for a dense histogram.
 const MIN_DENSE_WIDTH: usize = 8;
@@ -163,14 +170,28 @@ impl SampleHist {
         })
     }
 
-    /// Makes room for `slots` class rows at the end.
+    /// Makes room for `slots` class rows at the end. A dense histogram that would need more than
+    /// `MAX_DENSE_COUNTERS` counters becomes sparse.
     fn ensure_slots(&mut self, slots: usize) {
         if let Self::Dense(d) = self
             && d.slots < slots
         {
-            d.counts.resize(slots * d.width, 0);
-            d.slots = slots;
+            if slots.saturating_mul(d.width) > MAX_DENSE_COUNTERS {
+                self.make_sparse();
+            } else {
+                d.counts.resize(slots * d.width, 0);
+                d.slots = slots;
+            }
         }
+    }
+
+    /// Converts a dense histogram into a sparse one with the same counts.
+    fn make_sparse(&mut self) {
+        let mut sparse = Sparse::default();
+        self.for_each_nonzero(|s, b, c| {
+            sparse.map.insert((b, s as u16), c);
+        });
+        *self = Self::Sparse(sparse);
     }
 
     /// Moves the class rows to their new slots. `old_to_new[i]` is the new slot of the old slot
@@ -236,12 +257,13 @@ impl SampleHist {
                 let occupied = d.occupied();
                 let (lo, hi) = occupied.map_or((bin, bin), |(a, b)| (a.min(bin), b.max(bin)));
                 let span = i128::from(hi) - i128::from(lo) + 1;
-                if span > max_dense as i128 {
-                    let mut sparse = Sparse::default();
-                    self.for_each_nonzero(|s, b, c| {
-                        sparse.map.insert((b, s as u16), c);
-                    });
-                    *self = Self::Sparse(sparse);
+                // The window must not be wider than the limit, and must not need too many counters.
+                let too_big = span > max_dense as i128
+                    || d.slots
+                        .saturating_mul(Dense::width_for(span as usize, max_dense))
+                        > MAX_DENSE_COUNTERS;
+                if too_big {
+                    self.make_sparse();
                     self.add_count(slot, bin, count, max_dense);
                 } else {
                     d.relayout(occupied, lo, hi, max_dense);
@@ -347,8 +369,15 @@ impl SampleHist {
                 if d.slots != labels {
                     return Err(format!("{} class rows for {labels} labels", d.slots));
                 }
-                if d.slots.checked_mul(d.width) != Some(d.counts.len()) {
-                    return Err("the counters do not fit the window".into());
+                match d.slots.checked_mul(d.width) {
+                    Some(n) if n == d.counts.len() && n <= MAX_DENSE_COUNTERS => {}
+                    _ => return Err("the counters do not fit the window".into()),
+                }
+                if d.width == 0 && d.base != 0 {
+                    return Err("an empty window has a base".into());
+                }
+                if d.slots == 0 && d.width != 0 {
+                    return Err("a window without class rows has columns".into());
                 }
                 if d.width > max_dense {
                     return Err(format!(
@@ -457,17 +486,22 @@ impl Dense {
         (first != usize::MAX).then(|| (self.base + first as i64, self.base + last as i64))
     }
 
+    /// Width of a window for a span of `span` bins: the next power of two (at least
+    /// `MIN_DENSE_WIDTH`, at most `max_dense`, and at least the span).
+    fn width_for(span: usize, max_dense: usize) -> usize {
+        span.next_power_of_two()
+            .max(MIN_DENSE_WIDTH)
+            .min(max_dense)
+            .max(span)
+    }
+
     /// Re-lays out the window so that it covers `[lo, hi]`, which contains the `occupied` range.
     /// The width is the next power of two (at least `MIN_DENSE_WIDTH`, at most `max_dense`, and
     /// at least the span). The spare space is split evenly below and above, so repeated
     /// extensions in either direction need only a logarithmic number of re-layouts.
     fn relayout(&mut self, occupied: Option<(i64, i64)>, lo: i64, hi: i64, max_dense: usize) {
         let span = (i128::from(hi) - i128::from(lo) + 1) as usize;
-        let new_width = span
-            .next_power_of_two()
-            .max(MIN_DENSE_WIDTH)
-            .min(max_dense)
-            .max(span);
+        let new_width = Self::width_for(span, max_dense);
         let base = i128::from(lo) - ((new_width - span) / 2) as i128;
         let base = base.clamp(
             i128::from(i64::MIN),
@@ -506,6 +540,7 @@ struct LabelPlan {
 /// The type implements `Serialize` and `Deserialize`; call [`compact`](Self::compact) before
 /// saving to drop unused window space, and [`validate`](Self::validate) after loading.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(try_from = "HistAccumulatorRaw")]
 pub struct HistAccumulator {
     binning: Binning,
     max_dense_bins: usize,
@@ -519,6 +554,37 @@ pub struct HistAccumulator {
     hists: Vec<SampleHist>,
 }
 
+/// The fields of [`HistAccumulator`] as they are saved. Deserialization reads this type and then
+/// calls [`HistAccumulator::validate`], so a malformed state is an error, never an accumulator.
+#[derive(Deserialize)]
+struct HistAccumulatorRaw {
+    binning: Binning,
+    max_dense_bins: usize,
+    n_samples: usize,
+    labels: Vec<u16>,
+    class_counts: Vec<u64>,
+    rejected: u64,
+    hists: Vec<SampleHist>,
+}
+
+impl TryFrom<HistAccumulatorRaw> for HistAccumulator {
+    type Error = StatsError;
+
+    fn try_from(raw: HistAccumulatorRaw) -> Result<Self, StatsError> {
+        let acc = Self {
+            binning: raw.binning,
+            max_dense_bins: raw.max_dense_bins,
+            n_samples: raw.n_samples,
+            labels: raw.labels,
+            class_counts: raw.class_counts,
+            rejected: raw.rejected,
+            hists: raw.hists,
+        };
+        acc.validate()?;
+        Ok(acc)
+    }
+}
+
 impl HistAccumulator {
     /// Creates an empty accumulator for traces with `n_samples` samples.
     pub fn new(n_samples: usize, binning: Binning) -> Self {
@@ -527,11 +593,13 @@ impl HistAccumulator {
 
     /// Like [`new`](Self::new), with a custom limit for the width of a dense window. A histogram
     /// whose value range exceeds the limit becomes sparse. A limit of 0 makes all histograms
-    /// sparse.
+    /// sparse. A limit above [`MAX_DENSE_BINS_LIMIT`] is lowered to it. A histogram also becomes
+    /// sparse if its dense layout would need more than [`MAX_DENSE_COUNTERS`] counters (many
+    /// classes with a wide window).
     pub fn with_max_dense_bins(n_samples: usize, binning: Binning, max_dense_bins: usize) -> Self {
         Self {
             binning,
-            max_dense_bins,
+            max_dense_bins: max_dense_bins.min(MAX_DENSE_BINS_LIMIT),
             n_samples,
             labels: Vec::new(),
             class_counts: Vec::new(),
@@ -779,17 +847,25 @@ impl HistAccumulator {
     ///
     /// The checks are:
     ///
-    /// * the binning is valid, and `labels` and `class_counts` have the same length;
+    /// * the binning is valid, `max_dense_bins` is at most [`MAX_DENSE_BINS_LIMIT`], and
+    ///   `labels` and `class_counts` have the same length;
     /// * the labels are in strictly increasing order, and no class count is above `u32::MAX`;
     /// * the number of histograms equals the number of samples;
     /// * every dense histogram has one row per label, counters that fit its window, and a
-    ///   window that is not wider than the limit;
+    ///   window that is not wider than `max_dense_bins` and has at most [`MAX_DENSE_COUNTERS`]
+    ///   counters; a window without class rows (or without columns) is empty, with base 0;
     /// * every sparse entry belongs to a known class;
     /// * the bins are in the range of the binning rule;
     /// * the totals are consistent: for each sample and class, the bins hold at most as many
     ///   counts as the class has traces, and the missing counts of all samples add up to
     ///   [`rejected`](Self::rejected).
     pub fn validate(&self) -> Result<(), StatsError> {
+        if self.max_dense_bins > MAX_DENSE_BINS_LIMIT {
+            return invalid(format!(
+                "max_dense_bins {} is above the limit {MAX_DENSE_BINS_LIMIT}",
+                self.max_dense_bins
+            ));
+        }
         if let Binning::Fixed { origin, width } = self.binning
             && !(width.is_finite() && width > 0.0 && origin.is_finite())
         {
@@ -1102,5 +1178,242 @@ mod tests {
         assert_eq!(plan.old_to_new, vec![1, 2]);
         let err = acc.plan_labels(&[(8, u64::from(u32::MAX))]).unwrap_err();
         assert_eq!(err, StatsError::CountOverflow { label: 8 });
+    }
+
+    // ---- Fix round 1, items 4 and 5: malformed states ------------------------------------
+
+    /// A valid accumulator with 3 classes and 4 samples: samples 0 to 2 are dense, sample 3 is
+    /// sparse (`max_dense_bins` is 8).
+    fn valid_accumulator() -> HistAccumulator {
+        let n = 30;
+        let traces = Array2::from_shape_fn((n, 4), |(i, s)| {
+            if s == 3 {
+                (i * 40) as u16
+            } else {
+                ((i * (s + 1)) % 8) as u16
+            }
+        });
+        let labels = Array1::from_iter((0..n).map(|i| [2_u16, 5, 9][i % 3]));
+        let mut acc = HistAccumulator::with_max_dense_bins(4, Binning::Exact, 8);
+        acc.update(traces.view(), labels.view()).unwrap();
+        acc.validate().unwrap();
+        assert!(!acc.is_sparse(0) && acc.is_sparse(3));
+        acc
+    }
+
+    fn dense_mut(acc: &mut HistAccumulator, sample: usize) -> &mut Dense {
+        match &mut acc.hists[sample] {
+            SampleHist::Dense(d) => d,
+            SampleHist::Sparse(_) => panic!("sample {sample} is sparse"),
+        }
+    }
+
+    /// Every field that a method relies on, damaged one at a time.
+    fn damaged_states() -> Vec<(&'static str, HistAccumulator)> {
+        let mut out = Vec::new();
+        let mut add = |name: &'static str, edit: &dyn Fn(&mut HistAccumulator)| {
+            let mut acc = valid_accumulator();
+            edit(&mut acc);
+            out.push((name, acc));
+        };
+        add("labels not increasing", &|a| a.labels = vec![5, 2, 9]);
+        add("duplicate labels", &|a| a.labels = vec![2, 5, 5]);
+        add("labels longer than class_counts", &|a| {
+            a.class_counts.pop().map(|_| ()).unwrap_or(())
+        });
+        add("labels and class_counts empty-mismatch", &|a| {
+            a.labels = vec![0];
+            a.class_counts = vec![];
+            a.hists = (0..4).map(|_| SampleHist::empty()).collect();
+        });
+        add("class count above u32::MAX", &|a| {
+            a.class_counts[1] = u64::from(u32::MAX) + 1
+        });
+        add("class count too low", &|a| a.class_counts[1] = 3);
+        add("class count too high", &|a| a.class_counts[1] = 11);
+        add("wrong rejected counter", &|a| a.rejected = 1);
+        add("n_samples too large", &|a| a.n_samples = 5);
+        add("missing histogram", &|a| {
+            a.hists.pop();
+        });
+        add("dense slots too few", &|a| dense_mut(a, 0).slots = 2);
+        add("dense slots too many", &|a| dense_mut(a, 0).slots = 4);
+        add("dense counters do not fit the window", &|a| {
+            dense_mut(a, 0).width = 9
+        });
+        add("dense window wider than the limit", &|a| {
+            a.max_dense_bins = 4
+        });
+        add("dense window past the largest bin", &|a| {
+            dense_mut(a, 0).base = i64::MAX
+        });
+        add("max_dense_bins above the limit", &|a| {
+            a.max_dense_bins = MAX_DENSE_BINS_LIMIT + 1
+        });
+        add("sparse entry with an unknown class", &|a| {
+            let SampleHist::Sparse(sp) = &mut a.hists[3] else {
+                unreachable!()
+            };
+            sp.map.insert((i64::MAX, 3), 1);
+        });
+        add("fixed binning with zero width", &|a| {
+            a.binning = Binning::Fixed {
+                origin: 0.0,
+                width: 0.0,
+            };
+        });
+        add("fixed binning with a bin out of range", &|a| {
+            a.binning = Binning::Fixed {
+                origin: 0.0,
+                width: 1.0,
+            };
+            let SampleHist::Sparse(sp) = &mut a.hists[3] else {
+                unreachable!()
+            };
+            sp.map.insert((1 << 53, 0), 1);
+            a.class_counts[0] += 1;
+        });
+        out
+    }
+
+    /// The case of the review: no classes, one dense histogram with a huge window.
+    fn empty_with_a_huge_window() -> HistAccumulator {
+        let mut acc = HistAccumulator::new(1, Binning::Exact);
+        acc.max_dense_bins = usize::MAX;
+        acc.hists[0] = SampleHist::Dense(Dense {
+            base: i64::MIN,
+            width: usize::MAX,
+            slots: 0,
+            counts: Vec::new(),
+        });
+        acc
+    }
+
+    #[test]
+    fn a_damaged_state_fails_validate_and_both_deserializers() {
+        let mut damaged = damaged_states();
+        damaged.push(("empty with a huge window", empty_with_a_huge_window()));
+        let mut dense_empty = valid_accumulator();
+        dense_empty.labels.clear();
+        dense_empty.class_counts.clear();
+        dense_empty.hists = (0..4).map(|_| SampleHist::empty()).collect();
+        dense_empty.rejected = 0;
+        dense_empty.validate().unwrap();
+        for (name, acc) in &damaged {
+            assert!(
+                matches!(acc.validate(), Err(StatsError::InvalidState(_))),
+                "{name}: validate"
+            );
+            let json = serde_json::to_string(acc).unwrap();
+            assert!(
+                serde_json::from_str::<HistAccumulator>(&json).is_err(),
+                "{name}: JSON"
+            );
+            let bytes = postcard::to_stdvec(acc).unwrap();
+            assert!(
+                postcard::from_bytes::<HistAccumulator>(&bytes).is_err(),
+                "{name}: postcard"
+            );
+        }
+        // A valid state still round-trips in both formats.
+        let acc = valid_accumulator();
+        let json = serde_json::to_string(&acc).unwrap();
+        serde_json::from_str::<HistAccumulator>(&json)
+            .unwrap()
+            .validate()
+            .unwrap();
+        let bytes = postcard::to_stdvec(&acc).unwrap();
+        postcard::from_bytes::<HistAccumulator>(&bytes)
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+
+    /// An empty window must have no classes, no base, and no counters. Then adding the first
+    /// class cannot try to allocate `usize::MAX` counters.
+    #[test]
+    fn an_empty_window_must_be_empty() {
+        let mut acc = HistAccumulator::new(1, Binning::Exact);
+        acc.max_dense_bins = MAX_DENSE_BINS_LIMIT;
+        for (base, width) in [(i64::MIN, 0), (7, 0), (0, 16), (0, usize::MAX)] {
+            acc.hists[0] = SampleHist::Dense(Dense {
+                base,
+                width,
+                slots: 0,
+                counts: Vec::new(),
+            });
+            assert!(acc.validate().is_err(), "base {base}, width {width}");
+        }
+    }
+
+    #[test]
+    fn the_dense_window_limit_is_capped() {
+        let acc = HistAccumulator::with_max_dense_bins(1, Binning::Exact, usize::MAX);
+        assert_eq!(acc.max_dense_bins, MAX_DENSE_BINS_LIMIT);
+        let traces = Array2::from_shape_vec((2, 1), vec![i64::MIN, i64::MAX]).unwrap();
+        let mut acc = acc;
+        acc.update(traces.view(), Array1::from(vec![0_u16, 1]).view())
+            .unwrap();
+        assert!(acc.is_sparse(0));
+        acc.validate().unwrap();
+    }
+
+    /// With many classes, a wide window needs too many counters. The histogram becomes sparse
+    /// before it allocates them (`slots * width` above `MAX_DENSE_COUNTERS`).
+    #[test]
+    fn many_classes_with_a_wide_window_go_sparse() {
+        let classes = MAX_DENSE_COUNTERS / MAX_DENSE_BINS_LIMIT + 1; // 257
+        let mut acc = HistAccumulator::with_max_dense_bins(1, Binning::Exact, MAX_DENSE_BINS_LIMIT);
+        let n = classes + 1;
+        let values: Vec<i64> = (0..n)
+            .map(|i| {
+                if i == 0 {
+                    0
+                } else if i == 1 {
+                    (MAX_DENSE_BINS_LIMIT - 1) as i64
+                } else {
+                    5
+                }
+            })
+            .collect();
+        let labels: Vec<u16> = (0..n).map(|i| i.saturating_sub(1) as u16).collect();
+        let traces = Array2::from_shape_vec((n, 1), values).unwrap();
+        acc.update(traces.view(), Array1::from(labels).view())
+            .unwrap();
+        assert_eq!(acc.labels().len(), classes);
+        assert!(
+            acc.is_sparse(0),
+            "a dense window would need more than 2^28 counters"
+        );
+        acc.validate().unwrap();
+        // The same data in two batches (the second adds the classes to a dense window).
+        let mut acc2 =
+            HistAccumulator::with_max_dense_bins(1, Binning::Exact, MAX_DENSE_BINS_LIMIT);
+        let first =
+            Array2::from_shape_vec((2, 1), vec![0_i64, (MAX_DENSE_BINS_LIMIT - 1) as i64]).unwrap();
+        acc2.update(first.view(), Array1::from(vec![0_u16, 0]).view())
+            .unwrap();
+        assert!(!acc2.is_sparse(0));
+        let rest = Array2::from_elem((classes - 1, 1), 5_i64);
+        let rest_labels = Array1::from_iter((1..classes).map(|c| c as u16));
+        acc2.update(rest.view(), rest_labels.view()).unwrap();
+        assert!(
+            acc2.is_sparse(0),
+            "adding class rows must not allocate 2^28+ counters"
+        );
+        acc2.validate().unwrap();
+    }
+
+    /// If the state of a hand-built accumulator is wrong, a test returns an error. It does not panic.
+    #[test]
+    fn tests_on_a_state_with_too_few_rows_return_an_error() {
+        let mut acc = valid_accumulator();
+        dense_mut(&mut acc, 0).slots = 2;
+        dense_mut(&mut acc, 0).counts.truncate(2 * 8);
+        let opts = TestOptions::default();
+        assert!(matches!(
+            acc.test_all(&opts),
+            Err(StatsError::InvalidState(_))
+        ));
     }
 }
