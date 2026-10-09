@@ -396,13 +396,133 @@ def test_merge_without_a_manifest_says_what_to_do(tmp_path, fake_tvla):
 # -- the command line --------------------------------------------------------------------
 
 
-def test_keep_traces_is_refused_with_a_reason(tmp_path, capsys):
+class _Captured(Exception):
+    pass
+
+
+def parse_run(monkeypatch, tmp_path, *extra):
+    """The RunConfig that `scasim-tvla run` builds from the arguments."""
+    seen = {}
+
+    class Fake:
+        def __init__(self, cfg):
+            seen["cfg"] = cfg
+
+        def execute(self):
+            return runner.RunReport(ok=[], failed={}, report_dir=None)
+
+    monkeypatch.setattr(runner, "Pipeline", Fake)
+    code = cli.main(["run", "--sources", "x.sv", "--toplevel", "t", "--test-module", "m",
+                     "--batches", "1", "--tests-per-batch", "1", "--out", str(tmp_path),
+                     *extra])
+    return code, seen.get("cfg")
+
+
+def test_keep_takes_one_or_more_values(monkeypatch, tmp_path):
+    _, cfg = parse_run(monkeypatch, tmp_path, "--keep", "traces")
+    assert cfg.keep == "traces" and cfg.traces_channels == []
+    _, cfg = parse_run(monkeypatch, tmp_path, "--keep", "waveform", "traces",
+                       "--traces-channels", "total", "regex:a.*")
+    assert cfg.keep == "traces+waveform" and cfg.traces_channels == ["total", "regex:a.*"]
+    _, cfg = parse_run(monkeypatch, tmp_path)
+    assert cfg.keep == "none"
+    _, cfg = parse_run(monkeypatch, tmp_path, "--keep", "waveform")
+    assert cfg.keep == "waveform"
+
+
+@pytest.mark.parametrize("extra, reason", [
+    (["--keep", "none", "traces"], "none"),
+    (["--traces-channels", "total"], "--keep traces"),
+    (["--keep", "waveform", "--traces-channels", "total"], "--keep traces"),
+    (["--keep", "traces", "--no-analyze"], "analy"),
+])
+def test_keep_traces_options_that_do_not_fit_are_refused(monkeypatch, tmp_path, capsys, extra, reason):
     with pytest.raises(SystemExit) as exc:
-        cli.main(["run", "--sources", "x.sv", "--toplevel", "t", "--test-module", "m",
-                  "--batches", "1", "--tests-per-batch", "1", "--out", str(tmp_path),
-                  "--keep", "traces"])
+        parse_run(monkeypatch, tmp_path, *extra)
     assert exc.value.code == 2
-    assert "per-batch traces" in capsys.readouterr().err
+    assert reason in capsys.readouterr().err
+
+
+def test_the_traces_options_belong_to_the_runner_not_to_tvla():
+    for name in ("--traces-out", "--traces-channels"):
+        with pytest.raises(_args.ArgsError):
+            _args.partition(["--clock", "top.clk", name, "x"])
+
+
+def traces_of(tmp_path, batch):
+    return tmp_path / "out" / batch / runner.TRACES_NAME
+
+
+def test_keep_traces_writes_the_file_next_to_the_cache_and_drops_the_waveform(tmp_path, fake_tvla):
+    report, _ = run(tmp_path, fake_tvla, keep="traces", traces_channels=["total", "regex:a.*"])
+    out = tmp_path / "out"
+    assert not report.failed
+    for b in report.ok:
+        assert traces_of(tmp_path, b).read_text() == f"traces {b}\n"
+        assert (out / b / "statistics.bin").exists()
+        assert not (out / b / "tvla.fst").exists()
+    stats = calls(fake_tvla, "--stats-out")
+    for a in stats:
+        assert a[a.index("--traces-out") + 1].endswith(runner.TRACES_NAME)
+        i = a.index("--traces-channels")
+        assert a[i + 1 : i + 3] == ["total", "regex:a.*"]
+        assert a.index("--traces-channels") != a.index("--traces-out")
+    assert "--traces-out" not in calls(fake_tvla, "--merge-stats")[0]
+    assert "--traces-channels" not in calls(fake_tvla, "--merge-stats")[0]
+    manifest = json.loads((out / "manifest.json").read_text())
+    rec = manifest["batches"]["b0001"]
+    assert rec["traces"] == f"b0001/{runner.TRACES_NAME}" and rec["traces_bytes"] > 0
+    run_json = json.loads((out / "report" / "run.json").read_text())
+    assert run_json["keep"] == "traces"
+    assert run_json["batches"]["b0001"]["traces_bytes"] == rec["traces_bytes"]
+
+
+def test_keep_traces_and_waveform_keep_both(tmp_path, fake_tvla):
+    report, _ = run(tmp_path, fake_tvla, keep="traces+waveform")
+    out = tmp_path / "out"
+    assert all(traces_of(tmp_path, b).exists() and (out / b / "tvla.fst").exists()
+               for b in report.ok)
+    assert (out / "meta.list").read_text().splitlines() == [f"{b}/meta.json" for b in report.ok]
+    a = calls(fake_tvla, "--stats-out")[0]
+    assert "--traces-channels" not in a  # none were asked for
+
+
+def test_without_keep_traces_tvla_gets_no_traces_options(tmp_path, fake_tvla):
+    report, _ = run(tmp_path, fake_tvla, keep="waveform")
+    assert not any(traces_of(tmp_path, b).exists() for b in report.ok)
+    for a in calls(fake_tvla, "--stats-out"):
+        assert "--traces-out" not in a and "--traces-channels" not in a
+
+
+def test_a_failed_analysis_leaves_no_traces_file(tmp_path, fake_tvla, monkeypatch):
+    monkeypatch.setenv("FAKE_TVLA_FAIL", "b0001")
+    report, _ = run(tmp_path, fake_tvla, keep="traces")
+    assert set(report.failed) == {"b0001"}
+    assert not traces_of(tmp_path, "b0001").exists()
+    assert traces_of(tmp_path, "b0000").exists()
+    assert (tmp_path / "out" / "b0001" / "tvla.fst").exists()  # a failed batch keeps its waveform
+
+
+def test_a_rerun_keeps_the_traces_and_simulates_a_batch_that_lost_its_file(tmp_path, fake_tvla):
+    run(tmp_path, fake_tvla, keep="traces")
+    fake_tvla.log.unlink()
+    _, sim = run(tmp_path, fake_tvla, keep="traces")
+    assert sim.calls == [] and not calls(fake_tvla, "--stats-out")
+    traces_of(tmp_path, "b0002").unlink()
+    _, sim = run(tmp_path, fake_tvla, keep="traces")
+    assert [b for b in sim.calls if b != "probe"] == ["b0002"]
+    assert traces_of(tmp_path, "b0002").exists()
+
+
+def test_switching_keep_traces_on_or_changing_the_channels_runs_all_batches_again(tmp_path, fake_tvla):
+    run(tmp_path, fake_tvla, keep="none")
+    everything = ["b0000", "b0001", "b0002", "b0003"]
+    _, sim = run(tmp_path, fake_tvla, keep="traces")
+    assert sorted(b for b in sim.calls if b != "probe") == everything
+    _, sim = run(tmp_path, fake_tvla, keep="traces", traces_channels=["total"])
+    assert sorted(b for b in sim.calls if b != "probe") == everything
+    _, sim = run(tmp_path, fake_tvla, keep="traces", traces_channels=["total"])
+    assert sim.calls == []
 
 
 def test_collect_and_merge_commands(tmp_path, fake_tvla, capsys):

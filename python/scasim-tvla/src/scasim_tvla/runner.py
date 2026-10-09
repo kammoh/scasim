@@ -34,6 +34,7 @@ from .meta import read_meta
 
 MANIFEST = "manifest.json"
 CACHE_NAME = "statistics.bin"
+TRACES_NAME = "channel-traces.npz"  # not traces.npz: that is the legacy trace cache of tvla
 TRACE_FILE = "tvla.fst"
 TMP_MARK = ".tmp-"
 PLACEHOLDER_WAVEFORM_BYTES = 500_000_000
@@ -333,6 +334,26 @@ class Manifest:
 
 # -- configuration and result -----------------------------------------------------------------
 
+KEEP_VALUES = ("traces", "waveform")
+
+
+def normalize_keep(keep: str | Sequence[str]) -> str:
+    """The canonical form of `--keep`: `none`, `traces`, `waveform`, or `traces+waveform`.
+
+    Accepts one value, a `+` joined string, or a list of values.
+    """
+    values = keep.split("+") if isinstance(keep, str) else [v for k in keep for v in k.split("+")]
+    if "none" in values and len(values) > 1:
+        raise RunnerError("--keep none cannot be combined with other values")
+    unknown = [v for v in values if v not in ("none", *KEEP_VALUES)]
+    if unknown or not values:
+        raise RunnerError(f"--keep {keep!r}: the values are none, traces, and waveform")
+    return "none" if values == ["none"] else "+".join(v for v in KEEP_VALUES if v in values)
+
+
+def keep_set(keep: str) -> set[str]:
+    return set() if keep == "none" else set(keep.split("+"))
+
 
 @dataclass
 class SimSpec:
@@ -356,13 +377,14 @@ class RunConfig:
     tests_per_batch: int
     seed: int | None = None
     jobs: int | None = None
-    keep: str = "none"  # none | waveform
+    keep: str = "none"  # none | traces | waveform | traces+waveform
     analyze: bool = True
     tvla: str | None = None
     tvla_args: list[str] = field(default_factory=list)
     curve: str | None = None
     profile: bool = False
     design_random: str | None = None
+    traces_channels: list[str] = field(default_factory=list)  # for --keep traces; empty is all
     sim: SimSpec = field(default_factory=SimSpec)
 
 
@@ -422,8 +444,11 @@ class Pipeline:
         self.parts = _args.partition(cfg.tvla_args, need_clock=cfg.analyze)
         if cfg.curve is not None:
             _args.check_curve(cfg.curve)
-        if cfg.keep not in ("none", "waveform"):
-            raise RunnerError(f"--keep {cfg.keep!r}: only none and waveform are supported")
+        cfg.keep = normalize_keep(cfg.keep)
+        if "traces" in keep_set(cfg.keep) and not cfg.analyze:
+            raise RunnerError("--keep traces needs the analysis: do not use --no-analyze")
+        if cfg.traces_channels and "traces" not in keep_set(cfg.keep):
+            raise RunnerError("--traces-channels needs --keep traces")
         self.tvla_bin: Path | None = None
         self.build_dir: Path | None = None
         self.build_hash = ""
@@ -441,6 +466,8 @@ class Pipeline:
             "build": self.build_hash, "module": c.sim.test_module, "testcase": c.sim.testcase,
             "preprocess": self.parts.preprocess, "toplevel": c.sim.toplevel,
         }
+        if "traces" in keep_set(c.keep):  # a batch that has no traces file must run again
+            payload["traces"] = list(c.traces_channels)
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
     def prepare(self) -> None:
@@ -482,7 +509,8 @@ class Pipeline:
         for leftover in self.out.glob(f"*{TMP_MARK}*"):
             shutil.rmtree(leftover, ignore_errors=True)
         self.manifest.set_root(seed=self.seed, config=new, tvla_args=list(cfg.tvla_args),
-                               curve=cfg.curve, keep=cfg.keep, tests_per_batch=cfg.tests_per_batch)
+                               curve=cfg.curve, keep=cfg.keep, tests_per_batch=cfg.tests_per_batch,
+                               traces_channels=list(cfg.traces_channels))
 
     def _build(self) -> Path:
         sim = self.cfg.sim
@@ -663,16 +691,25 @@ class Pipeline:
         d = self.batch_dir(batch)
         cache = d / CACHE_NAME
         cache.unlink(missing_ok=True)
+        traces = d / TRACES_NAME
+        traces.unlink(missing_ok=True)
         scratch = d / "tvla-out"
         args = ["--meta-json", str(meta_file(d)), "--stats-out", str(cache),
                 *self.parts.batch, "-d", "1", "--plot=false", "--chi2=false",
                 "--ttest-output-dir", str(scratch)]
+        keep_traces = "traces" in keep_set(self.cfg.keep)
+        if keep_traces:  # tvla writes the file atomically, next to the cache
+            args += ["--traces-out", str(traces)]
+            if self.cfg.traces_channels:
+                args += ["--traces-channels", *self.cfg.traces_channels]
         if not self.parts.group_choice:
             args.append("--pool-groups")
         code, _out, err = self._tvla(args, d / "tvla.log")
         shutil.rmtree(scratch, ignore_errors=True)
-        if code != 0 or not cache.exists() or cache.stat().st_size == 0:
+        if code != 0 or not cache.exists() or cache.stat().st_size == 0 \
+                or (keep_traces and not traces.exists()):
             cache.unlink(missing_ok=True)
+            traces.unlink(missing_ok=True)
             raise RunnerError(f"tvla --stats-out failed (exit {code}): {err.strip()[-400:]}")
 
     # -- the batch loop -----------------------------------------------------------------
@@ -681,13 +718,17 @@ class Pipeline:
         rec = self.manifest.get(batch)
         d = self.batch_dir(batch)
         state = rec.get("state")
-        if state == "cached" and (d / CACHE_NAME).exists():
+        if state == "cached" and (d / CACHE_NAME).exists() \
+                and (not self._keep_traces() or (d / TRACES_NAME).exists()):
             return "skip"
         if state == "simulated" and self.check_batch(batch, SimResult(tests=1)) is None:
             return "analyze" if self.cfg.analyze else "skip"
         if state is None and self._recover and self.check_batch(batch, SimResult(tests=1)) is None:
             return "recover"  # finished and promoted, but the run stopped before the manifest
         return "simulate"
+
+    def _keep_traces(self) -> bool:
+        return "traces" in keep_set(self.cfg.keep)
 
     def _free_disk_ok(self) -> bool:
         if self.largest_waveform <= 0:
@@ -738,12 +779,16 @@ class Pipeline:
             self._fail(batch, str(exc))
             return
         d = self.batch_dir(batch)
-        self.manifest.set(batch, state="cached", cache=f"{batch}/{CACHE_NAME}",
-                          cache_bytes=(d / CACHE_NAME).stat().st_size)
+        fields: dict[str, Any] = {"cache": f"{batch}/{CACHE_NAME}",
+                                  "cache_bytes": (d / CACHE_NAME).stat().st_size}
+        if self._keep_traces():
+            fields.update(traces=f"{batch}/{TRACES_NAME}",
+                          traces_bytes=(d / TRACES_NAME).stat().st_size)
+        self.manifest.set(batch, state="cached", **fields)
         self._drop_waveform(batch)
 
     def _drop_waveform(self, batch: str) -> None:
-        if self.cfg.keep == "none":
+        if "waveform" not in keep_set(self.cfg.keep):
             (self.batch_dir(batch) / TRACE_FILE).unlink(missing_ok=True)
 
     def run_batches(self) -> None:
@@ -848,8 +893,8 @@ class Pipeline:
         batches = self.manifest.batches()
         data: dict[str, Any] = {
             "seed": self.seed, "jobs": self.jobs, "keep": self.cfg.keep, "merge_command": command,
-            "batches": {b: {k: r.get(k) for k in ("state", "seed", "cache_bytes", "waveform_bytes",
-                                                    "error") if k in r}
+            "batches": {b: {k: r.get(k) for k in ("state", "seed", "cache_bytes", "traces_bytes",
+                                                    "waveform_bytes", "error") if k in r}
                         for b, r in batches.items()},
         }
         if self.cfg.profile:
@@ -922,7 +967,8 @@ def merge_dir(root: Path, tvla: str | None = None, tvla_args: Sequence[str] | No
     args = list(tvla_args) if tvla_args is not None else list(manifest.data.get("tvla_args", []))
     curve = curve if curve is not None else manifest.data.get("curve")
     cfg = RunConfig(out=root, batches=0, tests_per_batch=0, tvla=tvla, tvla_args=args, curve=curve,
-                    keep=manifest.data.get("keep", "waveform"))
+                    keep=manifest.data.get("keep", "waveform"),
+                    traces_channels=list(manifest.data.get("traces_channels", [])))
     pipe = Pipeline(cfg, simulate=lambda *_: SimResult())
     pipe.tvla_bin = find_tvla(tvla)
     pipe.manifest = manifest

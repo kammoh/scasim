@@ -28,6 +28,8 @@ elif "--stats-out" in argv:
     meta = json.loads(Path(value("--meta-json")).read_text())
     batch = meta["batch"]["id"]
     time.sleep(float(os.environ.get("FAKE_TVLA_SLEEP", "0")))
+    if "--traces-out" in argv:  # like tvla: the traces file comes before the cache
+        Path(value("--traces-out")).write_text(f"traces {batch}\n")
     if batch in os.environ.get("FAKE_TVLA_FAIL", "").split(","):
         print("boom", file=sys.stderr)
         sys.exit(3)

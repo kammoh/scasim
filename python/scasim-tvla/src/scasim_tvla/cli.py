@@ -48,8 +48,14 @@ def _parser() -> argparse.ArgumentParser:
     r.add_argument("--trace-depth", type=int, metavar="D",
                    help="Verilator --trace-depth (it does not select the DUT scope reliably)")
     r.add_argument("--design-random", choices=("on", "off"))
-    r.add_argument("--keep", choices=("none", "traces", "waveform"), default="none",
-                   help="what stays per batch (default none: only the statistics cache)")
+    r.add_argument("--keep", nargs="+", choices=("none", "traces", "waveform"), default=["none"],
+                   metavar="WHAT",
+                   help="what stays per batch besides the statistics cache: none (default), "
+                   "traces (the per-channel traces, channel-traces.npz), waveform, or traces and "
+                   "waveform together (--keep traces waveform)")
+    r.add_argument("--traces-channels", nargs="+", default=[], metavar="SPEC",
+                   help="with --keep traces: write only these channels (names, or regex:PATTERN); "
+                   "default all")
     r.add_argument("--no-analyze", action="store_true", help="only simulate; keep the waveforms")
     r.add_argument("--curve", metavar="every|every:K|final", help="passed to tvla --merge-stats")
     r.add_argument("--profile", action="store_true",
@@ -97,17 +103,21 @@ def _finish(report: runner.RunReport) -> int:
 
 
 def _run(ns: argparse.Namespace, tvla_args: list[str], parser: argparse.ArgumentParser) -> int:
-    if ns.keep == "traces":
-        parser.error(
-            "--keep traces is not supported: tvla cannot write per-batch traces for scasim_meta "
-            "version 1 yet. Use --keep waveform and run tvla on the waveforms"
-        )
+    try:
+        keep = runner.normalize_keep(ns.keep)
+    except runner.RunnerError as exc:
+        parser.error(str(exc))
+    if "traces" in runner.keep_set(keep) and ns.no_analyze:
+        parser.error("--keep traces needs the analysis: do not use --no-analyze")
+    if ns.traces_channels and "traces" not in runner.keep_set(keep):
+        parser.error("--traces-channels needs --keep traces")
     if ns.batches < 1 or ns.tests_per_batch < 1:
         parser.error("--batches and --tests-per-batch must be at least 1")
     cfg = runner.RunConfig(
         out=ns.out, batches=ns.batches, tests_per_batch=ns.tests_per_batch, seed=ns.seed,
-        jobs=ns.jobs, keep=ns.keep, analyze=not ns.no_analyze, tvla=ns.tvla, tvla_args=tvla_args,
+        jobs=ns.jobs, keep=keep, analyze=not ns.no_analyze, tvla=ns.tvla, tvla_args=tvla_args,
         curve=ns.curve, profile=ns.profile, design_random=ns.design_random,
+        traces_channels=ns.traces_channels,
         sim=runner.SimSpec(
             sources=ns.sources, toplevel=ns.toplevel, test_module=ns.test_module,
             testcase=ns.testcase, build_args=ns.build_arg, trace_scopes=ns.trace_scope,

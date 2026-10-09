@@ -9,7 +9,9 @@ The runner calls `tvla` in three ways, and each call accepts different options:
   preprocessing options there, because the caches already fix them.
 
 The runner owns `--curve`, `--ttest-output-dir`, `--meta-json`, `--meta-list`, `--stats-out`,
-`--merge-stats`, and `--list-signals`. The user must not pass them after `--`.
+`--merge-stats`, `--list-signals`, `--traces-out`, and `--traces-channels` (the runner sets the
+two `--traces-` options from its own `--keep traces` and `--traces-channels`). The user must not
+pass them after `--`.
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ _MERGE = {
 _DROP = {"--use-existing": "optional"}
 _OWNED = {
     "--curve", "--ttest-output-dir", "--meta-json", "--meta-list", "--stats-out",
-    "--merge-stats", "--list-signals",
+    "--merge-stats", "--list-signals", "--traces-out", "--traces-channels",
 }
 
 _CURVE = re.compile(r"^(every|final|every:[1-9][0-9]*)$")

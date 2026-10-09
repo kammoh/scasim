@@ -112,10 +112,19 @@ path; `--pythonpath DIR` adds more). The arguments after `--` go to `tvla`.
   `results.xml` and the metadata, not the exit code. The seed of a batch comes from `--seed` and
   the batch id, so a retry or a different `--jobs` gives the same data.
 - **Pipeline.** A committed batch goes to `tvla --stats-out`, which writes `statistics.bin`. Then the
-  waveform is deleted (`--keep none`, the default). `--keep waveform` keeps it. `--keep traces` is
-  not supported: `tvla` cannot write per-batch traces for metadata version 1.
+  waveform is deleted (`--keep none`, the default). `--keep waveform` keeps it.
   Simulation pauses when `--jobs` finished waveforms wait for analysis, so the disk holds at most
   `2 x jobs` waveforms. The default `--jobs` comes from the cores, the RAM, and the free disk.
+- **Kept traces.** `--keep traces` also writes the exact per-channel traces of each batch to
+  `OUT/bNNNN/channel-traces.npz`, next to `statistics.bin` (`tvla --traces-out`; `tvla` writes the file
+  atomically). It stays when the waveform is deleted, and the manifest records its path and size
+  (`traces`, `traces_bytes`). `--traces-channels SPEC...` writes only some channels (exact names or
+  `regex:PATTERN`; default all). `--keep` takes several values: `--keep traces waveform` keeps both.
+  `none` cannot be combined with another value, and `--keep traces` needs the analysis (not
+  `--no-analyze`). Changing `--keep traces` or `--traces-channels` makes all batches run again,
+  because a deleted waveform cannot give the missing files. See the README of the repository root
+  for the file format (`t_<i>` as `u32`, `labels`, `groups`, `segment_ids`, `meta.json`). The file name
+  is not `traces.npz`, because `tvla` uses that name for its legacy trace cache.
 - **Failures.** A failed batch keeps its waveform and a `diagnostic.txt`. It is left out of the merge.
   The command exits with 1 after it merges the other batches.
 - **Reruns.** `OUT/manifest.json` records the state of each batch (`simulated`, `cached`, `failed`).

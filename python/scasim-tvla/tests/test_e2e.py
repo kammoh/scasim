@@ -15,7 +15,7 @@ from unittest import mock
 
 import pytest
 
-from npz_util import flagged, members, read_f64
+from npz_util import flagged, members, read_array, read_f64
 from scasim_tvla import cli, runner
 
 E2E = Path(__file__).parent / "e2e"
@@ -49,7 +49,7 @@ class Runs:
                 "--test-module", "tb_leaky", "--testcase", "leak_test",
                 "--pythonpath", str(E2E), "--batches", str(batches),
                 "--tests-per-batch", str(tests), "--out", str(out), "--seed", str(seed),
-                "--jobs", str(jobs), "--keep", keep, "--tvla", str(self.tvla),
+                "--jobs", str(jobs), "--keep", *keep.split(), "--tvla", str(self.tvla),
                 *[f"--build-arg={a}" for a in build_args], *extra, "--", *tvla_args]
         with mock.patch.dict(os.environ, env or {}):
             code = cli.main(argv)
@@ -284,3 +284,61 @@ def test_a_changed_include_file_rebuilds_the_design(tmp_path, tvla_bin):
         assert builds == ["build", "build"]
     record = json.loads((tmp_path / "out" / "build" / "scasim-tvla-build.json").read_text())
     assert str(header.resolve()) in record["inputs"] or str(header) in record["inputs"]
+
+
+def welch_order_1(shape, values, labels):
+    """The order-1 t-value of each sample, for the labels 0 and 1 (pure Python).
+
+    The variances are the biased ones (divided by the count), as in the Rust t-test.
+    """
+    rows, cols = shape
+    t = []
+    for j in range(cols):
+        groups = {0: [], 1: []}
+        for i in range(rows):
+            if labels[i] in groups:
+                groups[labels[i]].append(values[i * cols + j])
+        mean = {c: sum(v) / len(v) for c, v in groups.items()}
+        var = {c: sum((x - mean[c]) ** 2 for x in v) / len(v) for c, v in groups.items()}
+        denominator = (var[0] / len(groups[0]) + var[1] / len(groups[1])) ** 0.5
+        t.append((mean[0] - mean[1]) / denominator if denominator else float("nan"))
+    return t
+
+
+def test_keep_traces_keeps_the_traces_and_deletes_the_waveform(runs):
+    out = runs.run("traces", batches=1, keep="traces")
+    batch = out / "b0000"
+    traces = batch / runner.TRACES_NAME
+    assert traces.stat().st_size > 0
+    assert (batch / "statistics.bin").exists() and (batch / "meta.json").exists()
+    assert not (batch / "tvla.fst").exists()
+    manifest = json.loads((out / "manifest.json").read_text())["batches"]["b0000"]
+    assert manifest["traces"] == f"b0000/{runner.TRACES_NAME}"
+    assert manifest["traces_bytes"] == traces.stat().st_size
+    # The file: 120 segments, 8 samples, the raw labels, and the meta entry.
+    shape, values = read_array(traces, "t_0", "<u4")
+    assert shape == (TESTS, 8)
+    _, labels = read_array(traces, "labels", "<u2")
+    _, ids = read_array(traces, "segment_ids", "<u8")
+    assert sorted(set(labels)) == [0, 1] and len(ids) == TESTS
+    _, raw = read_array(traces, "meta.json", "|u1")
+    meta = json.loads(bytes(raw))
+    assert meta["samples"] == 8 and meta["segments"] == TESTS and meta["batch_id"] == "b0000"
+    assert [c["name"] for c in meta["channels"]] == ["total"]
+    # The t-values of the traces equal the merged report of this one batch.
+    _, reported = read_f64(out / "report" / "t_values.npz", "t_values")
+    recomputed = welch_order_1(shape, values, labels)
+    assert recomputed == pytest.approx(reported[:8], rel=1e-8, abs=1e-10)
+
+
+def test_keep_traces_and_waveform_keep_both_and_the_file_equals_a_direct_tvla_run(runs):
+    out = runs.run("both", batches=1, keep="traces waveform", extra=["--traces-channels", "total"])
+    batch = out / "b0000"
+    assert (batch / "tvla.fst").exists() and (batch / runner.TRACES_NAME).exists()
+    direct = runs.out("both_direct.npz")
+    runs.tvla_run("--meta-json", str(batch / "meta.json"), *CLOCK_ARGS, "--traces-out", str(direct),
+                  "--ttest-output-dir", str(runs.out("both_direct_out")))
+    kept = members(batch / runner.TRACES_NAME)
+    again = members(direct)
+    for name in ("t_0", "labels", "groups", "segment_ids"):
+        assert kept[name] == again[name], name
