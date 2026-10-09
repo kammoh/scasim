@@ -118,3 +118,19 @@ With `--per-scope`, `traces.npz` is neither read nor written, and `tvla` reads o
 ## Null runs with shuffled labels
 
 `--shuffle-labels SEED` shuffles the labels (classes) of each batch before the statistics. A small generator (SplitMix64) with a Fisher-Yates shuffle does this. Its state comes from `SEED` and the batch number, so a run with the same seed gives the same results. The number of traces in each class does not change. All outputs are written as usual, and the summary says that the labels were shuffled. Shuffling removes the expected association between the labels and the traces. So a run with shuffled labels should have few or no exceedances of the thresholds, but chance results can remain. The largest |t| of such a run shows how large |t| gets by chance, which calibrates the false-positive floor of the test.
+
+## Checking `tvla` on synthetic waveforms
+
+There is no representative design, so `tvla` is also checked on synthetic waveforms where the truth is known. The module `scasim::synth` (feature `synth`; the tests and examples turn it on) writes FST or VCD waveforms and the metadata for a design with planted leaks. A leak has a scope, a register, a cycle, a kind (`mean`, `variance`, `equal3`, or `deterministic`), and a strength. The spec also sets the clocks (period, phase, edges, a second clock, gating, glitches), the noise, the number of traces, the batches, and the seed. The output depends only on the spec.
+
+`tests/synth_ground_truth.rs` pins the results: which order finds which leak, at which sample, and which scope ranks first. It also pins that runs without a leak or with shuffled labels give no Bonferroni exceedance, and that the toggles are conserved in edges mode.
+
+`examples/synth_eval.rs` runs a sweep and writes `synth_eval.tsv` and `synth_eval.md`. Give a scratch directory outside the repository:
+
+```bash
+cargo build --release --bin tvla
+cargo run --release --example synth_eval -- /path/to/scratch   # a few minutes of CPU at most
+cargo run --release --example synth_eval -- --print-sweep > sweep.json   # edit, then: --sweep sweep.json
+```
+
+The options are `--tvla PATH` (default `target/release/tvla`), `--sweep FILE.json` (a list of cases), and `--keep` (keep the waveforms).
